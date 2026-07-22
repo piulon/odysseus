@@ -102,3 +102,10 @@ compound.config.json
 *.error.log
 _scratch/
 /odysseus/
+
+# Local production files and backups
+.env.prod
+.env.save
+*.bak
+compose.expandido.yml
+requirements.broken.txt

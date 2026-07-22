@@ -50,3 +50,5 @@ timetree*.png
 *_signin_page.png
 *_calendar_view.png
 .gitignore
+.env.save
+.env.prod
