@@ -3380,6 +3380,17 @@ async def stream_agent_loop(
             bool(all_tool_schemas),
             agent_stream_timeout,
         )
+        # Force an explicitly exclusive single tool only on the first round.
+        # Later rounds must remain automatic so the model can turn the tool
+        # result into a final response instead of repeatedly calling the tool.
+        _forced_tool_name = (
+            _tool_names_sent[0]
+            if round_num == 1
+            and _exclusive_tools
+            and len(_tool_names_sent) == 1
+            else None
+        )
+
         async for chunk in stream_llm_with_fallback(
             _candidates,
             messages,
@@ -3388,6 +3399,7 @@ async def stream_agent_loop(
             prompt_type=prompt_type if round_num == 1 else None,
             tools=all_tool_schemas if all_tool_schemas else None,
             tool_choice_none=_ody_doc_finetune_mode,
+            tool_choice_name=_forced_tool_name,
             timeout=agent_stream_timeout,
             session_id=session_id,
             workload=workload,

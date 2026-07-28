@@ -1323,7 +1323,15 @@ def _convert_openai_content_to_anthropic(content):
     return converted
 
 
-def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=False, tools=None):
+def _build_anthropic_payload(
+    model,
+    messages,
+    temperature,
+    max_tokens,
+    stream=False,
+    tools=None,
+    tool_choice_name=None,
+):
     """Convert OpenAI-style messages to Anthropic format."""
     system_parts = []
     chat_messages = []
@@ -1408,6 +1416,14 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
             # The breakpoint caches all tool defs preceding it in the request.
             anthropic_tools[-1]["cache_control"] = {"type": "ephemeral"}
             payload["tools"] = anthropic_tools
+            if (
+                tool_choice_name
+                and any(t.get("name") == tool_choice_name for t in anthropic_tools)
+            ):
+                payload["tool_choice"] = {
+                    "type": "tool",
+                    "name": tool_choice_name,
+                }
     return payload
 
 def _build_anthropic_headers(headers):
@@ -2113,7 +2129,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                     tool_choice_none: bool = False, workload: str = "foreground"):
+                     tool_choice_none: bool = False, tool_choice_name: Optional[str] = None,
+                     workload: str = "foreground"):
     target_url = _stream_target_url(url)
     async with _local_model_slot(target_url, model, workload):
         async for chunk in _stream_llm_inner(
@@ -2128,6 +2145,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             tools=tools,
             session_id=session_id,
             tool_choice_none=tool_choice_none,
+            tool_choice_name=tool_choice_name,
         ):
             yield chunk
 
@@ -2136,7 +2154,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                             timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                            tool_choice_none: bool = False):
+                            tool_choice_none: bool = False,
+                            tool_choice_name: Optional[str] = None):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -2165,7 +2184,15 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
-        payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
+        payload = _build_anthropic_payload(
+            model,
+            messages_copy,
+            temperature,
+            max_tokens,
+            stream=True,
+            tools=tools,
+            tool_choice_name=tool_choice_name,
+        )
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
         h = {"Content-Type": "application/json"}
@@ -2196,6 +2223,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             payload[tok_key] = max_tokens
         if tools:
             payload["tools"] = tools
+            if tool_choice_name:
+                payload["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tool_choice_name},
+                }
         elif tool_choice_none:
             payload["tool_choice"] = "none"
         # Mistral thinking-capable models — send reasoning_effort so Mistral
