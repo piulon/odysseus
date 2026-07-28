@@ -645,6 +645,12 @@ def _build_ollama_payload(
         payload["options"] = options
     if tools:
         payload["tools"] = tools
+
+    # Disable Qwen/Gemma reasoning in Ollama native API when using tools.
+    # Reasoning can prevent or swallow structured tool calls.
+    if tools and _supports_thinking(model):
+        payload["think"] = False
+
     return payload
 
 
