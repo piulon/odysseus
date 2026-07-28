@@ -46,6 +46,7 @@ from src.tool_policy import (
     WEB_TOOL_NAMES,
     build_effective_tool_policy,
     is_web_search_explicitly_denied,
+    known_tool_names,
     web_search_enabled_for_turn,
 )
 
@@ -88,6 +89,42 @@ def _last_user_plain_text(messages: List[Dict[str, Any]]) -> str:
         if msg.get("role") == "user":
             return _message_plain_text(msg.get("content"))
     return ""
+
+
+_EXCLUSIVE_TOOL_REQUEST_RE = re.compile(
+    r"\b(?:"
+    r"usa(?:r)?\s+(?:solo|solamente|únicamente|unicamente|exclusivamente)|"
+    r"utiliza(?:r)?\s+(?:solo|solamente|únicamente|unicamente|exclusivamente)|"
+    r"(?:solo|solamente|únicamente|unicamente|exclusivamente)\s+"
+    r"(?:usa(?:r)?|utiliza(?:r)?)|"
+    r"use\s+(?:only|exclusively)|"
+    r"only\s+use"
+    r")\b",
+    re.I,
+)
+
+
+def _detect_exclusive_tools(text: str) -> Optional[set[str]]:
+    """Return explicitly named registered tools for an exclusive request.
+
+    The request must contain an exclusivity phrase. Tool names are matched
+    literally with identifier boundaries, preventing names such as ``bash``
+    from matching inside unrelated words.
+    """
+    plain_text = str(text or "").strip()
+    if not plain_text or not _EXCLUSIVE_TOOL_REQUEST_RE.search(plain_text):
+        return None
+
+    matched = {
+        tool_name
+        for tool_name in known_tool_names()
+        if re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(tool_name)}(?![A-Za-z0-9_])",
+            plain_text,
+            re.I,
+        )
+    }
+    return matched or None
 
 
 def _ensure_current_request_is_latest_user(messages: List[Dict[str, Any]], current_message: str) -> List[Dict[str, Any]]:
@@ -1406,6 +1443,12 @@ def setup_chat_routes(
                     if _search_enabled:
                         _forced_tools = set(WEB_TOOL_NAMES)
 
+                    # Explicit exclusive requests clamp the agent to the
+                    # registered tool names mentioned in the current message.
+                    _exclusive_tools = _detect_exclusive_tools(
+                        _message_plain_text(message)
+                    )
+
                     async for chunk in stream_agent_loop(
                         sess.endpoint_url,
                         sess.model,
@@ -1428,6 +1471,7 @@ def setup_chat_routes(
                         approved_plan=approved_plan or None,
                         workspace=workspace or None,
                         forced_tools=_forced_tools,
+                        exclusive_tools=_exclusive_tools,
                         uploaded_files=ctx.uploaded_files,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):

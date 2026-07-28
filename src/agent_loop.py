@@ -328,7 +328,7 @@ _DOMAIN_TOOL_MAP = {
     "notes_calendar_tasks": {"manage_notes", "manage_calendar", "manage_tasks"},
     "ui": {"ui_control"},
     "sessions": {"create_session", "list_sessions", "manage_session", "send_to_session", "search_chats"},
-    "files": {"bash", "python", "read_file", "write_file", "edit_file", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs"},
+    "files": {"bash", "python", "read_file", "write_file", "edit_file", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs", "homelab"},
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
     "contacts": {"resolve_contact", "manage_contact"},
     "integrations": {"api_call"},
@@ -2561,6 +2561,7 @@ async def stream_agent_loop(
     tool_policy: Optional[ToolPolicy] = None,
     workspace: Optional[str] = None,
     forced_tools: Optional[Set[str]] = None,
+    exclusive_tools: Optional[Set[str]] = None,
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
     _is_teacher_run: bool = False,
@@ -2994,6 +2995,19 @@ async def stream_agent_loop(
                 _removed_doc_file_tools,
             )
 
+    # Explicit per-request exclusive tools override retrieval and all
+    # automatic tool expansions. Disabled tools remain unavailable.
+    if not guide_only and exclusive_tools:
+        _exclusive_set = {
+            t for t in exclusive_tools
+            if t not in disabled_tools
+        }
+        _relevant_tools = _exclusive_set
+        logger.info(
+            "[agent-intent] exclusive tool clamp=%s",
+            sorted(_relevant_tools),
+        )
+
     if _relevant_tools is not None:
         logger.info("[agent-intent] selected_tools=%s", sorted(_relevant_tools)[:50])
 
@@ -3298,7 +3312,9 @@ async def stream_agent_loop(
             # calling tools. Send NO tools this round so it's forced to
             # write the answer instead of flailing further.
             all_tool_schemas = []
-        elif _is_api_model:
+        elif _is_api_model or _is_ollama_native or _ollama_openai_compat:
+            # Send native function schemas to API models and Ollama.
+            # Ollama's /api/chat supports structured tool calling.
             # Filter schemas by RAG-selected tools (if available)
             if _relevant_tools:
                 # _build_base_prompt unions _ADMIN_TOOLS into the prompt
@@ -3340,7 +3356,7 @@ async def stream_agent_loop(
         agent_stream_timeout = int(get_setting("agent_stream_timeout_seconds", 300) or 300)
 
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
-        logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent[:15]} relevant_tools={sorted(_relevant_tools)[:15] if _relevant_tools else 'ALL'}")
+        logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent} relevant_tools={sorted(_relevant_tools) if _relevant_tools else 'ALL'}")
 
         # Primary target + any configured fallback models. stream_llm_with_fallback
         # only switches on a pre-content failure, so streamed output is never
