@@ -2,7 +2,8 @@ services:
   odysseus:
     build: .
     ports:
-      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000"
+      - "127.0.0.1:${APP_PORT:-7000}:7000"
+      - "${ODYSSEUS_TAILSCALE_IP:?ODYSSEUS_TAILSCALE_IP is required}:${APP_PORT:-7000}:7000"
     volumes:
       - ${APP_DATA_DIR:-./data}:/app/data:z
       - ${APP_LOGS_DIR:-./logs}:/app/logs:z
