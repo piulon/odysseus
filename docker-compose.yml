@@ -86,8 +86,6 @@ services:
 
   chromadb:
     image: docker.io/chromadb/chroma:latest
-    ports:
-      - "${CHROMADB_BIND:-127.0.0.1}:8100:8000"
     volumes:
       - chromadb-data:/chroma/chroma
     environment:
@@ -98,7 +96,7 @@ services:
     image: docker.io/binwiederhier/ntfy
     command: serve
     ports:
-      - "${NTFY_BIND:-127.0.0.1}:8091:80"
+      - "100.87.190.46:8091:80"
     volumes:
       - ntfy-cache:/var/cache/ntfy
     environment:
