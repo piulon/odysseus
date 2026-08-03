@@ -158,6 +158,49 @@ class HomelabSpecificFormatterTests(
             result.get("direct_response", ""),
         )
 
+    def test_status_with_service_uses_service_endpoint(self):
+        with patch(
+            "src.agent_tools.homelab_tools."
+            "HomelabClient"
+        ) as client_class:
+            client = client_class.return_value
+
+            client.service.return_value = {
+                "ok": True,
+                "service": {
+                    "service": "prometheus",
+                    "present": True,
+                    "running": True,
+                    "status": "running",
+                },
+            }
+
+            result = asyncio.run(
+                HomelabTool().execute(
+                    json.dumps({
+                        "action": "status",
+                        "service": "Prometheus",
+                    }),
+                    {},
+                )
+            )
+
+        client.service.assert_called_once_with(
+            "prometheus"
+        )
+
+        client.status.assert_not_called()
+
+        self.assertEqual(
+            result.get("exit_code"),
+            0,
+        )
+
+        self.assertIn(
+            "Prometheus",
+            result.get("direct_response", ""),
+        )
+
     def test_unknown_service_is_rejected_locally(self):
         with patch(
             "src.agent_tools.homelab_tools."

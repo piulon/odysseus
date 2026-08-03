@@ -1229,6 +1229,15 @@ class HomelabTool:
             raw_service
         )
 
+        # Local models sometimes emit action=status while also supplying a
+        # concrete service. The service field makes the intended scope
+        # unambiguous, so treat it as a service inspection at this boundary.
+        if (
+            action == "status"
+            and raw_service
+        ):
+            action = "service"
+
         raw_services = args.get(
             "services",
             [],
