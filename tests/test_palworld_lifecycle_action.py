@@ -10,6 +10,8 @@ from src.services.homelab.action_client import (
 )
 from src.services.homelab.palworld_lifecycle import (
     PalworldLifecycleBlockedError,
+    _require_startable,
+    _require_stopped,
     classify_palworld_lifecycle_turn,
     execute_confirmed_palworld_stop,
     format_start_result,
@@ -582,6 +584,19 @@ class PalworldLifecycleActionTests(
             "inactive",
             stop_text,
         )
+
+    def test_offline_is_accepted_for_start_and_stop_verification(
+        self,
+    ):
+        status = {
+            "ok": False,
+            "status": "offline",
+            "players": 0,
+        }
+
+        _require_startable(status)
+        _require_stopped(status)
+
 
 
 if __name__ == "__main__":

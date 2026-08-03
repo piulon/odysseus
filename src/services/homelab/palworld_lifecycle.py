@@ -33,6 +33,7 @@ _RUNNING_STATES = {
 _STOPPED_STATES = {
     "dead",
     "inactive",
+    "offline",
     "stopped",
     "unavailable",
 }
