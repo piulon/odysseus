@@ -131,6 +131,66 @@ class HomelabFastPathTests(unittest.TestCase):
                 )
 
 
+    def test_service_alias_accepts_cookbook_domain(self):
+        self.assert_command(
+            "¿Cómo está Ollama?",
+            {
+                "action": "service",
+                "service": "ollama",
+            },
+            domains={"cookbook"},
+        )
+
+    def test_open_webui_accepts_ui_domain(self):
+        self.assert_command(
+            "Estado de Open WebUI",
+            {
+                "action": "service",
+                "service": "open-webui",
+            },
+            domains={"ui"},
+        )
+
+    def test_service_domain_overrides_are_isolated(self):
+        cases = (
+            ("Estado de Grafana", {"cookbook"}),
+            ("Estado de Grafana", {"ui"}),
+            ("Estado de ComfyUI", {"ui"}),
+            ("Estado de Open WebUI", {"cookbook"}),
+            ("Estado de Ollama", {"ui"}),
+        )
+
+        for text, domains in cases:
+            with self.subTest(
+                text=text,
+                domains=domains,
+            ):
+                self.assert_normal_agent(
+                    text,
+                    domains=domains,
+                )
+
+
+    def test_cookbook_domain_does_not_open_other_paths(self):
+        for text in (
+            "Estado del homelab",
+            "Estado de la GPU",
+            "Estado de Palworld",
+            "Estado de las copias de Palworld",
+        ):
+            with self.subTest(text=text):
+                self.assert_normal_agent(
+                    text,
+                    domains={"cookbook"},
+                )
+
+    def test_web_domain_does_not_open_service_path(self):
+        self.assert_normal_agent(
+            "Estado de Ollama",
+            domains={"web"},
+        )
+
+
     def test_complex_requests_use_normal_agent(self):
         for text in (
             "¿Por qué usa tanta VRAM el homelab?",

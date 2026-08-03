@@ -753,8 +753,24 @@ def classify_direct_homelab_request(
 
     domain_set = set(domains or ())
 
-    if domain_set - {"homelab"}:
-        return None
+    homelab_domain_allowed = not (
+        domain_set - {"homelab"}
+    )
+
+    default_service_domains = {
+        "homelab",
+    }
+
+    service_domain_overrides = {
+        "ollama": {
+            "homelab",
+            "cookbook",
+        },
+        "open-webui": {
+            "homelab",
+            "ui",
+        },
+    }
 
     normalized = _normalize_direct_homelab_text(
         text
@@ -841,7 +857,8 @@ def classify_direct_homelab_request(
     )
 
     if (
-        " palworld " in padded
+        homelab_domain_allowed
+        and " palworld " in padded
         and any(
             term in padded
             for term in backup_terms
@@ -859,7 +876,8 @@ def classify_direct_homelab_request(
     )
 
     if (
-        " palworld " in padded
+        homelab_domain_allowed
+        and " palworld " in padded
         and any(
             term in padded
             for term in palworld_terms
@@ -894,7 +912,8 @@ def classify_direct_homelab_request(
     )
 
     if (
-        gpu_subject
+        homelab_domain_allowed
+        and gpu_subject
         and any(
             term in padded
             for term in gpu_terms
@@ -908,7 +927,14 @@ def classify_direct_homelab_request(
         DIRECT_SERVICE_ALIASES.items()
     ):
         if (
-            f" {alias} " in padded
+            not (
+                domain_set
+                - service_domain_overrides.get(
+                    service,
+                    default_service_domains,
+                )
+            )
+            and f" {alias} " in padded
             and any(
                 term in padded
                 for term in status_terms
@@ -936,7 +962,8 @@ def classify_direct_homelab_request(
     )
 
     if (
-        homelab_subject
+        homelab_domain_allowed
+        and homelab_subject
         and any(
             term in padded
             for term in status_terms
