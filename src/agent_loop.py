@@ -1077,6 +1077,21 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
            r"\b(?:home ?assistant|miniflux|gitea|linkding|jellyfin)\b"):
         domains.add("integrations")
 
+    # Deterministic read-only homelab inspection intent.
+    # Keep this narrower than generic Docker/GPU discussion: both a homelab
+    # subject and an inspection/status expression must be present.
+    _homelab_subject = has(
+        r"\b(homelab|home\s*lab|docker|containers?|contenedores?|gpu|vram|"
+        r"palworld|services?|servicios?)\b"
+    )
+    _homelab_inspection = has(
+        r"\b(status|state|health|check|inspect|running|active|usage|temperature|"
+        r"how many|estado|comprueba|comprobar|revisa|revisar|funcionando|"
+        r"activos?|uso|temperatura|cu[aá]ntos?)\b"
+    )
+    if _homelab_subject and _homelab_inspection:
+        domains.add("homelab")
+
     low_signal = not continuation and not domains
     return {
         "low_signal": low_signal,
@@ -2995,6 +3010,20 @@ async def stream_agent_loop(
                 _removed_doc_file_tools,
             )
 
+    # A deterministic, read-only homelab status request has one unambiguous
+    # implementation. Clamp it before generic/admin tool expansion so smaller
+    # local models cannot substitute Cookbook or server-management tools.
+    if (
+        not guide_only
+        and not exclusive_tools
+        and set(_intent.get("domains") or set()) == {"homelab"}
+    ):
+        exclusive_tools = {"homelab"}
+        logger.info(
+            "[agent-intent] deterministic homelab exclusive=%s",
+            sorted(exclusive_tools),
+        )
+
     # Explicit per-request exclusive tools override retrieval and all
     # automatic tool expansions. Disabled tools remain unavailable.
     if not guide_only and exclusive_tools:
@@ -3007,6 +3036,10 @@ async def stream_agent_loop(
             "[agent-intent] exclusive tool clamp=%s",
             sorted(_relevant_tools),
         )
+
+    # Exclusive requests must remain exclusive in both prompt construction
+    # and schema construction, even if generic admin intent also matched.
+    _effective_needs_admin = _needs_admin and not bool(exclusive_tools)
 
     if _relevant_tools is not None:
         logger.info("[agent-intent] selected_tools=%s", sorted(_relevant_tools)[:50])
@@ -3087,7 +3120,7 @@ async def stream_agent_loop(
     _compact_agent_prompt = _is_api_model or _is_ollama_native or _ollama_openai_compat
     messages, mcp_schemas = _build_system_prompt(
         messages, model, _prompt_active_document, mcp_mgr, disabled_tools,
-        needs_admin=_needs_admin, relevant_tools=_relevant_tools,
+        needs_admin=_effective_needs_admin, relevant_tools=_relevant_tools,
         mcp_disabled_map=_mcp_disabled_map,
         compact=_compact_agent_prompt,
         owner=owner,
@@ -3323,7 +3356,7 @@ async def stream_agent_loop(
                 # tools it cannot call and substitutes the nearest schema
                 # it does have (e.g. manage_memory for manage_skills).
                 _schema_names = set(_relevant_tools)
-                if _needs_admin:
+                if _effective_needs_admin:
                     _schema_names |= _ADMIN_TOOLS
                 base_schemas = [
                     s for s in FUNCTION_TOOL_SCHEMAS
@@ -3335,7 +3368,7 @@ async def stream_agent_loop(
                 ]
                 all_tool_schemas = base_schemas + _mcp_filtered
             else:
-                base_schemas = FUNCTION_TOOL_SCHEMAS if _needs_admin else [
+                base_schemas = FUNCTION_TOOL_SCHEMAS if _effective_needs_admin else [
                     s for s in FUNCTION_TOOL_SCHEMAS
                     if s.get("function", {}).get("name") not in _ADMIN_SCHEMA_NAMES
                 ]
@@ -3386,7 +3419,7 @@ async def stream_agent_loop(
         _forced_tool_name = (
             _tool_names_sent[0]
             if round_num == 1
-            and _exclusive_tools
+            and exclusive_tools
             and len(_tool_names_sent) == 1
             else None
         )
