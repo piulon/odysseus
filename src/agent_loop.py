@@ -2775,6 +2775,288 @@ async def stream_agent_loop(
         )
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
 
+    # Explicit confirmed Palworld restart requests are deterministic and session-bound.
+    # The first turn only creates a short-lived authorization. The second turn
+    # must provide its exact code from the same owner and session.
+    try:
+        from src.services.homelab.palworld_restart import (
+            classify_palworld_restart_turn
+            as _classify_palworld_restart_turn,
+        )
+
+        _palworld_restart_turn = (
+            _classify_palworld_restart_turn(
+                _last_user,
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+    except Exception as _restart_classify_error:
+        logger.warning(
+            "[agent-action] Palworld restart "
+            "classification failed: %s",
+            _restart_classify_error,
+        )
+        _palworld_restart_turn = None
+
+    _palworld_restart_plain_context = (
+        _palworld_restart_turn is not None
+        and not guide_only
+        and not plan_mode
+        and not approved_plan
+        and not workspace
+        and not active_email
+        and not uploaded_files
+        and not _active_document_relevant
+        and (
+            not forced_tools
+            or set(forced_tools).issubset({
+                "homelab",
+                "web_fetch",
+                "web_search",
+            })
+        )
+        and (
+            not relevant_tools
+            or set(relevant_tools) == {"homelab"}
+        )
+        and (
+            not exclusive_tools
+            or set(exclusive_tools) == {"homelab"}
+        )
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    )
+
+    if _palworld_restart_plain_context:
+        from src.tool_security import (
+            owner_is_admin_or_single_user
+            as _owner_can_restart_palworld,
+        )
+
+        _restart_started = time.time()
+
+        _restart_kind = str(
+            _palworld_restart_turn.get("kind")
+            or ""
+        )
+
+        _restart_action_attempted = (
+            _restart_kind == "confirmation"
+        )
+
+        _restart_command = json.dumps(
+            {
+                "action":
+                    "palworld_restart_confirmed",
+            },
+            ensure_ascii=False,
+        )
+
+        if _restart_action_attempted:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_start",
+                    "tool": "homelab",
+                    "command": _restart_command,
+                    "full_command": _restart_command,
+                    "round": 0,
+                })
+                + "\n\n"
+            )
+
+        _restart_confirmation_required = False
+
+        try:
+            if not _owner_can_restart_palworld(
+                owner
+            ):
+                raise PermissionError(
+                    "Esta acción requiere una "
+                    "sesión de administrador"
+                )
+
+            if not str(session_id or "").strip():
+                raise PermissionError(
+                    "El reinicio requiere una "
+                    "sesión persistente"
+                )
+
+            if _restart_kind == "request":
+                from src.services.homelab.palworld_restart import (
+                    format_restart_confirmation
+                    as _format_restart_confirmation,
+                    prepare_palworld_restart_confirmation
+                    as _prepare_palworld_restart_confirmation,
+                )
+
+                _restart_result = (
+                    await asyncio.to_thread(
+                        _prepare_palworld_restart_confirmation,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                    )
+                )
+
+                _restart_text = (
+                    _format_restart_confirmation(
+                        _restart_result,
+                        _last_user,
+                    )
+                )
+
+                _restart_confirmation_required = True
+
+            elif _restart_kind == "confirmation":
+                from src.services.homelab.palworld_restart import (
+                    execute_confirmed_palworld_restart
+                    as _execute_confirmed_palworld_restart,
+                    format_verified_palworld_restart
+                    as _format_verified_palworld_restart,
+                )
+
+                _restart_result = (
+                    await asyncio.to_thread(
+                        _execute_confirmed_palworld_restart,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                        code=str(
+                            _palworld_restart_turn.get(
+                                "code"
+                            )
+                            or ""
+                        ),
+                    )
+                )
+
+                _restart_text = (
+                    _format_verified_palworld_restart(
+                        _restart_result,
+                        _last_user,
+                    )
+                )
+
+            else:
+                raise RuntimeError(
+                    "Tipo de reinicio no permitido"
+                )
+
+            _restart_exit_code = 0
+
+        except Exception as _restart_error:
+            _safe_restart_error = (
+                str(_restart_error)
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .strip()[:400]
+            )
+
+            _restart_text = (
+                "No se pudo completar la "
+                "solicitud de reinicio de Palworld"
+                + (
+                    f": {_safe_restart_error}"
+                    if _safe_restart_error
+                    else "."
+                )
+            )
+
+            _restart_exit_code = 1
+
+            logger.warning(
+                "[agent-action] Palworld restart "
+                "failed closed kind=%s: %s",
+                _restart_kind,
+                _safe_restart_error,
+            )
+
+        _restart_duration = (
+            time.time() - _restart_started
+        )
+
+        if _restart_action_attempted:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_output",
+                    "tool": "homelab",
+                    "command": _restart_command,
+                    "output": _restart_text,
+                    "exit_code":
+                        _restart_exit_code,
+                })
+                + "\n\n"
+            )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "delta": _restart_text,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "metrics",
+                "data": {
+                    "model": model,
+                    "requested_model": model,
+                    "input_tokens": estimate_tokens([{
+                        "role": "user",
+                        "content": _last_user,
+                    }]),
+                    "output_tokens": max(
+                        len(_restart_text) // 4,
+                        1,
+                    ),
+                    "total_time": round(
+                        _restart_duration,
+                        3,
+                    ),
+                    "response_time": round(
+                        _restart_duration,
+                        3,
+                    ),
+                    "agent_rounds": 0,
+                    "tool_calls": (
+                        1
+                        if _restart_action_attempted
+                        else 0
+                    ),
+                    "direct_palworld_restart": True,
+                    "confirmation_required":
+                        _restart_confirmation_required,
+                    "confirmed_restart_attempt":
+                        _restart_action_attempted,
+                    "action_succeeded": (
+                        _restart_action_attempted
+                        and _restart_exit_code == 0
+                    ),
+                },
+            })
+            + "\n\n"
+        )
+
+        logger.info(
+            "[agent-action] Palworld restart "
+            "turn completed kind=%s exit=%s "
+            "duration=%.3fs",
+            _restart_kind,
+            _restart_exit_code,
+            _restart_duration,
+        )
+
+        yield "data: [DONE]\n\n"
+        return
+
     # Explicit Palworld backup actions are deterministic and fail closed.
     # They are not exposed in the LLM tool schema: only a complete command in
     # the current user turn can reach the restricted action client.

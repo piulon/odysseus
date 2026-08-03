@@ -112,3 +112,13 @@ class HomelabActionClient:
         return self._post(
             "/v1/palworld/backups/create"
         )
+
+
+    def restart_palworld(
+        self,
+    ) -> Dict[str, Any]:
+        """Restart only the dedicated Palworld service."""
+
+        return self._post(
+            "/v1/palworld/restart"
+        )
