@@ -2553,6 +2553,113 @@ def _detect_runaway_call(call_freq, threshold=15):
     return sig.split(":", 1)[0] if sig else None
 
 
+def _healthy_homelab_diagnostic_response(
+    output: str,
+    user_text: str,
+) -> str | None:
+    """Return a factual terminal reply for an unequivocally healthy service."""
+    rendered = str(output or "").strip()
+
+    if not rendered:
+        return None
+
+    folded = rendered.casefold()
+
+    if (
+        "- estado: **ok**" not in folded
+        or "- runtime: `running`" not in folded
+    ):
+        return None
+
+    match = re.search(
+        r"(?mi)^##\s+estado de\s+(.+?)\s*$",
+        rendered,
+    )
+
+    service = (
+        match.group(1).strip()
+        if match
+        else "El servicio"
+    )
+
+    health_unavailable = bool(
+        re.search(
+            r"(?mi)^-\s*salud:\s*`?n/d`?\s*$",
+            rendered,
+        )
+    )
+
+    latest = str(user_text or "").casefold()
+
+    is_catalan = any(
+        token in latest
+        for token in (
+            "per què",
+            "per que",
+            "caigut",
+            "caiguda",
+            "estat de",
+            "està caigut",
+            "esta caigut",
+        )
+    )
+
+    is_english = bool(
+        re.search(
+            r"\bwhy\b|\bdown\b|\bstatus\b",
+            latest,
+        )
+    )
+
+    if is_catalan:
+        response = (
+            f"{service} no està caigut: "
+            "l'operador informa d'un estat **OK** "
+            "i el contenidor està en execució "
+            "(`running`)."
+        )
+
+        if health_unavailable:
+            response += (
+                " `Salut: n/d` significa que no hi "
+                "ha dades de healthcheck disponibles; "
+                "no indica una fallada."
+            )
+
+        return response
+
+    if is_english:
+        response = (
+            f"{service} is not down: the operator "
+            "reports **OK** and the container is "
+            "running (`running`)."
+        )
+
+        if health_unavailable:
+            response += (
+                " `Health: n/a` means no health-check "
+                "data is available; it is not evidence "
+                "of a failure."
+            )
+
+        return response
+
+    response = (
+        f"{service} no está caído: el operador "
+        "informa de un estado **OK** y el "
+        "contenedor está en ejecución (`running`)."
+    )
+
+    if health_unavailable:
+        response += (
+            " `Salud: n/d` significa que no hay "
+            "datos de healthcheck disponibles; "
+            "no indica un fallo."
+        )
+
+    return response
+
+
 async def stream_agent_loop(
     endpoint_url: str,
     model: str,
@@ -4785,6 +4892,51 @@ async def stream_agent_loop(
             ):
                 _ody_doc_tool_completed = True
 
+        # Healthy diagnostic results are factual and need no probabilistic
+        # second-round synthesis. This also prevents unsupported remediation
+        # advice when the operator reports that the service is running.
+        if _homelab_agent_tool_required:
+            _healthy_homelab_output = ""
+
+            for _event in reversed(tool_events):
+                if (
+                    _event.get("tool") == "homelab"
+                    and _event.get("exit_code") == 0
+                ):
+                    _healthy_homelab_output = str(
+                        _event.get("output") or ""
+                    )
+                    break
+
+            _healthy_homelab_reply = (
+                _healthy_homelab_diagnostic_response(
+                    _healthy_homelab_output,
+                    _last_user,
+                )
+            )
+
+            if _healthy_homelab_reply:
+                full_response = (
+                    _healthy_homelab_reply
+                )
+
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "delta":
+                            _healthy_homelab_reply
+                    })
+                    + "\n\n"
+                )
+
+                _ody_homelab_status_completed = True
+
+                logger.info(
+                    "[agent] healthy homelab "
+                    "diagnostic completed from "
+                    "authoritative operator state"
+                )
+
         # If budget was hit, stop the loop
         if budget_hit:
             break
@@ -4830,6 +4982,35 @@ async def stream_agent_loop(
         _append_tool_results(messages, round_response, converted_calls,
                              tool_results, tool_result_texts, used_native, round_num,
                              round_reasoning=round_reasoning)
+
+        if (
+            _homelab_agent_tool_required
+            and any(
+                event.get("tool") == "homelab"
+                and event.get("exit_code") == 0
+                for event in tool_events
+            )
+        ):
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Treat the Homelab Operator result "
+                    "as authoritative. Synthesize it "
+                    "conservatively and in the user's "
+                    "language. If Estado is OK and Runtime "
+                    "is running, the first sentence must "
+                    "explicitly state that the service is "
+                    "not down. Salud n/d means that no "
+                    "health-check data is available; it is "
+                    "not evidence of failure. Do not invent "
+                    "possible causes or recommend restart, "
+                    "configuration changes, network fixes, "
+                    "or log inspection unless the tool "
+                    "result contains evidence of a problem "
+                    "or the user explicitly requested that "
+                    "next step. Keep the answer concise."
+                ),
+            })
 
         # Emit agent_step event
         yield (
