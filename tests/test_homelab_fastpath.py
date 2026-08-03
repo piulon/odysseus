@@ -97,6 +97,40 @@ class HomelabFastPathTests(unittest.TestCase):
                     domains=domains,
                 )
 
+    def test_named_service_status_commands(self):
+        cases = (
+            ("Estado de Grafana", "grafana"),
+            ("Estado de Prometheus", "prometheus"),
+            ("¿Cómo está Ollama?", "ollama"),
+            ("Caddy status", "caddy"),
+            ("Estado de ChromaDB", "chromadb"),
+            ("Estado de Chroma DB", "chromadb"),
+            ("Estado de SearXNG", "searxng"),
+            ("Estado de SearX NG", "searxng"),
+            ("Estado de Portainer", "portainer"),
+            ("Estado de Homepage", "homepage"),
+            ("Estado de Home Page", "homepage"),
+            ("Estado de Open WebUI", "open-webui"),
+            ("Estado de Open Web UI", "open-webui"),
+            ("Estado de OpenWebUI", "open-webui"),
+            ("Estado de ComfyUI", "comfyui"),
+            ("Estado de Comfy UI", "comfyui"),
+            ("Com està Grafana?", "grafana"),
+            ("Estat de Prometheus", "prometheus"),
+        )
+
+        for text, service in cases:
+            with self.subTest(text=text):
+                self.assert_command(
+                    text,
+                    {
+                        "action": "service",
+                        "service": service,
+                    },
+                    domains=set(),
+                )
+
+
     def test_complex_requests_use_normal_agent(self):
         for text in (
             "¿Por qué usa tanta VRAM el homelab?",
@@ -106,6 +140,12 @@ class HomelabFastPathTests(unittest.TestCase):
             "Estado del homelab y de Palworld",
             "Estado de los servicios del homelab",
             "Estado de Grafana y Prometheus",
+            "¿Por qué está caído Prometheus?",
+            "Diagnostica Ollama",
+            "Reinicia Caddy",
+            "Detén Portainer",
+            "Actualiza Open WebUI",
+            "Revisa los logs de ChromaDB",
         ):
             with self.subTest(text=text):
                 self.assert_normal_agent(text)

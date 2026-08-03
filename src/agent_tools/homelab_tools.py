@@ -696,6 +696,21 @@ def format_palworld_backups(
 
 DIRECT_SERVICE_ALIASES = {
     "grafana": "grafana",
+    "prometheus": "prometheus",
+    "ollama": "ollama",
+    "caddy": "caddy",
+    "chromadb": "chromadb",
+    "chroma db": "chromadb",
+    "searxng": "searxng",
+    "searx ng": "searxng",
+    "portainer": "portainer",
+    "homepage": "homepage",
+    "home page": "homepage",
+    "open webui": "open-webui",
+    "open web ui": "open-webui",
+    "openwebui": "open-webui",
+    "comfyui": "comfyui",
+    "comfy ui": "comfyui",
 }
 
 
