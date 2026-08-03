@@ -2676,10 +2676,22 @@ async def stream_agent_loop(
             HomelabTool as _FastHomelabTool,
             classify_direct_homelab_request
             as _classify_direct_homelab_request,
+            should_include_homelab_tool
+            as _should_include_homelab_tool,
         )
 
         _fast_command_args = (
             _classify_direct_homelab_request(
+                _last_user,
+                _intent.get("domains") or set(),
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+        _homelab_agent_tool_required = (
+            _should_include_homelab_tool(
                 _last_user,
                 _intent.get("domains") or set(),
                 continuation=bool(
@@ -2733,6 +2745,7 @@ async def stream_agent_loop(
 
         _fast_command_args = None
         _direct_homelab_request = False
+        _homelab_agent_tool_required = False
 
     if (
         _fast_command_args is not None
@@ -3253,6 +3266,32 @@ async def stream_agent_loop(
                 "[agent-intent] active document turn removed file tools=%s",
                 _removed_doc_file_tools,
             )
+
+    # Read-only homelab investigations remain on the agent path, but the
+    # homelab schema must remain available when generic retrieval misses.
+    if (
+        _homelab_agent_tool_required
+        and not guide_only
+        and not exclusive_tools
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    ):
+        if _relevant_tools is None:
+            from src.tool_index import ALWAYS_AVAILABLE
+
+            _relevant_tools = set(
+                ALWAYS_AVAILABLE
+            )
+
+        _relevant_tools.add("homelab")
+
+        logger.info(
+            "[agent-intent] added read-only "
+            "homelab tool for agent investigation"
+        )
 
     # A deterministic, read-only homelab status request has one unambiguous
     # implementation. Clamp it before generic/admin tool expansion so smaller

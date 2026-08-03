@@ -5,12 +5,13 @@ from src.services.homelab.client import HomelabClient
 
 
 READ_ONLY_ACTIONS = {
-    "status",
     "doctor",
-    "service",
     "gpu",
-    "palworld_status",
     "palworld_backups",
+    "palworld_status",
+    "service",
+    "services",
+    "status",
 }
 
 BLOCKED_ACTIONS = {
@@ -738,11 +739,42 @@ def _normalize_direct_homelab_text(
     ).strip()
 
 
+def _direct_service_mentions(
+    normalized: str,
+) -> list[str]:
+    """Return canonical service names in textual order."""
+    padded = f" {normalized} "
+    matches: list[tuple[int, int, str]] = []
+
+    for alias, service in DIRECT_SERVICE_ALIASES.items():
+        position = padded.find(
+            f" {alias} "
+        )
+
+        if position >= 0:
+            matches.append(
+                (
+                    position,
+                    -len(alias),
+                    service,
+                )
+            )
+
+    services: list[str] = []
+
+    for _, _, service in sorted(matches):
+        if service not in services:
+            services.append(service)
+
+    return services
+
+
+
 def classify_direct_homelab_request(
     text: str,
     domains,
     continuation: bool = False,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Return a canonical deterministic command or None.
 
     Only unequivocal read-only status requests are accepted. Causal,
@@ -784,10 +816,13 @@ def classify_direct_homelab_request(
 
     padded = f" {normalized} "
 
-    blocked_phrases = (
+    causal_phrases = (
         " por que ",
         " porque ",
         " why ",
+    )
+
+    multi_target_connectors = (
         " y ",
         " and ",
         " i ",
@@ -818,7 +853,7 @@ def classify_direct_homelab_request(
 
     if any(
         phrase in padded
-        for phrase in blocked_phrases
+        for phrase in causal_phrases
     ):
         return None
 
@@ -846,6 +881,29 @@ def classify_direct_homelab_request(
         " caido ",
         " caida ",
     )
+
+    service_mentions = (
+        _direct_service_mentions(normalized)
+    )
+
+    if (
+        homelab_domain_allowed
+        and len(service_mentions) >= 2
+        and any(
+            term in padded
+            for term in status_terms
+        )
+    ):
+        return {
+            "action": "services",
+            "services": service_mentions,
+        }
+
+    if any(
+        connector in padded
+        for connector in multi_target_connectors
+    ):
+        return None
 
     backup_terms = (
         " backup ",
@@ -980,6 +1038,110 @@ def classify_direct_homelab_request(
     return None
 
 
+def should_include_homelab_tool(
+    text: str,
+    domains=None,
+    continuation: bool = False,
+) -> bool:
+    """Identify read-only homelab requests that need the agent."""
+    del domains
+
+    if continuation:
+        return False
+
+    normalized = _normalize_direct_homelab_text(
+        text
+    )
+
+    if not normalized:
+        return False
+
+    if len(normalized.split()) > 40:
+        return False
+
+    padded = f" {normalized} "
+
+    mutating_stems = (
+        "reinici",
+        "restart",
+        "deten",
+        " stop ",
+        "arranc",
+        " start ",
+        "apaga",
+        "enciende",
+        "crear",
+        "crea ",
+        "borr",
+        "elimin",
+        "actualiz",
+        " update ",
+        " upgrade ",
+        "instal",
+        "configur",
+        "cambia",
+        " change ",
+    )
+
+    if any(
+        stem in padded
+        for stem in mutating_stems
+    ):
+        return False
+
+    service_mentions = (
+        _direct_service_mentions(normalized)
+    )
+
+    subject_present = (
+        bool(service_mentions)
+        or " homelab " in padded
+        or " home lab " in padded
+        or " gpu " in padded
+        or " vram " in padded
+        or " palworld " in padded
+    )
+
+    if not subject_present:
+        return False
+
+    read_only_terms = (
+        " estado ",
+        " estat ",
+        " status ",
+        " salud ",
+        " health ",
+        " funciona ",
+        " funcionando ",
+        " activo ",
+        " activa ",
+        " online ",
+        " caido ",
+        " caida ",
+        " por que ",
+        " porque ",
+        " why ",
+        " diagnost",
+        " analiz",
+        " investig",
+        " problema",
+        " error",
+        " falla",
+        " log ",
+        " logs ",
+        " registro ",
+        " registros ",
+        " revisa ",
+        " revisar ",
+    )
+
+    return any(
+        term in padded
+        for term in read_only_terms
+    )
+
+
+
 def is_direct_homelab_status_request(
     text: str,
     domains,
@@ -1030,6 +1192,25 @@ class HomelabTool:
             args.get("service", "")
         ).strip()
 
+        raw_services = args.get(
+            "services",
+            [],
+        )
+
+        services: list[str] = []
+
+        if isinstance(raw_services, list):
+            for item in raw_services:
+                candidate = str(
+                    item or ""
+                ).strip()
+
+                if (
+                    candidate
+                    and candidate not in services
+                ):
+                    services.append(candidate)
+
         if action in BLOCKED_ACTIONS:
             return {
                 "error": (
@@ -1074,6 +1255,37 @@ class HomelabTool:
                 result = client.palworld_backups()
                 direct_response = format_palworld_backups(
                     result
+                )
+
+            elif action == "services":
+                if not (
+                    2 <= len(services) <= 10
+                ):
+                    return {
+                        "error": (
+                            "homelab: services must contain "
+                            "between 2 and 10 unique names"
+                        ),
+                        "exit_code": 1,
+                    }
+
+                formatted_services = []
+
+                for service_name in services:
+                    result = client.service(
+                        service_name
+                    )
+
+                    formatted_services.append(
+                        format_homelab_service(
+                            result
+                        )
+                    )
+
+                direct_response = (
+                    "\n\n---\n\n".join(
+                        formatted_services
+                    )
                 )
 
             elif action == "service":

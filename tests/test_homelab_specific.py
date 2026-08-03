@@ -1,7 +1,7 @@
 import asyncio
 import json
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from src.agent_tools.homelab_tools import (
     HomelabTool,
@@ -116,6 +116,79 @@ class HomelabSpecificFormatterTests(
         self.assertIn("12", text)
         self.assertIn("correcta", text)
         self.assertIn("backup.tar.gz", text)
+
+    def test_multi_service_action_is_terminal(self):
+        with patch(
+            "src.agent_tools.homelab_tools."
+            "HomelabClient"
+        ) as client_class:
+            client = client_class.return_value
+
+            client.service.side_effect = [
+                {
+                    "ok": True,
+                    "service": {
+                        "service": "grafana",
+                        "present": True,
+                        "running": True,
+                        "status": "running",
+                    },
+                },
+                {
+                    "ok": True,
+                    "service": {
+                        "service": "prometheus",
+                        "present": True,
+                        "running": True,
+                        "status": "running",
+                    },
+                },
+            ]
+
+            result = asyncio.run(
+                HomelabTool().execute(
+                    json.dumps({
+                        "action": "services",
+                        "services": [
+                            "grafana",
+                            "prometheus",
+                        ],
+                    }),
+                    {},
+                )
+            )
+
+        self.assertEqual(
+            client.service.call_args_list,
+            [
+                call("grafana"),
+                call("prometheus"),
+            ],
+        )
+
+        self.assertEqual(
+            result.get("exit_code"),
+            0,
+        )
+
+        self.assertTrue(
+            result.get("terminal_response")
+        )
+
+        output = result.get(
+            "direct_response",
+            "",
+        )
+
+        self.assertIn(
+            "## Estado de Grafana",
+            output,
+        )
+
+        self.assertIn(
+            "## Estado de Prometheus",
+            output,
+        )
 
     def test_client_uses_dedicated_paths(self):
         client = object.__new__(

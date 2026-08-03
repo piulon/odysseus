@@ -2,6 +2,7 @@ import unittest
 
 from src.agent_tools.homelab_tools import (
     classify_direct_homelab_request,
+    should_include_homelab_tool,
 )
 
 
@@ -191,6 +192,71 @@ class HomelabFastPathTests(unittest.TestCase):
         )
 
 
+    def test_multi_service_status_commands(self):
+        cases = (
+            (
+                "Estado de Grafana y Prometheus",
+                ["grafana", "prometheus"],
+            ),
+            (
+                "Prometheus and Grafana status",
+                ["prometheus", "grafana"],
+            ),
+            (
+                "Estat de Grafana i Prometheus",
+                ["grafana", "prometheus"],
+            ),
+            (
+                "Estado de Grafana, Prometheus y Caddy",
+                [
+                    "grafana",
+                    "prometheus",
+                    "caddy",
+                ],
+            ),
+        )
+
+        for text, services in cases:
+            with self.subTest(text=text):
+                self.assert_command(
+                    text,
+                    {
+                        "action": "services",
+                        "services": services,
+                    },
+                    domains=set(),
+                )
+
+    def test_read_only_agent_homelab_hints(self):
+        for text in (
+            "¿Por qué está caído Prometheus?",
+            "Diagnostica Ollama",
+            "Revisa los logs de ChromaDB",
+            "Estado de los servicios del homelab",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(
+                    should_include_homelab_tool(
+                        text,
+                        set(),
+                    )
+                )
+
+    def test_mutations_do_not_request_homelab_hint(self):
+        for text in (
+            "Reinicia Caddy",
+            "Detén Portainer",
+            "Actualiza Open WebUI",
+            "Crea una copia de Palworld",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(
+                    should_include_homelab_tool(
+                        text,
+                        set(),
+                    )
+                )
+
     def test_complex_requests_use_normal_agent(self):
         for text in (
             "¿Por qué usa tanta VRAM el homelab?",
@@ -199,7 +265,6 @@ class HomelabFastPathTests(unittest.TestCase):
             "Crea una copia de Palworld",
             "Estado del homelab y de Palworld",
             "Estado de los servicios del homelab",
-            "Estado de Grafana y Prometheus",
             "¿Por qué está caído Prometheus?",
             "Diagnostica Ollama",
             "Reinicia Caddy",
