@@ -2775,6 +2775,254 @@ async def stream_agent_loop(
         )
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
 
+    # Explicit Palworld backup actions are deterministic and fail closed.
+    # They are not exposed in the LLM tool schema: only a complete command in
+    # the current user turn can reach the restricted action client.
+    try:
+        from src.services.homelab.palworld_backup import (
+            classify_explicit_palworld_backup_request
+            as _classify_explicit_palworld_backup_request,
+        )
+
+        _explicit_palworld_backup = (
+            _classify_explicit_palworld_backup_request(
+                _last_user,
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+    except Exception as _backup_classify_error:
+        logger.warning(
+            "[agent-action] Palworld backup "
+            "classification failed: %s",
+            _backup_classify_error,
+        )
+        _explicit_palworld_backup = False
+
+    _palworld_backup_plain_context = (
+        _explicit_palworld_backup
+        and not guide_only
+        and not plan_mode
+        and not approved_plan
+        and not workspace
+        and not active_email
+        and not uploaded_files
+        and not _active_document_relevant
+        and (
+            not forced_tools
+            or set(forced_tools).issubset({
+                "homelab",
+                "web_fetch",
+                "web_search",
+            })
+        )
+        and (
+            not relevant_tools
+            or set(relevant_tools) == {"homelab"}
+        )
+        and (
+            not exclusive_tools
+            or set(exclusive_tools) == {"homelab"}
+        )
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    )
+
+    if _palworld_backup_plain_context:
+        from src.tool_security import (
+            owner_is_admin_or_single_user
+            as _owner_can_run_homelab_action,
+        )
+
+        if not _owner_can_run_homelab_action(owner):
+            _denied_text = (
+                "Esta acción requiere una sesión "
+                "de administrador."
+            )
+
+            yield (
+                "data: "
+                + json.dumps({
+                    "delta": _denied_text,
+                })
+                + "\n\n"
+            )
+
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "metrics",
+                    "data": {
+                        "model": model,
+                        "requested_model": model,
+                        "input_tokens": estimate_tokens([{
+                            "role": "user",
+                            "content": _last_user,
+                        }]),
+                        "output_tokens": max(
+                            len(_denied_text) // 4,
+                            1,
+                        ),
+                        "agent_rounds": 0,
+                        "tool_calls": 0,
+                        "direct_palworld_backup": True,
+                        "action_authorized": False,
+                    },
+                })
+                + "\n\n"
+            )
+
+            logger.warning(
+                "[agent-action] denied Palworld "
+                "backup owner=%r",
+                owner,
+            )
+
+            yield "data: [DONE]\n\n"
+            return
+
+        _backup_started = time.time()
+
+        _backup_command = json.dumps(
+            {
+                "action":
+                    "palworld_backup_create",
+            },
+            ensure_ascii=False,
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "tool_start",
+                "tool": "homelab",
+                "command": _backup_command,
+                "full_command": _backup_command,
+                "round": 0,
+            })
+            + "\n\n"
+        )
+
+        try:
+            from src.services.homelab.palworld_backup import (
+                create_verified_palworld_backup
+                as _create_verified_palworld_backup,
+                format_verified_palworld_backup
+                as _format_verified_palworld_backup,
+            )
+
+            _verified_backup = await asyncio.to_thread(
+                _create_verified_palworld_backup
+            )
+
+            _backup_text = (
+                _format_verified_palworld_backup(
+                    _verified_backup,
+                    _last_user,
+                )
+            )
+
+            _backup_exit_code = 0
+
+        except Exception as _backup_error:
+            _safe_backup_error = (
+                str(_backup_error)
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .strip()[:400]
+            )
+
+            _backup_text = (
+                "No se pudo completar el backup "
+                "de Palworld"
+                + (
+                    f": {_safe_backup_error}"
+                    if _safe_backup_error
+                    else "."
+                )
+            )
+
+            _backup_exit_code = 1
+
+            logger.warning(
+                "[agent-action] Palworld backup "
+                "failed closed: %s",
+                _safe_backup_error,
+            )
+
+        _backup_duration = (
+            time.time() - _backup_started
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "tool_output",
+                "tool": "homelab",
+                "command": _backup_command,
+                "output": _backup_text,
+                "exit_code": _backup_exit_code,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "delta": _backup_text,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "metrics",
+                "data": {
+                    "model": model,
+                    "requested_model": model,
+                    "input_tokens": estimate_tokens([{
+                        "role": "user",
+                        "content": _last_user,
+                    }]),
+                    "output_tokens": max(
+                        len(_backup_text) // 4,
+                        1,
+                    ),
+                    "total_time": round(
+                        _backup_duration,
+                        3,
+                    ),
+                    "response_time": round(
+                        _backup_duration,
+                        3,
+                    ),
+                    "agent_rounds": 0,
+                    "tool_calls": 1,
+                    "direct_palworld_backup": True,
+                    "action_authorized": True,
+                    "action_succeeded":
+                        _backup_exit_code == 0,
+                },
+            })
+            + "\n\n"
+        )
+
+        logger.info(
+            "[agent-action] Palworld backup "
+            "completed exit=%s duration=%.3fs",
+            _backup_exit_code,
+            _backup_duration,
+        )
+
+        yield "data: [DONE]\n\n"
+        return
+
     # Deterministic homelab read-only requests do not need an LLM round.
     # The classifier returns the canonical tool command; this loop contains
     # no service-specific linguistic routing rules.
