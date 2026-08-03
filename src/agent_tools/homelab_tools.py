@@ -8,6 +8,9 @@ READ_ONLY_ACTIONS = {
     "status",
     "doctor",
     "service",
+    "gpu",
+    "palworld_status",
+    "palworld_backups",
 }
 
 BLOCKED_ACTIONS = {
@@ -392,26 +395,317 @@ def format_homelab_status(
 
 
 
-def is_direct_homelab_status_request(
+def format_homelab_service(
+    payload: dict[str, Any],
+) -> str:
+    service = (
+        payload.get("service")
+        if isinstance(payload, dict)
+        else None
+    )
+
+    if not isinstance(service, dict):
+        return (
+            "## Estado del servicio\n\n"
+            "No se recibió una respuesta válida del operador."
+        )
+
+    name = str(
+        service.get("service")
+        or "servicio"
+    )
+
+    title = (
+        name.replace("-", " ")
+        .replace("_", " ")
+        .title()
+    )
+
+    marker = _service_state(service)
+
+    status = str(
+        service.get("status")
+        or "desconocido"
+    )
+
+    health = str(
+        service.get("health")
+        or "n/d"
+    )
+
+    container = str(
+        service.get("container")
+        or "n/d"
+    )
+
+    category = str(
+        service.get("category")
+        or "n/d"
+    )
+
+    image = str(
+        service.get("image")
+        or "n/d"
+    )
+
+    networks = [
+        str(network)
+        for network in service.get("networks", [])
+        if str(network).strip()
+    ]
+
+    return "\n".join([
+        f"## Estado de {title}",
+        "",
+        f"- Estado: **{marker}**",
+        f"- Runtime: `{status}`",
+        f"- Salud: `{health}`",
+        f"- Contenedor: `{container}`",
+        f"- Categoría: `{category}`",
+        f"- Imagen: `{image}`",
+        (
+            "- Redes: "
+            + (
+                ", ".join(
+                    f"`{network}`"
+                    for network in networks
+                )
+                if networks
+                else "ninguna"
+            )
+        ),
+    ])
+
+
+def format_homelab_gpu(
+    payload: dict[str, Any],
+) -> str:
+    if not isinstance(payload, dict):
+        gpu = {}
+    elif isinstance(payload.get("gpu"), dict):
+        gpu = payload["gpu"]
+    else:
+        gpu = payload
+
+    devices = [
+        device
+        for device in gpu.get("devices", [])
+        if isinstance(device, dict)
+    ]
+
+    lines = [
+        "## Estado de la GPU",
+        "",
+        (
+            "- Fuente: "
+            f"`{gpu.get('source') or 'n/d'}`"
+        ),
+    ]
+
+    if not gpu.get("available") or not devices:
+        lines.append("- GPU: **no disponible**")
+        return "\n".join(lines)
+
+    devices.sort(
+        key=lambda device: _as_int(
+            device.get("index")
+        )
+    )
+
+    for device in devices:
+        model = str(
+            device.get("model")
+            or device.get("device")
+            or "GPU"
+        )
+
+        used = _as_int(
+            device.get("memory_used_mib")
+        )
+
+        free = _as_int(
+            device.get("memory_free_mib")
+        )
+
+        reserved = _as_int(
+            device.get("memory_reserved_mib")
+        )
+
+        total = _as_int(
+            device.get("memory_total_mib")
+        )
+
+        percentage = (
+            (used / total) * 100
+            if total > 0
+            else 0.0
+        )
+
+        lines.extend([
+            "",
+            f"### {model}",
+            (
+                "- Temperatura: "
+                f"**{_format_number(device.get('temperature_c'))} °C**"
+            ),
+            (
+                "- Uso de GPU: "
+                f"**{_format_number(device.get('utilization_percent'))} %**"
+            ),
+            (
+                "- VRAM usada: "
+                f"**{used}/{total} MiB "
+                f"({_format_number(percentage, 1)} %)**"
+            ),
+            f"- VRAM libre: **{free} MiB**",
+            f"- VRAM reservada: **{reserved} MiB**",
+            (
+                "- Potencia: "
+                f"**{_format_number(device.get('power_w'))} W**"
+            ),
+            (
+                "- Driver: "
+                f"`{device.get('driver_version') or 'n/d'}`"
+            ),
+        ])
+
+    return "\n".join(lines)
+
+
+def format_palworld_status(
+    payload: dict[str, Any],
+) -> str:
+    if not isinstance(payload, dict):
+        return (
+            "## Estado de Palworld\n\n"
+            "No se recibió una respuesta válida del operador."
+        )
+
+    raw_status = str(
+        payload.get("status")
+        or "desconocido"
+    ).lower()
+
+    status_label = {
+        "online": "EN LÍNEA",
+        "offline": "FUERA DE LÍNEA",
+        "starting": "INICIANDO",
+        "stopping": "DETENIÉNDOSE",
+    }.get(
+        raw_status,
+        raw_status.upper(),
+    )
+
+    players = (
+        payload.get("players_display")
+        or (
+            f"{payload.get('players', 'n/d')} / "
+            f"{payload.get('max_players', 'n/d')}"
+        )
+    )
+
+    lines = [
+        "## Estado de Palworld",
+        "",
+        f"- Estado: **{status_label}**",
+        (
+            "- Servidor: "
+            f"**{payload.get('server') or 'n/d'}**"
+        ),
+        (
+            "- Versión: "
+            f"`{payload.get('version') or 'n/d'}`"
+        ),
+        f"- Jugadores: **{players}**",
+        f"- FPS: **{payload.get('fps', 'n/d')}**",
+        (
+            "- Tiempo activo: "
+            f"**{payload.get('uptime') or 'n/d'}**"
+        ),
+        (
+            "- Días del mundo: "
+            f"**{payload.get('world_days', 'n/d')}**"
+        ),
+    ]
+
+    if payload.get("observed_at"):
+        lines.append(
+            "- Observado: "
+            f"`{payload['observed_at']}`"
+        )
+
+    return "\n".join(lines)
+
+
+def format_palworld_backups(
+    payload: dict[str, Any],
+) -> str:
+    if not isinstance(payload, dict):
+        return (
+            "## Copias de Palworld\n\n"
+            "No se recibió una respuesta válida del operador."
+        )
+
+    status = str(
+        payload.get("status")
+        or "desconocido"
+    ).upper()
+
+    lines = [
+        "## Copias de Palworld",
+        "",
+        f"- Estado: **{status}**",
+        (
+            "- Copias disponibles: "
+            f"**{payload.get('count', 'n/d')}**"
+        ),
+        (
+            "- Última copia: "
+            f"`{payload.get('latest_backup') or 'n/d'}`"
+        ),
+        (
+            "- Antigüedad: "
+            f"**{payload.get('age') or 'n/d'}**"
+        ),
+        (
+            "- Tamaño: "
+            f"**{payload.get('size') or 'n/d'}**"
+        ),
+        (
+            "- Integridad: "
+            f"**{payload.get('integrity') or 'n/d'}**"
+        ),
+        (
+            "- Retención: "
+            f"**{payload.get('retention') or 'n/d'}**"
+        ),
+        (
+            "- Programación: "
+            f"`{payload.get('schedule') or 'n/d'}`"
+        ),
+    ]
+
+    if payload.get("observed_at"):
+        lines.append(
+            "- Observado: "
+            f"`{payload['observed_at']}`"
+        )
+
+    return "\n".join(lines)
+
+
+DIRECT_SERVICE_ALIASES = {
+    "grafana": "grafana",
+}
+
+
+def _normalize_direct_homelab_text(
     text: str,
-    domains,
-    continuation: bool = False,
-) -> bool:
-    """Return True only for a simple whole-homelab status request.
+) -> str:
+    import re
+    import unicodedata
 
-    Service-specific inspection, diagnosis and control requests must continue
-    through the normal agent path.
-    """
-    import re as _re
-    import unicodedata as _unicodedata
-
-    if continuation:
-        return False
-
-    if set(domains or ()) != {"homelab"}:
-        return False
-
-    normalized = _unicodedata.normalize(
+    normalized = unicodedata.normalize(
         "NFKD",
         str(text or ""),
     )
@@ -419,96 +713,244 @@ def is_direct_homelab_status_request(
     normalized = "".join(
         character
         for character in normalized
-        if not _unicodedata.combining(character)
+        if not unicodedata.combining(character)
     ).lower()
 
-    normalized = _re.sub(
+    return re.sub(
         r"[^a-z0-9]+",
         " ",
         normalized,
     ).strip()
 
-    if not normalized:
-        return False
 
-    words = normalized.split()
+def classify_direct_homelab_request(
+    text: str,
+    domains,
+    continuation: bool = False,
+) -> dict[str, str] | None:
+    """Return a canonical deterministic command or None.
 
-    if len(words) > 11:
-        return False
+    Only unequivocal read-only status requests are accepted. Causal,
+    diagnostic, multi-target and mutating requests stay on the agent path.
+    """
+    if continuation:
+        return None
 
-    if (
-        "homelab" not in normalized
-        and "home lab" not in normalized
-    ):
-        return False
+    domain_set = set(domains or ())
 
-    status_expressions = (
-        "estado",
-        "status",
-        "salud",
-        "health",
-        "estat",
-        "como esta",
-        "como va",
-        "com esta",
-        "how is",
+    if domain_set - {"homelab"}:
+        return None
+
+    normalized = _normalize_direct_homelab_text(
+        text
     )
 
-    if not any(
-        expression in normalized
-        for expression in status_expressions
-    ):
-        return False
+    if not normalized:
+        return None
+
+    if len(normalized.split()) > 16:
+        return None
 
     padded = f" {normalized} "
 
-    blocked_fragments = (
+    blocked_phrases = (
         " por que ",
         " porque ",
         " why ",
         " y ",
         " and ",
-        " palworld ",
-        " grafana ",
-        " prometheus ",
-        " ollama ",
-        " chromadb ",
-        " searxng ",
-        " caddy ",
-        " homepage ",
-        " portainer ",
-        " comfyui ",
-        " gpu ",
-        " vram ",
+        " i ",
+    )
+
+    blocked_stems = (
+        "diagnost",
+        "analiz",
+        "investig",
+        "problema",
+        "error",
+        "falla",
+        "solucion",
+        "arregl",
+        "reinici",
+        "restart",
+        "deten",
+        " stop ",
+        "arranc",
+        " start ",
+        "apaga",
+        "enciende",
+        "crear",
+        "crea ",
+        "borr",
+        "elimin",
+    )
+
+    if any(
+        phrase in padded
+        for phrase in blocked_phrases
+    ):
+        return None
+
+    if any(
+        stem in padded
+        for stem in blocked_stems
+    ):
+        return None
+
+    status_terms = (
+        " estado ",
+        " estat ",
+        " status ",
+        " salud ",
+        " health ",
+        " como esta ",
+        " como va ",
+        " com esta ",
+        " how is ",
+        " funciona ",
+        " funcionando ",
+        " activo ",
+        " activa ",
+        " online ",
+        " caido ",
+        " caida ",
+    )
+
+    backup_terms = (
+        " backup ",
+        " backups ",
+        " copia ",
+        " copias ",
+        " respaldo ",
+        " respaldos ",
+    )
+
+    if (
+        " palworld " in padded
+        and any(
+            term in padded
+            for term in backup_terms
+        )
+    ):
+        return {
+            "action": "palworld_backups",
+        }
+
+    palworld_terms = status_terms + (
+        " jugadores ",
+        " fps ",
+        " uptime ",
+        " version ",
+    )
+
+    if (
+        " palworld " in padded
+        and any(
+            term in padded
+            for term in palworld_terms
+        )
+    ):
+        return {
+            "action": "palworld_status",
+        }
+
+    gpu_subject = (
+        " gpu " in padded
+        or " vram " in padded
+    )
+
+    gpu_terms = status_terms + (
+        " uso ",
+        " us ",
+        " utilizacion ",
         " temperatura ",
-        " temperature ",
-        " contenedor ",
-        " contenedores ",
-        " container ",
-        " containers ",
+        " consumo ",
+        " memoria ",
+        " libre ",
+        " disponible ",
+        " lliure ",
+        " lliures ",
+        " cuanta ",
+        " cuanto ",
+        " quant ",
+        " quanta ",
+        " quants ",
+        " quantes ",
+    )
+
+    if (
+        gpu_subject
+        and any(
+            term in padded
+            for term in gpu_terms
+        )
+    ):
+        return {
+            "action": "gpu",
+        }
+
+    for alias, service in (
+        DIRECT_SERVICE_ALIASES.items()
+    ):
+        if (
+            f" {alias} " in padded
+            and any(
+                term in padded
+                for term in status_terms
+            )
+        ):
+            return {
+                "action": "service",
+                "service": service,
+            }
+
+    homelab_subject = (
+        " homelab " in padded
+        or " home lab " in padded
+    )
+
+    general_detail_terms = (
         " servicio ",
         " servicios ",
         " service ",
         " services ",
-        " copia ",
-        " copias ",
-        " backup ",
-        " backups ",
-        " diagnost",
-        " detalle",
-        " especific",
-        " reinici",
-        " restart",
-        " arranc",
-        " start ",
-        " detener",
-        " stop ",
-        " apagar",
+        " contenedor ",
+        " contenedores ",
+        " container ",
+        " containers ",
     )
 
-    return not any(
-        fragment in padded
-        for fragment in blocked_fragments
+    if (
+        homelab_subject
+        and any(
+            term in padded
+            for term in status_terms
+        )
+        and not any(
+            term in padded
+            for term in general_detail_terms
+        )
+    ):
+        return {
+            "action": "status",
+        }
+
+    return None
+
+
+def is_direct_homelab_status_request(
+    text: str,
+    domains,
+    continuation: bool = False,
+) -> bool:
+    """Backward-compatible wrapper for whole-homelab status."""
+    return (
+        classify_direct_homelab_request(
+            text,
+            domains,
+            continuation=continuation,
+        )
+        == {"action": "status"}
     )
 
 
@@ -574,17 +1016,25 @@ class HomelabTool:
                     result
                 )
 
-                return {
-                    "output": direct_response,
-                    "direct_response": direct_response,
-                    "terminal_response": True,
-                    "exit_code": 0,
-                }
+            elif action == "gpu":
+                result = client.status()
+                direct_response = format_homelab_gpu(
+                    result
+                )
 
-            if action == "doctor":
-                result = client.doctor()
+            elif action == "palworld_status":
+                result = client.palworld_status()
+                direct_response = format_palworld_status(
+                    result
+                )
 
-            else:
+            elif action == "palworld_backups":
+                result = client.palworld_backups()
+                direct_response = format_palworld_backups(
+                    result
+                )
+
+            elif action == "service":
                 if not service:
                     return {
                         "error": (
@@ -595,13 +1045,26 @@ class HomelabTool:
                     }
 
                 result = client.service(service)
+                direct_response = format_homelab_service(
+                    result
+                )
+
+            else:
+                result = client.doctor()
+
+                return {
+                    "output": json.dumps(
+                        result,
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                    "exit_code": 0,
+                }
 
             return {
-                "output": json.dumps(
-                    result,
-                    indent=2,
-                    ensure_ascii=False,
-                ),
+                "output": direct_response,
+                "direct_response": direct_response,
+                "terminal_response": True,
                 "exit_code": 0,
             }
 

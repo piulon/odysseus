@@ -2668,24 +2668,33 @@ async def stream_agent_loop(
         )
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
 
-    # Simple whole-homelab status requests do not need an LLM round.
-    # Execute the deterministic read-only tool directly, while preserving
-    # the normal frontend tool card, response delta, metrics and SSE close.
+    # Deterministic homelab read-only requests do not need an LLM round.
+    # The classifier returns the canonical tool command; this loop contains
+    # no service-specific linguistic routing rules.
     try:
         from src.agent_tools.homelab_tools import (
             HomelabTool as _FastHomelabTool,
-            is_direct_homelab_status_request
-            as _is_direct_homelab_status_request,
+            classify_direct_homelab_request
+            as _classify_direct_homelab_request,
         )
 
-        _direct_homelab_status = (
-            _is_direct_homelab_status_request(
+        _fast_command_args = (
+            _classify_direct_homelab_request(
                 _last_user,
                 _intent.get("domains") or set(),
                 continuation=bool(
                     _intent.get("continuation")
                 ),
             )
+        )
+
+        if _fast_command_args is not None:
+            _intent["domains"] = {"homelab"}
+            _low_signal_turn = False
+            _direct_low_signal = False
+
+        _direct_homelab_request = (
+            _fast_command_args is not None
             and not guide_only
             and not plan_mode
             and not approved_plan
@@ -2715,22 +2724,40 @@ async def stream_agent_loop(
                 and tool_policy.blocks("homelab")
             )
         )
+
     except Exception as _fast_classify_err:
         logger.warning(
             "[agent-fastpath] classification failed: %s",
             _fast_classify_err,
         )
-        _direct_homelab_status = False
 
+        _fast_command_args = None
+        _direct_homelab_request = False
 
-    if set(_intent.get("domains") or set()) == {"homelab"}:
+    if (
+        _fast_command_args is not None
+        or set(
+            _intent.get("domains") or set()
+        ) == {"homelab"}
+    ):
         logger.info(
             "[agent-fastpath] eligibility=%s "
+            "action=%s service=%s "
             "workspace=%s active_email=%s "
             "forced=%s relevant=%s uploads=%s "
             "active_doc=%s guide_only=%s "
             "plan_mode=%s",
-            _direct_homelab_status,
+            _direct_homelab_request,
+            (
+                _fast_command_args.get("action")
+                if _fast_command_args
+                else None
+            ),
+            (
+                _fast_command_args.get("service")
+                if _fast_command_args
+                else None
+            ),
             bool(workspace),
             bool(active_email),
             sorted(forced_tools or []),
@@ -2741,11 +2768,17 @@ async def stream_agent_loop(
             plan_mode,
         )
 
-    if _direct_homelab_status:
+    if _direct_homelab_request:
         _fast_start = time.time()
+
         _fast_command = json.dumps(
-            {"action": "status"},
+            _fast_command_args,
             ensure_ascii=False,
+        )
+
+        _fast_action = str(
+            _fast_command_args.get("action")
+            or ""
         )
 
         try:
@@ -2770,12 +2803,15 @@ async def stream_agent_loop(
             ):
                 raise RuntimeError(
                     _fast_result.get("error")
-                    or "invalid deterministic status result"
+                    or (
+                        "invalid deterministic "
+                        "homelab result"
+                    )
                 )
 
         except Exception as _fast_exec_err:
             logger.warning(
-                "[agent-fastpath] homelab status failed; "
+                "[agent-fastpath] homelab request failed; "
                 "continuing through normal agent path: %s",
                 _fast_exec_err,
             )
@@ -2846,7 +2882,11 @@ async def stream_agent_loop(
                 ),
                 "agent_rounds": 0,
                 "tool_calls": 1,
-                "direct_homelab_status": True,
+                "direct_homelab_request": True,
+                "direct_homelab_status": (
+                    _fast_action == "status"
+                ),
+                "direct_homelab_action": _fast_action,
             }
 
             yield (
@@ -2861,8 +2901,10 @@ async def stream_agent_loop(
             )
 
             logger.info(
-                "[agent-fastpath] homelab status "
-                "completed without LLM in %.3fs",
+                "[agent-fastpath] homelab request "
+                "completed without LLM "
+                "action=%s in %.3fs",
+                _fast_action,
                 _fast_duration,
             )
 

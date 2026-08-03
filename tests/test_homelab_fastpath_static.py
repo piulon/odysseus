@@ -9,10 +9,26 @@ class HomelabFastPathStaticTests(unittest.TestCase):
             "/app/src/agent_loop.py"
         ).read_text(encoding="utf-8")
 
+        cls.marker = (
+            "# Deterministic homelab read-only "
+            "requests do not need an LLM round."
+        )
+
+    def fastpath_block(self):
+        start = self.source.index(
+            self.marker
+        )
+
+        end = self.source.index(
+            "# RAG-based tool selection",
+            start,
+        )
+
+        return self.source[start:end]
+
     def test_fastpath_precedes_tool_retrieval(self):
         fastpath = self.source.index(
-            "# Simple whole-homelab status "
-            "requests do not need an LLM round."
+            self.marker
         )
 
         retrieval = self.source.index(
@@ -26,42 +42,45 @@ class HomelabFastPathStaticTests(unittest.TestCase):
         self.assertLess(fastpath, retrieval)
         self.assertLess(fastpath, model_loop)
 
+    def test_classifier_returns_dynamic_command(self):
+        block = self.fastpath_block()
+
+        self.assertIn(
+            "classify_direct_homelab_request",
+            block,
+        )
+
+        self.assertIn(
+            "_fast_command_args",
+            block,
+        )
+
+        self.assertIn(
+            "json.dumps(",
+            block,
+        )
+
+        self.assertNotIn(
+            '{"action": "status"}',
+            block,
+        )
+
     def test_fastpath_preserves_sse_contract(self):
-        start = self.source.index(
-            "# Simple whole-homelab status "
-            "requests do not need an LLM round."
-        )
-
-        end = self.source.index(
-            "# RAG-based tool selection",
-            start,
-        )
-
-        block = self.source[start:end]
+        block = self.fastpath_block()
 
         for required in (
             '"type": "tool_start"',
             '"type": "tool_output"',
             '"type": "metrics"',
-            '"action": "status"',
             'yield "data: [DONE]',
+            "direct_homelab_request",
+            "direct_homelab_action",
             "return",
         ):
             self.assertIn(required, block)
 
-
-    def test_passive_ui_context_does_not_block_fastpath(self):
-        start = self.source.index(
-            "# Simple whole-homelab status "
-            "requests do not need an LLM round."
-        )
-
-        end = self.source.index(
-            "# RAG-based tool selection",
-            start,
-        )
-
-        block = self.source[start:end]
+    def test_passive_ui_context_is_allowed(self):
+        block = self.fastpath_block()
         compact = " ".join(block.split())
 
         self.assertNotIn(
@@ -80,35 +99,6 @@ class HomelabFastPathStaticTests(unittest.TestCase):
         )
 
         self.assertIn(
-            'set(relevant_tools) == {"homelab"}',
-            compact,
-        )
-
-        self.assertIn(
-            "[agent-fastpath] eligibility=",
-            block,
-        )
-
-
-    def test_passive_forced_web_tools_are_allowed(self):
-        start = self.source.index(
-            "# Simple whole-homelab status "
-            "requests do not need an LLM round."
-        )
-
-        end = self.source.index(
-            "# RAG-based tool selection",
-            start,
-        )
-
-        block = self.source[start:end]
-
-        self.assertIn(
-            'set(forced_tools).issubset(',
-            block,
-        )
-
-        self.assertIn(
             '"web_fetch"',
             block,
         )
@@ -119,7 +109,7 @@ class HomelabFastPathStaticTests(unittest.TestCase):
         )
 
         self.assertIn(
-            '"homelab"',
+            "[agent-fastpath] eligibility=",
             block,
         )
 

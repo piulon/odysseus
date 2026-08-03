@@ -119,6 +119,12 @@ class HomelabClient:
     def status(self) -> Dict[str, Any]:
         return self._request("/v1/status")
 
+    def palworld_status(self) -> Dict[str, Any]:
+        return self._request("/v1/palworld/status")
+
+    def palworld_backups(self) -> Dict[str, Any]:
+        return self._request("/v1/palworld/backups")
+
     def doctor(self) -> Dict[str, Any]:
         return self._request("/v1/doctor")
 

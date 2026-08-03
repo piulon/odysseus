@@ -1,30 +1,44 @@
 import unittest
 
 from src.agent_tools.homelab_tools import (
-    is_direct_homelab_status_request,
+    classify_direct_homelab_request,
 )
 
 
 class HomelabFastPathTests(unittest.TestCase):
-    def assert_direct(self, text):
-        self.assertTrue(
-            is_direct_homelab_status_request(
+    def assert_command(
+        self,
+        text,
+        expected,
+        domains=None,
+    ):
+        self.assertEqual(
+            classify_direct_homelab_request(
                 text,
-                {"homelab"},
+                {"homelab"}
+                if domains is None
+                else domains,
+            ),
+            expected,
+            text,
+        )
+
+    def assert_normal_agent(
+        self,
+        text,
+        domains=None,
+    ):
+        self.assertIsNone(
+            classify_direct_homelab_request(
+                text,
+                {"homelab"}
+                if domains is None
+                else domains,
             ),
             text,
         )
 
-    def assert_normal_agent(self, text):
-        self.assertFalse(
-            is_direct_homelab_status_request(
-                text,
-                {"homelab"},
-            ),
-            text,
-        )
-
-    def test_simple_status_requests_are_direct(self):
+    def test_general_status_commands(self):
         for text in (
             "Estado del homelab",
             "¿Cuál es el estado del homelab?",
@@ -33,24 +47,72 @@ class HomelabFastPathTests(unittest.TestCase):
             "Quin és l'estat del homelab?",
         ):
             with self.subTest(text=text):
-                self.assert_direct(text)
+                self.assert_command(
+                    text,
+                    {"action": "status"},
+                )
 
-    def test_specific_requests_use_normal_agent(self):
+    def test_specific_status_commands(self):
+        cases = (
+            (
+                "Estado de Grafana",
+                {},
+                {
+                    "action": "service",
+                    "service": "grafana",
+                },
+            ),
+            (
+                "Estado de Palworld",
+                {"homelab"},
+                {"action": "palworld_status"},
+            ),
+            (
+                "Estado de las copias de Palworld",
+                {"homelab"},
+                {"action": "palworld_backups"},
+            ),
+            (
+                "Estado de la GPU",
+                {"homelab"},
+                {"action": "gpu"},
+            ),
+            (
+                "Uso de VRAM",
+                {"homelab"},
+                {"action": "gpu"},
+            ),
+            (
+                "Quanta VRAM lliure hi ha?",
+                {"homelab"},
+                {"action": "gpu"},
+            ),
+        )
+
+        for text, domains, expected in cases:
+            with self.subTest(text=text):
+                self.assert_command(
+                    text,
+                    expected,
+                    domains=domains,
+                )
+
+    def test_complex_requests_use_normal_agent(self):
         for text in (
-            "Estado de Palworld",
-            "Revisa Grafana",
             "¿Por qué usa tanta VRAM el homelab?",
-            "Diagnostica el homelab",
-            "Reinicia el homelab",
-            "Estado de los servicios del homelab",
+            "Diagnostica la GPU",
+            "Reinicia Palworld",
+            "Crea una copia de Palworld",
             "Estado del homelab y de Palworld",
+            "Estado de los servicios del homelab",
+            "Estado de Grafana y Prometheus",
         ):
             with self.subTest(text=text):
                 self.assert_normal_agent(text)
 
     def test_continuations_are_not_direct(self):
-        self.assertFalse(
-            is_direct_homelab_status_request(
+        self.assertIsNone(
+            classify_direct_homelab_request(
                 "sí, revísalo",
                 {"homelab"},
                 continuation=True,
@@ -58,11 +120,9 @@ class HomelabFastPathTests(unittest.TestCase):
         )
 
     def test_other_domains_are_not_direct(self):
-        self.assertFalse(
-            is_direct_homelab_status_request(
-                "Estado del homelab",
-                {"homelab", "web"},
-            )
+        self.assert_normal_agent(
+            "Estado del homelab",
+            domains={"homelab", "web"},
         )
 
 
