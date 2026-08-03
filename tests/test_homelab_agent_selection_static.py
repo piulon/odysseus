@@ -19,24 +19,65 @@ class HomelabAgentSelectionStaticTests(
             self.source,
         )
 
-    def test_agent_adds_homelab_to_tools(self):
+    def test_diagnostic_forces_homelab(self):
+        marker = (
+            "forced read-only "
+            '"\n'
+            '            "homelab diagnostic tool=%s'
+        )
+
         self.assertIn(
-            '_relevant_tools.add("homelab")',
+            marker,
             self.source,
         )
 
-    def test_hint_runs_after_fast_path(self):
-        fast_position = self.source.index(
+        marker_position = self.source.index(
+            marker
+        )
+
+        preceding = self.source[
+            max(0, marker_position - 700):
+            marker_position
+        ]
+
+        self.assertIn(
+            'exclusive_tools = {"homelab"}',
+            preceding,
+        )
+
+    def test_force_occurs_after_direct_fastpath(self):
+        fastpath_position = self.source.index(
             "if _direct_homelab_request:"
         )
 
-        selection_position = self.source.index(
-            '_relevant_tools.add("homelab")'
+        diagnostic_position = self.source.index(
+            "forced read-only "
         )
 
         self.assertLess(
-            fast_position,
-            selection_position,
+            fastpath_position,
+            diagnostic_position,
+        )
+
+    def test_diagnostic_result_is_not_terminal(self):
+        homelab_result_position = self.source.index(
+            'block.tool_type == "homelab"'
+        )
+
+        bypass_position = self.source.index(
+            "and not "
+            "_homelab_agent_tool_required",
+            homelab_result_position,
+        )
+
+        feedback_position = self.source.index(
+            "_append_tool_results(",
+            homelab_result_position,
+        )
+
+        self.assertLess(
+            bypass_position,
+            feedback_position,
         )
 
 

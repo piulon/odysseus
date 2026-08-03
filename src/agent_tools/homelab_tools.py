@@ -1142,6 +1142,39 @@ def should_include_homelab_tool(
 
 
 
+def canonicalize_homelab_service(
+    value: Any,
+) -> str | None:
+    """Resolve case-insensitive service names and known aliases."""
+    normalized = _normalize_direct_homelab_text(
+        str(value or "")
+    )
+
+    if not normalized:
+        return None
+
+    service = DIRECT_SERVICE_ALIASES.get(
+        normalized
+    )
+
+    if service:
+        return service
+
+    for canonical in set(
+        DIRECT_SERVICE_ALIASES.values()
+    ):
+        if (
+            _normalize_direct_homelab_text(
+                canonical
+            )
+            == normalized
+        ):
+            return canonical
+
+    return None
+
+
+
 def is_direct_homelab_status_request(
     text: str,
     domains,
@@ -1188,9 +1221,13 @@ class HomelabTool:
             args.get("action", "status")
         ).lower()
 
-        service = str(
+        raw_service = str(
             args.get("service", "")
         ).strip()
+
+        service = canonicalize_homelab_service(
+            raw_service
+        )
 
         raw_services = args.get(
             "services",
@@ -1198,18 +1235,58 @@ class HomelabTool:
         )
 
         services: list[str] = []
+        invalid_services: list[str] = []
 
         if isinstance(raw_services, list):
             for item in raw_services:
-                candidate = str(
+                raw_candidate = str(
                     item or ""
                 ).strip()
 
+                candidate = (
+                    canonicalize_homelab_service(
+                        raw_candidate
+                    )
+                )
+
                 if (
+                    raw_candidate
+                    and candidate is None
+                ):
+                    invalid_services.append(
+                        raw_candidate
+                    )
+
+                elif (
                     candidate
                     and candidate not in services
                 ):
                     services.append(candidate)
+
+        if (
+            action == "service"
+            and raw_service
+            and service is None
+        ):
+            return {
+                "error": (
+                    "homelab: unknown service "
+                    f"'{raw_service}'"
+                ),
+                "exit_code": 1,
+            }
+
+        if (
+            action == "services"
+            and invalid_services
+        ):
+            return {
+                "error": (
+                    "homelab: unknown services: "
+                    + ", ".join(invalid_services)
+                ),
+                "exit_code": 1,
+            }
 
         if action in BLOCKED_ACTIONS:
             return {

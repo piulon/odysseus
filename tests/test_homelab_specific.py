@@ -117,6 +117,74 @@ class HomelabSpecificFormatterTests(
         self.assertIn("correcta", text)
         self.assertIn("backup.tar.gz", text)
 
+    def test_service_name_is_canonicalized(self):
+        with patch(
+            "src.agent_tools.homelab_tools."
+            "HomelabClient"
+        ) as client_class:
+            client = client_class.return_value
+
+            client.service.return_value = {
+                "ok": True,
+                "service": {
+                    "service": "prometheus",
+                    "present": True,
+                    "running": True,
+                    "status": "running",
+                },
+            }
+
+            result = asyncio.run(
+                HomelabTool().execute(
+                    json.dumps({
+                        "action": "service",
+                        "service": "Prometheus",
+                    }),
+                    {},
+                )
+            )
+
+        client.service.assert_called_once_with(
+            "prometheus"
+        )
+
+        self.assertEqual(
+            result.get("exit_code"),
+            0,
+        )
+
+        self.assertIn(
+            "Prometheus",
+            result.get("direct_response", ""),
+        )
+
+    def test_unknown_service_is_rejected_locally(self):
+        with patch(
+            "src.agent_tools.homelab_tools."
+            "HomelabClient"
+        ) as client_class:
+            result = asyncio.run(
+                HomelabTool().execute(
+                    json.dumps({
+                        "action": "service",
+                        "service": "Servicio inexistente",
+                    }),
+                    {},
+                )
+            )
+
+        client_class.return_value.service.assert_not_called()
+
+        self.assertEqual(
+            result.get("exit_code"),
+            1,
+        )
+
+        self.assertIn(
+            "unknown service",
+            result.get("error", ""),
+        )
+
     def test_multi_service_action_is_terminal(self):
         with patch(
             "src.agent_tools.homelab_tools."

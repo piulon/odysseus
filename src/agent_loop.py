@@ -3267,8 +3267,9 @@ async def stream_agent_loop(
                 _removed_doc_file_tools,
             )
 
-    # Read-only homelab investigations remain on the agent path, but the
-    # homelab schema must remain available when generic retrieval misses.
+    # Read-only homelab investigations must start with real operator data.
+    # Clamp the first-round schema to homelab so smaller local models cannot
+    # substitute ask_teacher, web search, or unrelated administration tools.
     if (
         _homelab_agent_tool_required
         and not guide_only
@@ -3279,18 +3280,12 @@ async def stream_agent_loop(
             and tool_policy.blocks("homelab")
         )
     ):
-        if _relevant_tools is None:
-            from src.tool_index import ALWAYS_AVAILABLE
-
-            _relevant_tools = set(
-                ALWAYS_AVAILABLE
-            )
-
-        _relevant_tools.add("homelab")
+        exclusive_tools = {"homelab"}
 
         logger.info(
-            "[agent-intent] added read-only "
-            "homelab tool for agent investigation"
+            "[agent-intent] forced read-only "
+            "homelab diagnostic tool=%s",
+            sorted(exclusive_tools),
         )
 
     # A deterministic, read-only homelab status request has one unambiguous
@@ -4628,6 +4623,7 @@ async def stream_agent_loop(
                 block.tool_type == "homelab"
                 and result.get("terminal_response")
                 and not result.get("error")
+                and not _homelab_agent_tool_required
             ):
                 _homelab_text = str(
                     result.get("direct_response")
