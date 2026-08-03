@@ -3274,6 +3274,7 @@ async def stream_agent_loop(
     actual_model = model
     total_tool_calls = 0  # for budget enforcement
     _ody_notes_tool_completed = False
+    _ody_homelab_status_completed = False
 
     # Loop-breaker state. Small models (e.g. deepseek-v4-flash) can get
     # stuck firing the same tool call over and over with no text — burns
@@ -4340,6 +4341,47 @@ async def stream_agent_loop(
                 tool_output_data["diff"] = result["diff"]
             yield f'data: {json.dumps(tool_output_data)}\n\n'
 
+            if (
+                block.tool_type == "homelab"
+                and result.get("terminal_response")
+                and not result.get("error")
+            ):
+                _homelab_text = str(
+                    result.get("direct_response")
+                    or result.get("output")
+                    or ""
+                ).strip()
+
+                if _homelab_text:
+                    if not _ody_homelab_status_completed:
+                        _clean_current = strip_tool_blocks(
+                            full_response
+                        ).strip()
+
+                        _prefix = (
+                            "\n\n"
+                            if _clean_current
+                            else ""
+                        )
+
+                        full_response = (
+                            _clean_current
+                            + _prefix
+                            + _homelab_text
+                        ).strip()
+
+                        yield (
+                            "data: "
+                            + json.dumps({
+                                "delta":
+                                    _prefix
+                                    + _homelab_text
+                            })
+                            + "\n\n"
+                        )
+
+                    _ody_homelab_status_completed = True
+
             if block.tool_type == "manage_notes":
                 _notes_action = ""
                 try:
@@ -4473,6 +4515,13 @@ async def stream_agent_loop(
         # arrives as the next message and the agent resumes from there. The
         # question text is already in the streamed response, so it persists.
         if _awaiting_user:
+            break
+
+        if _ody_homelab_status_completed:
+            logger.info(
+                "[agent] homelab status completed "
+                "from deterministic tool output"
+            )
             break
 
         if _doc_stream_create_completed:
