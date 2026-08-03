@@ -75,7 +75,7 @@ class HomelabFastPathStaticTests(unittest.TestCase):
         )
 
         self.assertIn(
-            'set(forced_tools) == {"homelab"}',
+            "set(forced_tools).issubset(",
             compact,
         )
 
@@ -86,6 +86,40 @@ class HomelabFastPathStaticTests(unittest.TestCase):
 
         self.assertIn(
             "[agent-fastpath] eligibility=",
+            block,
+        )
+
+
+    def test_passive_forced_web_tools_are_allowed(self):
+        start = self.source.index(
+            "# Simple whole-homelab status "
+            "requests do not need an LLM round."
+        )
+
+        end = self.source.index(
+            "# RAG-based tool selection",
+            start,
+        )
+
+        block = self.source[start:end]
+
+        self.assertIn(
+            'set(forced_tools).issubset(',
+            block,
+        )
+
+        self.assertIn(
+            '"web_fetch"',
+            block,
+        )
+
+        self.assertIn(
+            '"web_search"',
+            block,
+        )
+
+        self.assertIn(
+            '"homelab"',
             block,
         )
 

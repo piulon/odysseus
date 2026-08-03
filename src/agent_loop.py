@@ -2691,7 +2691,13 @@ async def stream_agent_loop(
             and not approved_plan
             and (
                 not forced_tools
-                or set(forced_tools) == {"homelab"}
+                or set(forced_tools).issubset(
+                    {
+                        "homelab",
+                        "web_fetch",
+                        "web_search",
+                    }
+                )
             )
             and (
                 not relevant_tools
