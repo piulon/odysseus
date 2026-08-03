@@ -391,6 +391,127 @@ def format_homelab_status(
     return "\n".join(lines)
 
 
+
+def is_direct_homelab_status_request(
+    text: str,
+    domains,
+    continuation: bool = False,
+) -> bool:
+    """Return True only for a simple whole-homelab status request.
+
+    Service-specific inspection, diagnosis and control requests must continue
+    through the normal agent path.
+    """
+    import re as _re
+    import unicodedata as _unicodedata
+
+    if continuation:
+        return False
+
+    if set(domains or ()) != {"homelab"}:
+        return False
+
+    normalized = _unicodedata.normalize(
+        "NFKD",
+        str(text or ""),
+    )
+
+    normalized = "".join(
+        character
+        for character in normalized
+        if not _unicodedata.combining(character)
+    ).lower()
+
+    normalized = _re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        normalized,
+    ).strip()
+
+    if not normalized:
+        return False
+
+    words = normalized.split()
+
+    if len(words) > 11:
+        return False
+
+    if (
+        "homelab" not in normalized
+        and "home lab" not in normalized
+    ):
+        return False
+
+    status_expressions = (
+        "estado",
+        "status",
+        "salud",
+        "health",
+        "estat",
+        "como esta",
+        "como va",
+        "com esta",
+        "how is",
+    )
+
+    if not any(
+        expression in normalized
+        for expression in status_expressions
+    ):
+        return False
+
+    padded = f" {normalized} "
+
+    blocked_fragments = (
+        " por que ",
+        " porque ",
+        " why ",
+        " y ",
+        " and ",
+        " palworld ",
+        " grafana ",
+        " prometheus ",
+        " ollama ",
+        " chromadb ",
+        " searxng ",
+        " caddy ",
+        " homepage ",
+        " portainer ",
+        " comfyui ",
+        " gpu ",
+        " vram ",
+        " temperatura ",
+        " temperature ",
+        " contenedor ",
+        " contenedores ",
+        " container ",
+        " containers ",
+        " servicio ",
+        " servicios ",
+        " service ",
+        " services ",
+        " copia ",
+        " copias ",
+        " backup ",
+        " backups ",
+        " diagnost",
+        " detalle",
+        " especific",
+        " reinici",
+        " restart",
+        " arranc",
+        " start ",
+        " detener",
+        " stop ",
+        " apagar",
+    )
+
+    return not any(
+        fragment in padded
+        for fragment in blocked_fragments
+    )
+
+
 class HomelabTool:
     async def execute(
         self,

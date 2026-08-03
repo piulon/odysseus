@@ -1086,7 +1086,7 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     )
     _homelab_inspection = has(
         r"\b(status|state|health|check|inspect|running|active|usage|temperature|"
-        r"how many|estado|comprueba|comprobar|revisa|revisar|funcionando|"
+        r"how many|estado|estat|com\\s+est[aà]|comprueba|comprobar|revisa|revisar|funcionando|"
         r"activos?|uso|temperatura|cu[aá]ntos?)\b"
     )
     if _homelab_subject and _homelab_inspection:
@@ -2667,6 +2667,179 @@ async def stream_agent_loop(
             _last_user[:80],
         )
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
+
+    # Simple whole-homelab status requests do not need an LLM round.
+    # Execute the deterministic read-only tool directly, while preserving
+    # the normal frontend tool card, response delta, metrics and SSE close.
+    try:
+        from src.agent_tools.homelab_tools import (
+            HomelabTool as _FastHomelabTool,
+            is_direct_homelab_status_request
+            as _is_direct_homelab_status_request,
+        )
+
+        _direct_homelab_status = (
+            _is_direct_homelab_status_request(
+                _last_user,
+                _intent.get("domains") or set(),
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+            and not guide_only
+            and not plan_mode
+            and not approved_plan
+            and not forced_tools
+            and not relevant_tools
+            and not uploaded_files
+            and not workspace
+            and not active_email
+            and not _active_document_relevant
+            and "homelab" not in disabled_tools
+            and (
+                not exclusive_tools
+                or set(exclusive_tools) == {"homelab"}
+            )
+            and not (
+                tool_policy
+                and tool_policy.blocks("homelab")
+            )
+        )
+    except Exception as _fast_classify_err:
+        logger.warning(
+            "[agent-fastpath] classification failed: %s",
+            _fast_classify_err,
+        )
+        _direct_homelab_status = False
+
+    if _direct_homelab_status:
+        _fast_start = time.time()
+        _fast_command = json.dumps(
+            {"action": "status"},
+            ensure_ascii=False,
+        )
+
+        try:
+            _fast_result = await _FastHomelabTool().execute(
+                _fast_command,
+                {},
+            )
+
+            _fast_text = str(
+                _fast_result.get("direct_response")
+                or _fast_result.get("output")
+                or ""
+            ).strip()
+
+            if (
+                _fast_result.get("error")
+                or _fast_result.get("exit_code") != 0
+                or not _fast_result.get(
+                    "terminal_response"
+                )
+                or not _fast_text
+            ):
+                raise RuntimeError(
+                    _fast_result.get("error")
+                    or "invalid deterministic status result"
+                )
+
+        except Exception as _fast_exec_err:
+            logger.warning(
+                "[agent-fastpath] homelab status failed; "
+                "continuing through normal agent path: %s",
+                _fast_exec_err,
+            )
+
+        else:
+            _fast_duration = (
+                time.time() - _fast_start
+            )
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "tool_start",
+                        "tool": "homelab",
+                        "command": _fast_command,
+                        "full_command": _fast_command,
+                        "round": 0,
+                    }
+                )
+                + "\n\n"
+            )
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "tool_output",
+                        "tool": "homelab",
+                        "command": _fast_command,
+                        "output": _fast_text,
+                        "exit_code": 0,
+                    }
+                )
+                + "\n\n"
+            )
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {"delta": _fast_text}
+                )
+                + "\n\n"
+            )
+
+            _fast_metrics = {
+                "model": model,
+                "requested_model": model,
+                "input_tokens": estimate_tokens(
+                    [
+                        {
+                            "role": "user",
+                            "content": _last_user,
+                        }
+                    ]
+                ),
+                "output_tokens": max(
+                    len(_fast_text) // 4,
+                    1,
+                ),
+                "total_time": round(
+                    _fast_duration,
+                    3,
+                ),
+                "response_time": round(
+                    _fast_duration,
+                    3,
+                ),
+                "agent_rounds": 0,
+                "tool_calls": 1,
+                "direct_homelab_status": True,
+            }
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "metrics",
+                        "data": _fast_metrics,
+                    }
+                )
+                + "\n\n"
+            )
+
+            logger.info(
+                "[agent-fastpath] homelab status "
+                "completed without LLM in %.3fs",
+                _fast_duration,
+            )
+
+            yield "data: [DONE]\n\n"
+            return
+
     if _direct_low_signal:
         logger.info("[agent] direct low-signal reply path for latest=%r", _last_user[:80])
         direct_messages = (
