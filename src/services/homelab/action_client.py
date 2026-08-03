@@ -114,6 +114,24 @@ class HomelabActionClient:
         )
 
 
+    def start_palworld(
+        self,
+    ) -> Dict[str, Any]:
+        """Start only the dedicated Palworld service."""
+
+        return self._post(
+            "/v1/palworld/start"
+        )
+
+    def stop_palworld(
+        self,
+    ) -> Dict[str, Any]:
+        """Stop only the dedicated Palworld service."""
+
+        return self._post(
+            "/v1/palworld/stop"
+        )
+
     def restart_palworld(
         self,
     ) -> Dict[str, Any]:

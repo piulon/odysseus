@@ -2775,6 +2775,345 @@ async def stream_agent_loop(
         )
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
 
+    # Explicit Palworld start and confirmed stop requests are deterministic.
+    # Start is immediate for administrators. Stop requires a short-lived
+    # owner/session authorization and always creates a verified backup first.
+    try:
+        from src.services.homelab.palworld_lifecycle import (
+            classify_palworld_lifecycle_turn
+            as _classify_palworld_lifecycle_turn,
+        )
+
+        _palworld_lifecycle_turn = (
+            _classify_palworld_lifecycle_turn(
+                _last_user,
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+    except Exception as _lifecycle_classify_error:
+        logger.warning(
+            "[agent-action] Palworld lifecycle "
+            "classification failed: %s",
+            _lifecycle_classify_error,
+        )
+        _palworld_lifecycle_turn = None
+
+    _palworld_lifecycle_plain_context = (
+        _palworld_lifecycle_turn is not None
+        and not guide_only
+        and not plan_mode
+        and not approved_plan
+        and not workspace
+        and not active_email
+        and not uploaded_files
+        and not _active_document_relevant
+        and (
+            not forced_tools
+            or set(forced_tools).issubset({
+                "homelab",
+                "web_fetch",
+                "web_search",
+            })
+        )
+        and (
+            not relevant_tools
+            or set(relevant_tools) == {"homelab"}
+        )
+        and (
+            not exclusive_tools
+            or set(exclusive_tools) == {"homelab"}
+        )
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    )
+
+    if _palworld_lifecycle_plain_context:
+        from src.tool_security import (
+            owner_is_admin_or_single_user
+            as _owner_can_control_palworld,
+        )
+
+        _lifecycle_started = time.time()
+
+        _lifecycle_action = str(
+            _palworld_lifecycle_turn.get(
+                "action"
+            )
+            or ""
+        )
+
+        _lifecycle_kind = str(
+            _palworld_lifecycle_turn.get(
+                "kind"
+            )
+            or ""
+        )
+
+        _lifecycle_effectful = (
+            _lifecycle_action == "start"
+            or (
+                _lifecycle_action == "stop"
+                and _lifecycle_kind
+                == "confirmation"
+            )
+        )
+
+        _lifecycle_command_action = (
+            "palworld_start"
+            if _lifecycle_action == "start"
+            else "palworld_stop_confirmed"
+        )
+
+        _lifecycle_command = json.dumps(
+            {
+                "action":
+                    _lifecycle_command_action,
+            },
+            ensure_ascii=False,
+        )
+
+        if _lifecycle_effectful:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_start",
+                    "tool": "homelab",
+                    "command": _lifecycle_command,
+                    "full_command":
+                        _lifecycle_command,
+                    "round": 0,
+                })
+                + "\n\n"
+            )
+
+        _lifecycle_confirmation_required = False
+
+        try:
+            if not _owner_can_control_palworld(
+                owner
+            ):
+                raise PermissionError(
+                    "Esta acción requiere una "
+                    "sesión de administrador"
+                )
+
+            if (
+                _lifecycle_action == "stop"
+                and not str(
+                    session_id or ""
+                ).strip()
+            ):
+                raise PermissionError(
+                    "La parada requiere una "
+                    "sesión persistente"
+                )
+
+            if _lifecycle_action == "start":
+                from src.services.homelab.palworld_lifecycle import (
+                    format_start_result
+                    as _format_start_result,
+                    start_palworld_verified
+                    as _start_palworld_verified,
+                )
+
+                _lifecycle_result = (
+                    await asyncio.to_thread(
+                        _start_palworld_verified
+                    )
+                )
+
+                _lifecycle_text = (
+                    _format_start_result(
+                        _lifecycle_result,
+                        _last_user,
+                    )
+                )
+
+            elif (
+                _lifecycle_action == "stop"
+                and _lifecycle_kind == "request"
+            ):
+                from src.services.homelab.palworld_lifecycle import (
+                    format_stop_confirmation
+                    as _format_stop_confirmation,
+                    prepare_palworld_stop_confirmation
+                    as _prepare_palworld_stop_confirmation,
+                )
+
+                _lifecycle_result = (
+                    await asyncio.to_thread(
+                        _prepare_palworld_stop_confirmation,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                    )
+                )
+
+                _lifecycle_text = (
+                    _format_stop_confirmation(
+                        _lifecycle_result,
+                        _last_user,
+                    )
+                )
+
+                _lifecycle_confirmation_required = True
+
+            elif (
+                _lifecycle_action == "stop"
+                and _lifecycle_kind
+                == "confirmation"
+            ):
+                from src.services.homelab.palworld_lifecycle import (
+                    execute_confirmed_palworld_stop
+                    as _execute_confirmed_palworld_stop,
+                    format_stop_result
+                    as _format_stop_result,
+                )
+
+                _lifecycle_result = (
+                    await asyncio.to_thread(
+                        _execute_confirmed_palworld_stop,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                        code=str(
+                            _palworld_lifecycle_turn.get(
+                                "code"
+                            )
+                            or ""
+                        ),
+                    )
+                )
+
+                _lifecycle_text = (
+                    _format_stop_result(
+                        _lifecycle_result,
+                        _last_user,
+                    )
+                )
+
+            else:
+                raise RuntimeError(
+                    "Acción de ciclo de vida "
+                    "no permitida"
+                )
+
+            _lifecycle_exit_code = 0
+
+        except Exception as _lifecycle_error:
+            _safe_lifecycle_error = (
+                str(_lifecycle_error)
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .strip()[:400]
+            )
+
+            _lifecycle_text = (
+                "No se pudo completar la "
+                "solicitud sobre Palworld"
+                + (
+                    f": {_safe_lifecycle_error}"
+                    if _safe_lifecycle_error
+                    else "."
+                )
+            )
+
+            _lifecycle_exit_code = 1
+
+            logger.warning(
+                "[agent-action] Palworld lifecycle "
+                "failed closed action=%s kind=%s: %s",
+                _lifecycle_action,
+                _lifecycle_kind,
+                _safe_lifecycle_error,
+            )
+
+        _lifecycle_duration = (
+            time.time() - _lifecycle_started
+        )
+
+        if _lifecycle_effectful:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_output",
+                    "tool": "homelab",
+                    "command": _lifecycle_command,
+                    "output": _lifecycle_text,
+                    "exit_code":
+                        _lifecycle_exit_code,
+                })
+                + "\n\n"
+            )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "delta": _lifecycle_text,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "metrics",
+                "data": {
+                    "model": model,
+                    "requested_model": model,
+                    "input_tokens": estimate_tokens([{
+                        "role": "user",
+                        "content": _last_user,
+                    }]),
+                    "output_tokens": max(
+                        len(_lifecycle_text) // 4,
+                        1,
+                    ),
+                    "total_time": round(
+                        _lifecycle_duration,
+                        3,
+                    ),
+                    "response_time": round(
+                        _lifecycle_duration,
+                        3,
+                    ),
+                    "agent_rounds": 0,
+                    "tool_calls": (
+                        1
+                        if _lifecycle_effectful
+                        else 0
+                    ),
+                    "direct_palworld_lifecycle": True,
+                    "lifecycle_action":
+                        _lifecycle_action,
+                    "confirmation_required":
+                        _lifecycle_confirmation_required,
+                    "action_succeeded": (
+                        _lifecycle_effectful
+                        and _lifecycle_exit_code == 0
+                    ),
+                },
+            })
+            + "\n\n"
+        )
+
+        logger.info(
+            "[agent-action] Palworld lifecycle "
+            "completed action=%s kind=%s "
+            "exit=%s duration=%.3fs",
+            _lifecycle_action,
+            _lifecycle_kind,
+            _lifecycle_exit_code,
+            _lifecycle_duration,
+        )
+
+        yield "data: [DONE]\n\n"
+        return
+
     # Explicit confirmed Palworld restart requests are deterministic and session-bound.
     # The first turn only creates a short-lived authorization. The second turn
     # must provide its exact code from the same owner and session.

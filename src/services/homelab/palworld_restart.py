@@ -293,13 +293,35 @@ def _active_actions(
     return active
 
 
-def issue_pending_restart(
+_PENDING_ACTION_PREFIXES = {
+    "palworld.restart": "PRW",
+    "palworld.stop": "PST",
+}
+
+
+def issue_pending_action(
     *,
+    action: str,
     owner: str,
     session_id: str,
     ttl: int = RESTART_CONFIRMATION_TTL,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """Issue one short-lived authorization for one exact action."""
+
+    action_value = str(
+        action or ""
+    ).strip()
+
+    prefix = _PENDING_ACTION_PREFIXES.get(
+        action_value
+    )
+
+    if prefix is None:
+        raise PalworldRestartConfirmationError(
+            "Acción pendiente no permitida"
+        )
+
     owner_value = str(owner or "").strip()
     session_value = str(
         session_id or ""
@@ -329,7 +351,8 @@ def issue_pending_restart(
     )
 
     code = (
-        "PRW-"
+        prefix
+        + "-"
         + "".join(
             secrets.choice(
                 _CONFIRMATION_ALPHABET
@@ -339,7 +362,7 @@ def issue_pending_restart(
     )
 
     record = {
-        "action": "palworld.restart",
+        "action": action_value,
         "owner": owner_value,
         "session_id": session_value,
         "code_digest": _code_digest(code),
@@ -358,14 +381,14 @@ def issue_pending_restart(
         )
 
         actions = [
-            action
-            for action in actions
+            stored
+            for stored in actions
             if not (
-                action.get("action")
-                == "palworld.restart"
-                and action.get("owner")
+                stored.get("action")
+                == action_value
+                and stored.get("owner")
                 == owner_value
-                and action.get("session_id")
+                and stored.get("session_id")
                 == session_value
             )
         ]
@@ -378,6 +401,7 @@ def issue_pending_restart(
         })
 
     return {
+        "action": action_value,
         "code": code,
         "created_at": issued_at,
         "expires_at": (
@@ -387,13 +411,29 @@ def issue_pending_restart(
     }
 
 
-def consume_pending_restart(
+def consume_pending_action(
     *,
+    action: str,
     owner: str,
     session_id: str,
     code: str,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """Consume exactly one owner/session/action authorization."""
+
+    action_value = str(
+        action or ""
+    ).strip()
+
+    prefix = _PENDING_ACTION_PREFIXES.get(
+        action_value
+    )
+
+    if prefix is None:
+        raise PalworldRestartConfirmationError(
+            "Acción pendiente no permitida"
+        )
+
     owner_value = str(owner or "").strip()
     session_value = str(
         session_id or ""
@@ -402,6 +442,18 @@ def consume_pending_restart(
     code_value = str(
         code or ""
     ).strip().upper()
+
+    expected_pattern = re.compile(
+        rf"{re.escape(prefix)}-[A-Z2-9]{{12}}"
+    )
+
+    if not expected_pattern.fullmatch(
+        code_value
+    ):
+        raise PalworldRestartConfirmationError(
+            "Confirmación inválida, caducada "
+            "o perteneciente a otra sesión"
+        )
 
     current_time = (
         float(now)
@@ -421,17 +473,19 @@ def consume_pending_restart(
 
         matched_index = None
 
-        for index, action in enumerate(actions):
+        for index, stored in enumerate(
+            actions
+        ):
             stored_digest = str(
-                action.get("code_digest") or ""
+                stored.get("code_digest") or ""
             )
 
             if (
-                action.get("action")
-                == "palworld.restart"
-                and action.get("owner")
+                stored.get("action")
+                == action_value
+                and stored.get("owner")
                 == owner_value
-                and action.get("session_id")
+                and stored.get("session_id")
                 == session_value
                 and hmac.compare_digest(
                     stored_digest,
@@ -465,6 +519,70 @@ def consume_pending_restart(
         })
 
     return consumed
+
+
+def issue_pending_restart(
+    *,
+    owner: str,
+    session_id: str,
+    ttl: int = RESTART_CONFIRMATION_TTL,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    return issue_pending_action(
+        action="palworld.restart",
+        owner=owner,
+        session_id=session_id,
+        ttl=ttl,
+        now=now,
+    )
+
+
+def consume_pending_restart(
+    *,
+    owner: str,
+    session_id: str,
+    code: str,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    return consume_pending_action(
+        action="palworld.restart",
+        owner=owner,
+        session_id=session_id,
+        code=code,
+        now=now,
+    )
+
+
+def issue_pending_stop(
+    *,
+    owner: str,
+    session_id: str,
+    ttl: int = RESTART_CONFIRMATION_TTL,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    return issue_pending_action(
+        action="palworld.stop",
+        owner=owner,
+        session_id=session_id,
+        ttl=ttl,
+        now=now,
+    )
+
+
+def consume_pending_stop(
+    *,
+    owner: str,
+    session_id: str,
+    code: str,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    return consume_pending_action(
+        action="palworld.stop",
+        owner=owner,
+        session_id=session_id,
+        code=code,
+        now=now,
+    )
 
 
 def _extract_players(
