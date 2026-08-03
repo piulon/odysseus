@@ -50,5 +50,45 @@ class HomelabFastPathStaticTests(unittest.TestCase):
             self.assertIn(required, block)
 
 
+    def test_passive_ui_context_does_not_block_fastpath(self):
+        start = self.source.index(
+            "# Simple whole-homelab status "
+            "requests do not need an LLM round."
+        )
+
+        end = self.source.index(
+            "# RAG-based tool selection",
+            start,
+        )
+
+        block = self.source[start:end]
+        compact = " ".join(block.split())
+
+        self.assertNotIn(
+            "and not workspace",
+            compact,
+        )
+
+        self.assertNotIn(
+            "and not active_email",
+            compact,
+        )
+
+        self.assertIn(
+            'set(forced_tools) == {"homelab"}',
+            compact,
+        )
+
+        self.assertIn(
+            'set(relevant_tools) == {"homelab"}',
+            compact,
+        )
+
+        self.assertIn(
+            "[agent-fastpath] eligibility=",
+            block,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

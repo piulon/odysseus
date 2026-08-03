@@ -2689,11 +2689,15 @@ async def stream_agent_loop(
             and not guide_only
             and not plan_mode
             and not approved_plan
-            and not forced_tools
-            and not relevant_tools
+            and (
+                not forced_tools
+                or set(forced_tools) == {"homelab"}
+            )
+            and (
+                not relevant_tools
+                or set(relevant_tools) == {"homelab"}
+            )
             and not uploaded_files
-            and not workspace
-            and not active_email
             and not _active_document_relevant
             and "homelab" not in disabled_tools
             and (
@@ -2711,6 +2715,25 @@ async def stream_agent_loop(
             _fast_classify_err,
         )
         _direct_homelab_status = False
+
+
+    if set(_intent.get("domains") or set()) == {"homelab"}:
+        logger.info(
+            "[agent-fastpath] eligibility=%s "
+            "workspace=%s active_email=%s "
+            "forced=%s relevant=%s uploads=%s "
+            "active_doc=%s guide_only=%s "
+            "plan_mode=%s",
+            _direct_homelab_status,
+            bool(workspace),
+            bool(active_email),
+            sorted(forced_tools or []),
+            sorted(relevant_tools or []),
+            bool(uploaded_files),
+            bool(_active_document_relevant),
+            guide_only,
+            plan_mode,
+        )
 
     if _direct_homelab_status:
         _fast_start = time.time()
