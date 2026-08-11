@@ -81,7 +81,16 @@ _BUILTIN_NPX_SERVERS = {
     "builtin_browser": {
         "name": "Built-in: Browser",
         "command": "npx",
-        "args": ["-y", "@playwright/mcp@latest", "--headless", "--caps", "vision"],
+        "args": [
+            "--no-install",
+            "@playwright/mcp@0.0.78",
+            "--headless",
+            "--browser",
+            "chromium",
+            "--no-sandbox",
+            "--caps",
+            "vision",
+        ],
     }
 }
 
@@ -276,29 +285,60 @@ async def _is_npx_package_cached(npx_path, package_spec, timeout_s=5):
 
 
 def _is_package_in_npx_cache(package_spec):
-    """Return True when npm's `_npx` cache already contains package_spec."""
+    """Return True only for the requested package/version in the npx cache."""
     package_name = _npx_package_name(package_spec)
+    package_version = _npx_package_version(package_spec)
     if not package_name:
         return False
 
     for cache_root in _npm_cache_roots():
         npx_root = os.path.join(cache_root, "_npx")
-        if _npx_cache_contains_package(npx_root, package_name):
+        if _npx_cache_contains_package(
+            npx_root,
+            package_name,
+            package_version,
+        ):
             return True
     return False
 
-
 def _npx_package_name(package_spec):
-    """Strip a version/range suffix from an npm package spec."""
+    """Return package name without an optional version/tag."""
     if not package_spec:
         return ""
-    if package_spec.startswith("@"):
-        parts = package_spec.split("@", 2)
-        if len(parts) >= 3:
-            return f"@{parts[1]}"
-        return package_spec
-    return package_spec.split("@", 1)[0]
 
+    if package_spec.startswith("@"):
+        slash = package_spec.find("/")
+        if slash < 0:
+            return package_spec
+        version_at = package_spec.find("@", slash)
+        if version_at < 0:
+            return package_spec
+        return package_spec[:version_at]
+
+    if "@" in package_spec:
+        return package_spec.rsplit("@", 1)[0]
+
+    return package_spec
+
+
+def _npx_package_version(package_spec):
+    """Return explicit version/tag from an npm package spec, if present."""
+    if not package_spec:
+        return ""
+
+    if package_spec.startswith("@"):
+        slash = package_spec.find("/")
+        if slash < 0:
+            return ""
+        version_at = package_spec.find("@", slash)
+        if version_at < 0:
+            return ""
+        return package_spec[version_at + 1:]
+
+    if "@" in package_spec:
+        return package_spec.rsplit("@", 1)[1]
+
+    return ""
 
 def _npm_cache_roots():
     roots = []
@@ -312,24 +352,48 @@ def _npm_cache_roots():
     return list(dict.fromkeys(roots))
 
 
-def _npx_cache_contains_package(npx_root, package_name):
+def _npx_cache_contains_package(
+    npx_root,
+    package_name,
+    package_version="",
+):
     if not os.path.isdir(npx_root):
         return False
-    package_path = os.path.join("node_modules", *package_name.split("/"), "package.json")
+
+    package_path = os.path.join(
+        "node_modules",
+        *package_name.split("/"),
+        "package.json",
+    )
+
     try:
         entries = list(os.scandir(npx_root))
     except OSError:
         return False
+
     for entry in entries:
         try:
-            is_dir = entry.is_dir()
+            if not entry.is_dir():
+                continue
         except OSError:
             continue
-        cached_name = _cached_package_name(os.path.join(entry.path, package_path))
-        if is_dir and cached_name == package_name:
-            return True
-    return False
 
+        package_json = os.path.join(
+            entry.path,
+            package_path,
+        )
+        cached_name = _cached_package_name(package_json)
+        cached_version = _cached_package_version(package_json)
+
+        if cached_name != package_name:
+            continue
+
+        if package_version and cached_version != package_version:
+            continue
+
+        return True
+
+    return False
 
 def _cached_package_name(package_json_path):
     try:
@@ -338,3 +402,12 @@ def _cached_package_name(package_json_path):
     except (OSError, ValueError):
         return ""
     return str(data.get("name", "")).strip()
+
+
+def _cached_package_version(package_json_path):
+    try:
+        with open(package_json_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    return str(data.get("version", "")).strip()

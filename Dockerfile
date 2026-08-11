@@ -50,6 +50,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # regressing pip/venv installs on hosts without libmagic. Debian always has the
 # lib here, so the import is instant and detection actually works.
 
+# Built-in Browser MCP.
+#
+# Pin both the MCP package and its bundled Playwright/browser artifacts so a
+# rebuild never resolves an arbitrary @latest release.  Runtime uses
+# `npx --no-install`, so network access is never required to start Browser MCP.
+ARG PLAYWRIGHT_MCP_VERSION=0.0.78
+ENV npm_config_cache=/opt/odysseus-npm-cache \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+
+RUN mkdir -p "$npm_config_cache" "$PLAYWRIGHT_BROWSERS_PATH" \
+    && npx -y "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" --version \
+    && PW="$(find "$npm_config_cache/_npx" \
+         -path "*/node_modules/.bin/playwright" -print -quit)" \
+    && test -n "$PW" \
+    && test -x "$PW" \
+    && DEBIAN_FRONTEND=noninteractive \
+       "$PW" install --with-deps --no-shell chromium \
+    && chmod -R a+rX "$npm_config_cache" "$PLAYWRIGHT_BROWSERS_PATH" \
+    && rm -rf /var/lib/apt/lists/*
+
 # Docker CLI (client only — daemon stays on the host via the
 # /var/run/docker.sock mount). The Debian `docker.io` package ships
 # dockerd but not the client binary on slim, so grab the static client

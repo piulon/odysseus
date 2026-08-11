@@ -32,8 +32,8 @@ def test_npx_package_from_args_prefers_package_after_y_flag(monkeypatch):
     builtin_mcp = _load_builtin_mcp(monkeypatch)
 
     assert builtin_mcp._npx_package_from_args(
-        ["-y", "@playwright/mcp@latest", "--headless"]
-    ) == "@playwright/mcp@latest"
+        ["-y", "@playwright/mcp@0.0.78", "--headless"]
+    ) == "@playwright/mcp@0.0.78"
 
 
 def test_npx_cache_check_detects_scoped_package_in_npx_cache(monkeypatch, tmp_path):
@@ -49,7 +49,7 @@ def test_npx_cache_check_detects_scoped_package_in_npx_cache(monkeypatch, tmp_pa
         / "package.json"
     )
     package_json.parent.mkdir(parents=True)
-    package_json.write_text('{"name":"@playwright/mcp","version":"0.0.76"}', encoding="utf-8")
+    package_json.write_text('{"name":"@playwright/mcp","version":"0.0.78"}', encoding="utf-8")
 
     async def unexpected_exec(*args, **kwargs):
         raise AssertionError("cache hit should not shell out to npx")
@@ -61,7 +61,7 @@ def test_npx_cache_check_detects_scoped_package_in_npx_cache(monkeypatch, tmp_pa
     assert asyncio.run(
         builtin_mcp._is_npx_package_cached(
             "npx",
-            "@playwright/mcp@latest",
+            "@playwright/mcp@0.0.78",
             timeout_s=2,
         )
     ) is True
@@ -88,14 +88,14 @@ def test_npx_cache_check_falls_back_when_async_subprocess_is_unsupported(monkeyp
     assert asyncio.run(
         builtin_mcp._is_npx_package_cached(
             "npx.cmd",
-            "@playwright/mcp@latest",
+            "@playwright/mcp@0.0.78",
             timeout_s=2,
         )
     ) is True
     assert captured["args"] == [
         "npx.cmd",
         "--no-install",
-        "@playwright/mcp@latest",
+        "@playwright/mcp@0.0.78",
         "--version",
     ]
     assert captured["kwargs"]["capture_output"] is True
@@ -119,7 +119,61 @@ def test_npx_cache_check_fallback_treats_timeout_as_cache_miss(monkeypatch, tmp_
     assert asyncio.run(
         builtin_mcp._is_npx_package_cached(
             "npx.cmd",
-            "@playwright/mcp@latest",
+            "@playwright/mcp@0.0.78",
             timeout_s=2,
         )
     ) is False
+
+
+def test_npx_cache_rejects_wrong_exact_version(monkeypatch, tmp_path):
+    builtin_mcp = _load_builtin_mcp(monkeypatch)
+
+    package_json = (
+        tmp_path
+        / ".npm"
+        / "_npx"
+        / "wrong-version"
+        / "node_modules"
+        / "@playwright"
+        / "mcp"
+        / "package.json"
+    )
+    package_json.parent.mkdir(parents=True)
+    package_json.write_text(
+        '{"name":"@playwright/mcp","version":"0.0.76"}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("npm_config_cache", raising=False)
+
+    assert (
+        builtin_mcp._is_package_in_npx_cache(
+            "@playwright/mcp@0.0.78"
+        )
+        is False
+    )
+
+
+def test_builtin_browser_is_pinned_and_offline(monkeypatch):
+    builtin_mcp = _load_builtin_mcp(monkeypatch)
+
+    args = builtin_mcp._BUILTIN_NPX_SERVERS[
+        "builtin_browser"
+    ]["args"]
+
+    assert args[:2] == [
+        "--no-install",
+        "@playwright/mcp@0.0.78",
+    ]
+    assert "@playwright/mcp@latest" not in args
+    assert "-y" not in args
+
+    assert "--headless" in args
+    assert "--no-sandbox" in args
+
+    browser_i = args.index("--browser")
+    assert args[browser_i + 1] == "chromium"
+
+    caps_i = args.index("--caps")
+    assert args[caps_i + 1] == "vision"
