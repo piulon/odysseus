@@ -6,69 +6,17 @@ Each server runs as a stdio subprocess managed by McpManager.
 """
 
 import asyncio
-import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 
-from core.platform_compat import IS_WINDOWS, which_tool
+from core.platform_compat import which_tool
 from src.runtime_paths import get_app_root
 
 logger = logging.getLogger(__name__)
 
 
-def _find_npx() -> str:
-    """Find the npx binary, checking common locations if not on PATH.
-
-    On Windows the shim is `npx.cmd`, which `which_tool` resolves via PATHEXT.
-    """
-    npx = which_tool("npx")
-    if npx:
-        return npx
-    if IS_WINDOWS:
-        # Minimal-PATH fallbacks: npm's global bin lives under %APPDATA%\npm,
-        # and node's installer dir carries npx.cmd alongside node.exe.
-        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
-        for candidate in (
-            os.path.join(appdata, "npm", "npx.cmd"),
-            r"C:\Program Files\nodejs\npx.cmd",
-        ):
-            if os.path.isfile(candidate):
-                return candidate
-        node = which_tool("node")
-        if node:
-            cand = os.path.join(os.path.dirname(node), "npx.cmd")
-            if os.path.isfile(cand):
-                return cand
-        return "npx.cmd"  # fallback, will fail with a clear error
-    # Common POSIX locations when PATH is minimal (e.g. systemd)
-    for candidate in [
-        os.path.expanduser("~/.npm-global/bin/npx"),
-        os.path.expanduser("~/.local/bin/npx"),
-        "/usr/local/bin/npx",
-        "/usr/bin/npx",
-    ]:
-        if os.path.isfile(candidate):
-            return candidate
-    # Try to find node and use npx from same dir
-    node = shutil.which("node")
-    if node:
-        npx_candidate = os.path.join(os.path.dirname(node), "npx")
-        if os.path.isfile(npx_candidate):
-            return npx_candidate
-    return "npx"  # fallback, will fail with a clear error
-
-# Server definitions: id -> (script path relative to project root, display name)
-#
-# bash / python / filesystem / web_search were folded into native in-process
-# execution (src/tool_execution.py:_direct_fallback). Those trivial subprocess
-# wrappers are gone.
-#
-# image_gen / memory / rag / email still run as stdio MCP servers — each
-# carries hundreds of LOC of unique IMAP / HTTP / manager logic not worth
-# duplicating into the native path right now.
 _BUILTIN_SERVERS = {
     "image_gen":  ("mcp_servers/image_gen_server.py",  "Built-in: Image Generation"),
     "memory":     ("mcp_servers/memory_server.py",     "Built-in: Memory"),
@@ -77,16 +25,23 @@ _BUILTIN_SERVERS = {
 }
 
 # NPX-based built-in servers (run via npx, not Python)
-_BUILTIN_NPX_SERVERS = {
+# External-command built-in servers.
+#
+# Browser MCP is installed into the Docker image at build time and is
+# deliberately executed directly rather than through npx, so runtime never
+# resolves packages or requires access to the npm registry.
+_BUILTIN_COMMAND_SERVERS = {
     "builtin_browser": {
         "name": "Built-in: Browser",
-        "command": "npx",
+        "command": "playwright-mcp",
         "args": [
-            "--no-install",
-            "@playwright/mcp@0.0.78",
             "--headless",
             "--browser",
             "chromium",
+            "--executable-path",
+            "/usr/local/bin/odysseus-chromium",
+            "--user-data-dir",
+            "/tmp/odysseus-browser-profile",
             "--no-sandbox",
             "--caps",
             "vision",
@@ -164,250 +119,61 @@ async def register_builtin_servers(mcp_manager):
             continue
         _spawn_bg(_connect_python_server(server_id, script_path, name))
 
-    # Register NPX-based servers in the background (they take longer to start)
-    npx_path = _find_npx()
-    logger.info(f"NPX binary resolved to: {npx_path}")
+    # Register external-command built-ins after the Python MCP servers.
+    async def _start_command_servers():
+        await asyncio.sleep(3)
 
-    async def _start_npx_servers():
-        await asyncio.sleep(3)  # let Python servers finish first
-        for server_id, cfg in _BUILTIN_NPX_SERVERS.items():
-            # Skip the server if its npx package isn't cached. Without this
-            # check, npx would try to download/install the package on first
-            # use, which can take minutes (or hang) on fresh installs without
-            # Playwright system deps. Wrapping that in asyncio.wait_for to
-            # bound the wait sounds reasonable, but mcp.client.stdio uses an
-            # internal anyio task group that can't survive the resulting
-            # cross-task cancellation: it raises "Attempted to exit cancel
-            # scope in a different task than it was entered in" in a sibling
-            # task, which cascades cancellations into the rest of the event
-            # loop and downs the app. Detecting installed-state up-front lets
-            # us bail with a useful warning before we ever touch stdio_client.
-            args = cfg["args"]
-            pkg_spec = _npx_package_from_args(args)
-            if pkg_spec and not await _is_npx_package_cached(npx_path, pkg_spec):
+        for server_id, cfg in _BUILTIN_COMMAND_SERVERS.items():
+            command = (
+                which_tool(cfg["command"])
+                or shutil.which(cfg["command"])
+            )
+
+            if not command:
                 logger.warning(
                     f"{cfg['name']} is not available.\n"
-                    f"  Reason: npm package {pkg_spec!r} is not installed in the npx cache.\n"
-                    f"  Impact: tools provided by this MCP server will be unavailable.\n"
-                    f"  Fix:    {os.path.basename(npx_path)} -y {pkg_spec} --version\n"
-                    f"          (run once, then restart Odysseus)\n"
-                    f"  Notes:  this server is optional; see README.md "
-                    f"'Built-in MCP servers' for details."
+                    f"  Reason: executable {cfg['command']!r} "
+                    f"was not found.\n"
+                    f"  Impact: tools provided by this MCP server "
+                    f"will be unavailable."
                 )
                 continue
 
-            logger.info(f"Starting NPX server: {cfg['name']} ({npx_path} {' '.join(args)})")
+            args = cfg["args"]
+
+            logger.info(
+                f"Starting external MCP server: "
+                f"{cfg['name']} "
+                f"({command} {' '.join(args)})"
+            )
+
             try:
                 ok = await mcp_manager.connect_server(
                     server_id=server_id,
                     name=cfg["name"],
                     transport="stdio",
-                    command=npx_path,
+                    command=command,
                     args=args,
                 )
+
                 if ok:
-                    logger.info(f"Built-in NPX server registered: {cfg['name']}")
+                    logger.info(
+                        f"Built-in external MCP server registered: "
+                        f"{cfg['name']}"
+                    )
                 else:
-                    logger.warning(f"Built-in NPX server failed to connect: {cfg['name']}")
+                    logger.warning(
+                        f"Built-in external MCP server failed to connect: "
+                        f"{cfg['name']}"
+                    )
+
             except asyncio.CancelledError:
                 raise
             except BaseException as e:
-                logger.warning(f"Built-in NPX server {cfg['name']} error: {type(e).__name__}: {e}")
+                logger.warning(
+                    f"Built-in external MCP server "
+                    f"{cfg['name']} error: "
+                    f"{type(e).__name__}: {e}"
+                )
 
-    _spawn_bg(_start_npx_servers())
-
-
-def _npx_package_from_args(args):
-    """Pick the package spec out of an npx args list shaped like
-    ['-y', '<package@version>', ...flags]. Returns None if the
-    convention doesn't match (we then skip the cache check and just
-    try the connect)."""
-    if not args:
-        return None
-    if "-y" in args:
-        idx = args.index("-y") + 1
-        if idx < len(args) and not args[idx].startswith("-"):
-            return args[idx]
-    # No -y prefix: first non-flag arg is the package
-    for a in args:
-        if not a.startswith("-"):
-            return a
-    return None
-
-
-async def _is_npx_package_cached(npx_path, package_spec, timeout_s=5):
-    """Probe whether an npx package is already in the local cache.
-
-    First checks the local `_npx` cache for an installed package. If the
-    package is not found there, falls back to `npx --no-install <pkg>
-    --version` so older npm layouts still work without downloading.
-    """
-    if _is_package_in_npx_cache(package_spec):
-        return True
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            npx_path, "--no-install", package_spec, "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except NotImplementedError:
-        try:
-            result = subprocess.run(
-                [npx_path, "--no-install", package_spec, "--version"],
-                capture_output=True,
-                timeout=timeout_s,
-            )
-        except (subprocess.TimeoutExpired, OSError, ValueError):
-            return False
-        return result.returncode == 0 and bool(result.stdout.strip())
-    except (OSError, ValueError):
-        return False
-    try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except Exception:
-            pass
-        return False
-    except asyncio.CancelledError:
-        # The probe was cancelled (e.g. app shutdown). Reap the child so it
-        # isn't orphaned, then propagate the cancellation.
-        try:
-            proc.kill()
-            await proc.wait()
-        except Exception:
-            pass
-        raise
-    return proc.returncode == 0 and bool(stdout.strip())
-
-
-def _is_package_in_npx_cache(package_spec):
-    """Return True only for the requested package/version in the npx cache."""
-    package_name = _npx_package_name(package_spec)
-    package_version = _npx_package_version(package_spec)
-    if not package_name:
-        return False
-
-    for cache_root in _npm_cache_roots():
-        npx_root = os.path.join(cache_root, "_npx")
-        if _npx_cache_contains_package(
-            npx_root,
-            package_name,
-            package_version,
-        ):
-            return True
-    return False
-
-def _npx_package_name(package_spec):
-    """Return package name without an optional version/tag."""
-    if not package_spec:
-        return ""
-
-    if package_spec.startswith("@"):
-        slash = package_spec.find("/")
-        if slash < 0:
-            return package_spec
-        version_at = package_spec.find("@", slash)
-        if version_at < 0:
-            return package_spec
-        return package_spec[:version_at]
-
-    if "@" in package_spec:
-        return package_spec.rsplit("@", 1)[0]
-
-    return package_spec
-
-
-def _npx_package_version(package_spec):
-    """Return explicit version/tag from an npm package spec, if present."""
-    if not package_spec:
-        return ""
-
-    if package_spec.startswith("@"):
-        slash = package_spec.find("/")
-        if slash < 0:
-            return ""
-        version_at = package_spec.find("@", slash)
-        if version_at < 0:
-            return ""
-        return package_spec[version_at + 1:]
-
-    if "@" in package_spec:
-        return package_spec.rsplit("@", 1)[1]
-
-    return ""
-
-def _npm_cache_roots():
-    roots = []
-    configured = os.environ.get("npm_config_cache")
-    if configured:
-        roots.append(os.path.expanduser(configured))
-    roots.append(os.path.join(os.path.expanduser("~"), ".npm"))
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        roots.append(os.path.join(local_app_data, "npm-cache"))
-    return list(dict.fromkeys(roots))
-
-
-def _npx_cache_contains_package(
-    npx_root,
-    package_name,
-    package_version="",
-):
-    if not os.path.isdir(npx_root):
-        return False
-
-    package_path = os.path.join(
-        "node_modules",
-        *package_name.split("/"),
-        "package.json",
-    )
-
-    try:
-        entries = list(os.scandir(npx_root))
-    except OSError:
-        return False
-
-    for entry in entries:
-        try:
-            if not entry.is_dir():
-                continue
-        except OSError:
-            continue
-
-        package_json = os.path.join(
-            entry.path,
-            package_path,
-        )
-        cached_name = _cached_package_name(package_json)
-        cached_version = _cached_package_version(package_json)
-
-        if cached_name != package_name:
-            continue
-
-        if package_version and cached_version != package_version:
-            continue
-
-        return True
-
-    return False
-
-def _cached_package_name(package_json_path):
-    try:
-        with open(package_json_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return ""
-    return str(data.get("name", "")).strip()
-
-
-def _cached_package_version(package_json_path):
-    try:
-        with open(package_json_path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return ""
-    return str(data.get("version", "")).strip()
+    _spawn_bg(_start_command_servers())
