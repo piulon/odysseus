@@ -1030,7 +1030,13 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("documents")
     if "notes_calendar_tasks" not in domains and has(r"\bwrite\b"):
         domains.add("documents")
-    if has(r"\b(search|web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b"):
+    if has(
+        r"\b(search|web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b",
+        r"\b(noticias|actualidad)\b",
+        r"\b(?:buscar|busca|busque)\b.*\b(?:internet|web|online|noticias|actualidad|informaci[oó]n\s+actual|últimas?|ultimas?|últimos?|ultimos?)\b",
+        r"\b(notícies|noticies|actualitat)\b",
+        r"\b(?:cercar|cerca|buscar|busca)\b.*\b(?:internet|web|online|notícies|noticies|actualitat|informació\s+actual|últimes?|ultimes?|darreres?)\b",
+    ):
         domains.add("web")
     if has(
         r"\b(wyszukaj|wyszukać|wyszukac)\b.*\b(internet|internecie|online|web)\b",

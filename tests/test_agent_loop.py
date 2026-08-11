@@ -498,3 +498,37 @@ class TestWebSearchSourcesKeyLookup:
         src_text = result.get("output") or result.get("results") or result.get("stdout") or ""
         assert src_text != ""
         assert "SOURCES" in src_text
+
+
+def test_spanish_explicit_web_request_classifies_as_web():
+    intent = _classify_agent_request(
+        [],
+        "Busca noticias sobre NVIDIA",
+    )
+    assert intent["low_signal"] is False
+    assert "web" in intent["domains"]
+
+
+def test_catalan_explicit_web_request_classifies_as_web():
+    intent = _classify_agent_request(
+        [],
+        "Cerca les últimes notícies sobre IA",
+    )
+    assert intent["low_signal"] is False
+    assert "web" in intent["domains"]
+
+
+def test_spanish_search_word_in_non_web_context_does_not_classify_as_web():
+    intent = _classify_agent_request(
+        [],
+        "Explícame el algoritmo de búsqueda binaria",
+    )
+    assert "web" not in intent["domains"]
+
+
+def test_catalan_search_word_in_non_web_context_does_not_classify_as_web():
+    intent = _classify_agent_request(
+        [],
+        "Explica què és la cerca binària",
+    )
+    assert "web" not in intent["domains"]
