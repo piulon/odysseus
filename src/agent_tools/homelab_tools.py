@@ -857,6 +857,40 @@ def classify_direct_homelab_request(
     ):
         return None
 
+    # A whole-homelab diagnostic maps unambiguously to the read-only
+    # Operator doctor endpoint. Keep service-specific, multi-target and
+    # mutating investigations on the normal agent path.
+    _diagnostic_request = (
+        homelab_domain_allowed
+        and " homelab " in padded
+        and "diagnos" in padded
+        and not _direct_service_mentions(normalized)
+        and not any(
+            connector in padded
+            for connector in multi_target_connectors
+        )
+        and not any(
+            stem in padded
+            for stem in (
+                "reinici",
+                "restart",
+                "deten",
+                " stop ",
+                "arranc",
+                " start ",
+                "apaga",
+                "enciende",
+                "crear",
+                "crea ",
+                "borr",
+                "elimin",
+            )
+        )
+    )
+
+    if _diagnostic_request:
+        return {"action": "doctor"}
+
     if any(
         stem in padded
         for stem in blocked_stems

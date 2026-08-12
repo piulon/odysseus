@@ -2559,6 +2559,103 @@ def _detect_runaway_call(call_freq, threshold=15):
     return sig.split(":", 1)[0] if sig else None
 
 
+def _homelab_doctor_response(
+    output: str,
+    user_text: str,
+) -> str | None:
+    """Render authoritative whole-homelab doctor JSON without an LLM."""
+    raw = str(output or "").strip()
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    required = {
+        "ok",
+        "errors",
+        "warnings",
+        "issues",
+        "checked_services",
+        "observed_containers",
+    }
+    if not required.issubset(data):
+        return None
+
+    try:
+        errors = int(data.get("errors") or 0)
+        warnings = int(data.get("warnings") or 0)
+        checked = int(data.get("checked_services") or 0)
+        observed = int(data.get("observed_containers") or 0)
+    except (TypeError, ValueError):
+        return None
+
+    issues = data.get("issues") or []
+    if not isinstance(issues, list):
+        return None
+
+    latest = str(user_text or "").casefold()
+
+    if any(x in latest for x in ("diagnòst", "meu homelab", "fes un")):
+        title = "## Diagnòstic del homelab"
+        state = "**correcte**" if data.get("ok") else "**amb incidències**"
+        labels = ("Estat", "Errors", "Avisos", "Serveis comprovats", "Contenidors observats")
+        issues_title = "### Incidències"
+        no_issues = "No s'han detectat incidències."
+        warning_word = "AVÍS"
+    elif any(x in latest for x in ("diagnose", "diagnostic", "my homelab")):
+        title = "## Homelab diagnostic"
+        state = "**healthy**" if data.get("ok") else "**issues detected**"
+        labels = ("Status", "Errors", "Warnings", "Services checked", "Containers observed")
+        issues_title = "### Issues"
+        no_issues = "No issues were detected."
+        warning_word = "WARNING"
+    else:
+        title = "## Diagnóstico del homelab"
+        state = "**correcto**" if data.get("ok") else "**con incidencias**"
+        labels = ("Estado", "Errores", "Avisos", "Servicios comprobados", "Contenedores observados")
+        issues_title = "### Incidencias"
+        no_issues = "No se han detectado incidencias."
+        warning_word = "AVISO"
+
+    lines = [
+        title,
+        "",
+        f"- {labels[0]}: {state}",
+        f"- {labels[1]}: **{errors}**",
+        f"- {labels[2]}: **{warnings}**",
+        f"- {labels[3]}: **{checked}**",
+        f"- {labels[4]}: **{observed}**",
+    ]
+
+    if not issues:
+        return "\n".join(lines + ["", no_issues])
+
+    lines += ["", issues_title]
+
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+
+        severity = str(issue.get("severity") or "issue").lower()
+        label = warning_word if severity == "warning" else severity.upper()
+        service = str(issue.get("service") or "homelab")
+        code = str(issue.get("code") or "unknown")
+        message = str(issue.get("message") or "").strip()
+
+        line = f"- [{label}] **{service}** · `{code}`"
+        if message:
+            line += f": {message}"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
 def _healthy_homelab_diagnostic_response(
     output: str,
     user_text: str,
@@ -3789,10 +3886,26 @@ async def stream_agent_loop(
             ).strip()
 
             if (
+                _fast_action == "doctor"
+                and _fast_text
+            ):
+                _fast_doctor_reply = (
+                    _homelab_doctor_response(
+                        _fast_text,
+                        _last_user,
+                    )
+                )
+                if _fast_doctor_reply:
+                    _fast_text = _fast_doctor_reply
+
+            if (
                 _fast_result.get("error")
                 or _fast_result.get("exit_code") != 0
-                or not _fast_result.get(
-                    "terminal_response"
+                or (
+                    _fast_action != "doctor"
+                    and not _fast_result.get(
+                        "terminal_response"
+                    )
                 )
                 or not _fast_text
             ):
