@@ -108,3 +108,6 @@ volumes:
   chromadb-data:
   ntfy-cache:
 
+networks:
+  ai_net:
+    external: true
