@@ -40,6 +40,7 @@ from routes.chat_helpers import (
     run_post_response_tasks,
     clean_thinking_for_save,
     _enforce_chat_privileges,
+    _filter_allowed_model_candidates,
 )
 from src.action_intents import ToolIntent, classify_tool_intent as _classify_tool_intent
 from src.tool_policy import (
@@ -493,9 +494,33 @@ def setup_chat_routes(
                 "No model selected for this chat. Open the model picker and choose one before sending.",
             )
 
-        # Same allowed_models + daily-cap gate as chat_stream (mirror so the
-        # non-streaming path can't be used to bypass).
-        _enforce_chat_privileges(request, sess)
+        # Resolve the model for this request without changing the session's
+        # persistent manual/fallback selection.
+        from src.chat_model_router import resolve_chat_route
+
+        image_generation_session = _is_image_generation_session(
+            sess,
+            owner=owner,
+        )
+
+        runtime_route = resolve_chat_route(
+            sess,
+            owner=owner,
+            agent_mode=False,
+            message=message,
+            allow_auto=not (
+                bool(att_ids)
+                or image_generation_session
+            ),
+        )
+
+        # Same allowed_models + daily-cap gate as chat_stream. In Auto mode,
+        # validate the model that will actually receive this request.
+        _enforce_chat_privileges(
+            request,
+            sess,
+            model_override=runtime_route.model,
+        )
 
         tool_policy = build_effective_tool_policy(last_user_message=message)
         allow_tool_preprocessing = not tool_policy.block_all_tool_calls
@@ -518,6 +543,21 @@ def setup_chat_routes(
             time_filter=time_filter,
             webhook_manager=webhook_manager,
             allow_tool_preprocessing=allow_tool_preprocessing,
+            runtime_endpoint_url=(
+                runtime_route.endpoint_url
+                if runtime_route.auto
+                else None
+            ),
+            runtime_model=(
+                runtime_route.model
+                if runtime_route.auto
+                else None
+            ),
+            runtime_headers=(
+                runtime_route.headers
+                if runtime_route.auto
+                else None
+            ),
         )
 
         # Research injection
@@ -539,16 +579,19 @@ def setup_chat_routes(
                 logger.error(f"Research failed: {e}")
 
         reply = await llm_call_async(
-            sess.endpoint_url,
-            sess.model,
+            runtime_route.endpoint_url,
+            runtime_route.model,
             ctx.messages,
-            headers=sess.headers,
+            headers=runtime_route.headers,
             temperature=ctx.preset.temperature,
             max_tokens=ctx.preset.max_tokens,
             prompt_type=preset_id,
             session_id=session,
         )
-        _clean_reply, _clean_md = clean_thinking_for_save(reply, {"model": sess.model})
+        _clean_reply, _clean_md = clean_thinking_for_save(
+            reply,
+            {"model": runtime_route.model},
+        )
         sess.add_message(ChatMessage("assistant", _clean_reply, metadata=_clean_md))
 
         from core.database import update_session_last_accessed
@@ -758,18 +801,52 @@ def setup_chat_routes(
         except (ValueError, ValidationError):
             raise HTTPException(400, "Invalid request parameters")
 
-        # ------------------------------------------------------------------ #
-        # Privilege gates that must fire BEFORE any LLM work / token spend.
-        #   1. allowed_models — reject if session.model isn't in the user's
-        #      configured allowlist (empty list = "no restriction").
-        #   2. max_messages_per_day — count user-role ChatMessage rows owned
-        #      by this user in the last UTC day; 429 if at/over the cap.
-        # Admins always have full privileges via get_privileges (returns
-        # ADMIN_PRIVILEGES wholesale) so this is a no-op for them.
-        _enforce_chat_privileges(request, sess)
-
-        # Ensure session has auth headers
+        # Refresh the persistent/manual route auth before capturing it as
+        # the request primary or an Auto fallback.
         resolve_session_auth(sess, session, owner=effective_user(request))
+
+        # Resolve the effective endpoint/model for this request only.
+        # The persistent session selection is deliberately not modified.
+        from src.chat_model_router import resolve_chat_route
+
+        _image_generation_session = _is_image_generation_session(
+            sess,
+            owner=owner,
+        )
+
+        runtime_route = resolve_chat_route(
+            sess,
+            owner=owner,
+            agent_mode=(chat_mode == "agent"),
+            message=message,
+            allow_auto=not (
+                bool(_has_atts)
+                or _image_generation_session
+            ),
+        )
+
+        logger.info(
+            "[auto-route] session=%s auto=%s lane=%s model=%s reason=%s",
+            session,
+            runtime_route.auto,
+            runtime_route.lane,
+            runtime_route.model,
+            runtime_route.reason,
+        )
+
+        # Auto must not bypass the account model allowlist.
+        _enforce_chat_privileges(
+            request,
+            sess,
+            model_override=runtime_route.model,
+        )
+
+        # Filter the request-scoped fallback chain through the same model
+        # allowlist as the primary. Do not re-run the daily quota check.
+        allowed_runtime_fallbacks = _filter_allowed_model_candidates(
+            request,
+            runtime_route.fallbacks,
+        )
 
         # Check for research_pending BEFORE mode persist overwrites it
         do_research = str(use_research).lower() == "true"
@@ -814,6 +891,21 @@ def setup_chat_routes(
             # index would be useless / unwanted noise.
             agent_mode=(chat_mode == "agent"),
             allow_tool_preprocessing=allow_tool_preprocessing,
+            runtime_endpoint_url=(
+                runtime_route.endpoint_url
+                if runtime_route.auto
+                else None
+            ),
+            runtime_model=(
+                runtime_route.model
+                if runtime_route.auto
+                else None
+            ),
+            runtime_headers=(
+                runtime_route.headers
+                if runtime_route.auto
+                else None
+            ),
         )
 
         _research_flags = {"do": do_research}  # Mutable container for generator scope
@@ -1097,7 +1189,7 @@ def setup_chat_routes(
 
                 if _is_first_research:
                     logger.info(f"First research message — asking clarifying questions for: {message[:60]}")
-                    yield f'data: {json.dumps({"type": "model_info", "model": sess.model, "suffix": "Research"})}\n\n'
+                    yield f'data: {json.dumps({"type": "model_info", "model": runtime_route.model, "suffix": "Research"})}\n\n'
                     # Set DB mode to research_pending so the NEXT message auto-triggers research
                     set_session_mode(session, "research_pending")
                     ctx.messages.insert(0, {"role": "system", "content":
@@ -1214,25 +1306,26 @@ def setup_chat_routes(
             thinking_response = ""
             last_metrics = None
 
-            # Configured fallback chain for the default chat model. Tried in
-            # order if the session's primary model fails before producing
-            # output. Resolved once per request.
-            try:
-                from src.endpoint_resolver import resolve_chat_fallback_candidates
-                _fallback_candidates = resolve_chat_fallback_candidates(owner=_user)
-            except Exception:
-                _fallback_candidates = []
+            # Preserve the primary/fallback chain selected before context
+            # construction so the request cannot drift to another route.
+            _fallback_candidates = list(allowed_runtime_fallbacks)
 
             # Send model name early so the frontend can show it during streaming
             _model_suffix = "Research" if effective_do_research else None
-            _model_info = {"type": "model_info", "model": sess.model}
+            _model_info = {
+                "type": "model_info",
+                "model": runtime_route.model,
+            }
+            if runtime_route.auto:
+                _model_info["auto_route"] = True
+                _model_info["route_reason"] = runtime_route.reason
             if _model_suffix:
                 _model_info["suffix"] = _model_suffix
             if ctx.preset.character_name:
                 _model_info["character_name"] = ctx.preset.character_name
             yield f'data: {json.dumps(_model_info)}\n\n'
 
-            if _is_image_generation_session(sess, owner=_user):
+            if _image_generation_session:
                 from src.settings import get_setting
                 if tool_policy.blocks("generate_image"):
                     _blocked_msg = tool_policy.reason_for("generate_image")
@@ -1274,11 +1367,17 @@ def setup_chat_routes(
             elif chat_mode == "chat":
                 _chat_start = time.time()
                 _answered_by = None  # set if the selected model failed and a fallback answered
-                _requested_model = sess.model
+                _requested_model = runtime_route.model
                 _actual_model = None
                 # ── Chat mode: call stream_llm directly, NO tools, NO document access ──
                 try:
-                    _chat_candidates = [(sess.endpoint_url, sess.model, sess.headers)] + _fallback_candidates
+                    _chat_candidates = [
+                        (
+                            runtime_route.endpoint_url,
+                            runtime_route.model,
+                            runtime_route.headers,
+                        )
+                    ] + _fallback_candidates
                     async for chunk in stream_llm_with_fallback(
                         _chat_candidates,
                         messages,
@@ -1346,7 +1445,12 @@ def setup_chat_routes(
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: error"):
-                            logger.warning(f"Stream error for {sess.model} on {sess.endpoint_url}: {chunk!r}")
+                            logger.warning(
+                                "Stream error for %s on %s: %r",
+                                runtime_route.model,
+                                runtime_route.endpoint_url,
+                                chunk,
+                            )
                             yield chunk
                         elif chunk.startswith("event: "):
                             yield chunk
@@ -1418,7 +1522,7 @@ def setup_chat_routes(
                 _agent_rounds = 0
                 _agent_tool_calls = 0
                 _answered_by = None  # set if the selected model failed and a fallback answered
-                _requested_model = sess.model
+                _requested_model = runtime_route.model
                 _actual_model = None
                 try:
                     from src.settings import get_setting
@@ -1450,10 +1554,10 @@ def setup_chat_routes(
                     )
 
                     async for chunk in stream_agent_loop(
-                        sess.endpoint_url,
-                        sess.model,
+                        runtime_route.endpoint_url,
+                        runtime_route.model,
                         messages,
-                        headers=sess.headers,
+                        headers=runtime_route.headers,
                         temperature=ctx.preset.temperature,
                         max_tokens=ctx.preset.max_tokens,
                         prompt_type=preset_id,

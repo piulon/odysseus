@@ -191,6 +191,7 @@ class Session(TimestampMixin, Base):
     # Configuration flags
     rag = Column(Boolean, default=False)
     archived = Column(Boolean, default=False)
+    auto_route = Column(Boolean, default=False)
 
     # Organization
     folder = Column(String, nullable=True, default=None)
@@ -239,6 +240,7 @@ class Session(TimestampMixin, Base):
             'endpoint_url': self.endpoint_url,
             'rag': self.rag,
             'archived': self.archived,
+            'auto_route': bool(self.auto_route),
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'last_accessed': self.last_accessed.isoformat() if self.last_accessed else None,
@@ -1172,6 +1174,40 @@ def _migrate_add_mode_column():
         except Exception:
             pass
 
+def _migrate_add_auto_route_column():
+    """Add request-scoped automatic model-routing flag to sessions."""
+    import sqlite3
+
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(sessions)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if "auto_route" not in columns:
+            conn.execute(
+                "ALTER TABLE sessions "
+                "ADD COLUMN auto_route BOOLEAN DEFAULT 0"
+            )
+            conn.commit()
+            logging.getLogger(__name__).info(
+                "Migrated: added 'auto_route' column to sessions"
+            )
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"Migration check for auto_route failed: {e}"
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _migrate_add_folder_column():
     """Add folder column to sessions table if it doesn't exist."""
     import sqlite3
@@ -1942,6 +1978,7 @@ def init_db():
     _migrate_add_folder_column()
     _migrate_add_token_columns()
     _migrate_add_mode_column()
+    _migrate_add_auto_route_column()
     _migrate_add_multiuser_owner_columns()
     _migrate_add_gallery_caption_column()
     _migrate_add_api_token_scopes_column()

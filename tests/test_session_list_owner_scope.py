@@ -66,7 +66,11 @@ def test_list_sessions_excludes_other_users_sessions(monkeypatch):
     sm = MagicMock()
     sm.get_sessions_for_user.return_value = {alice_id: alice_session}
     router = sr.setup_session_routes(sm, {})
-    endpoint = next(r.endpoint for r in router.routes
+    # setup_session_routes() registers on a module-global APIRouter.
+    # Other tests may have registered the same path earlier, so select the
+    # most recently registered endpoint, which closes over this test's
+    # session_manager.
+    endpoint = next(r.endpoint for r in reversed(router.routes)
                     if getattr(r, "path", "") == "/api/sessions"
                     and "GET" in getattr(r, "methods", set()))
 

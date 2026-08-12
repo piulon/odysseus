@@ -118,7 +118,11 @@ class ChatContext:
 
 # ── Helpers ────────────────────────────────────────────────────────────── #
 
-def _enforce_chat_privileges(request, sess) -> None:
+def _enforce_chat_privileges(
+    request,
+    sess,
+    model_override: Optional[str] = None,
+) -> None:
     """Apply the per-user privilege gates (allowed_models + max_messages_per_day)
     that both /api/chat and /api/chat_stream must enforce BEFORE any LLM work.
 
@@ -140,18 +144,30 @@ def _enforce_chat_privileges(request, sess) -> None:
 
     privs = auth_manager.get_privileges(user) or {}
 
+    model_to_check = (
+        str(model_override).strip()
+        if model_override is not None
+        else str(getattr(sess, "model", "") or "").strip()
+    )
+
     # Explicit "block everything" sentinel takes precedence over the
     # allowlist — it's the only way to distinguish "user clicked [None]"
     # (block all) from "user clicked [All]" (no restriction), since both
     # otherwise produce an empty `allowed_models` list.
     if privs.get("block_all_models"):
-        raise HTTPException(403, f"Your account is not allowed to use model '{sess.model}'.")
+        raise HTTPException(
+            403,
+            f"Your account is not allowed to use model '{model_to_check}'.",
+        )
 
     allowed_raw = privs.get("allowed_models")
     allowed = allowed_raw if isinstance(allowed_raw, list) else []
     restricted = bool(privs.get("allowed_models_restricted")) or bool(allowed)
-    if restricted and sess.model and sess.model not in allowed:
-        raise HTTPException(403, f"Your account is not allowed to use model '{sess.model}'.")
+    if restricted and model_to_check and model_to_check not in allowed:
+        raise HTTPException(
+            403,
+            f"Your account is not allowed to use model '{model_to_check}'.",
+        )
 
     cap = int(privs.get("max_messages_per_day") or 0)
     if cap <= 0:
@@ -173,6 +189,64 @@ def _enforce_chat_privileges(request, sess) -> None:
         db.close()
     if count >= cap:
         raise HTTPException(429, f"Daily message limit reached ({cap}). Try again in 24 hours.")
+
+
+def _filter_allowed_model_candidates(request, candidates):
+    """Filter fallback candidates through the caller's model allowlist.
+
+    This deliberately does NOT enforce max_messages_per_day; that quota is
+    checked once for the request by _enforce_chat_privileges().
+    """
+    candidates = list(candidates or [])
+
+    try:
+        user = effective_user(request)
+    except Exception:
+        user = None
+
+    if not user:
+        return candidates
+
+    auth_manager = getattr(
+        getattr(request.app, "state", None),
+        "auth_manager",
+        None,
+    )
+    if not auth_manager:
+        return candidates
+
+    privs = auth_manager.get_privileges(user) or {}
+
+    if privs.get("block_all_models"):
+        return []
+
+    allowed_raw = privs.get("allowed_models")
+    allowed = allowed_raw if isinstance(allowed_raw, list) else []
+    restricted = (
+        bool(privs.get("allowed_models_restricted"))
+        or bool(allowed)
+    )
+
+    if not restricted:
+        return candidates
+
+    allowed_set = {
+        str(model).strip()
+        for model in allowed
+        if str(model).strip()
+    }
+
+    filtered = []
+    for candidate in candidates:
+        try:
+            model = str(candidate[1] or "").strip()
+        except (IndexError, TypeError):
+            continue
+
+        if model and model in allowed_set:
+            filtered.append(candidate)
+
+    return filtered
 
 
 def needs_auto_name(name: str) -> bool:
@@ -648,6 +722,9 @@ async def build_chat_context(
     use_enhanced_message: bool = False,
     agent_mode: bool = False,
     allow_tool_preprocessing: bool = True,
+    runtime_endpoint_url: Optional[str] = None,
+    runtime_model: Optional[str] = None,
+    runtime_headers: Optional[dict] = None,
 ) -> ChatContext:
     """Build the full context (preface + messages) for an LLM call.
 
@@ -750,15 +827,35 @@ async def build_chat_context(
     for transcript in preprocessed.youtube_transcripts:
         preface.append(untrusted_context_message("youtube transcript", transcript))
 
-    # Normalize model ID. Prefer cached endpoint models so group chat does not
-    # re-hit slow local /models endpoints on every participant turn.
-    norm = _normalize_model_id_from_cache(sess) or normalize_model_id(
-        sess.endpoint_url,
-        sess.model,
-        owner=getattr(sess, "owner", None),
+    # Resolve the model used only for this request. Manual sessions retain
+    # the legacy normalization behaviour; Auto routes deliberately avoid
+    # mutating the persistent session model.
+    context_endpoint_url = (
+        runtime_endpoint_url
+        if runtime_endpoint_url is not None
+        else sess.endpoint_url
     )
-    if norm:
-        sess.model = norm
+    context_model = (
+        runtime_model
+        if runtime_model is not None
+        else sess.model
+    )
+    context_headers = (
+        runtime_headers
+        if runtime_headers is not None
+        else sess.headers
+    )
+
+    if runtime_endpoint_url is None and runtime_model is None:
+        # Manual route: preserve existing normalization semantics.
+        norm = _normalize_model_id_from_cache(sess) or normalize_model_id(
+            sess.endpoint_url,
+            sess.model,
+            owner=getattr(sess, "owner", None),
+        )
+        if norm:
+            sess.model = norm
+            context_model = norm
 
     # Build messages
     messages = preface + sess.get_context_messages()
@@ -785,7 +882,12 @@ async def build_chat_context(
 
     # Auto-compact
     messages, context_length, was_compacted = await maybe_compact(
-        sess, sess.endpoint_url, sess.model, messages, sess.headers, owner=user,
+        sess,
+        context_endpoint_url,
+        context_model,
+        messages,
+        context_headers,
+        owner=user,
     )
     _before_trim_messages = len(messages)
     _before_trim_tokens = estimate_tokens(messages)
