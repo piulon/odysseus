@@ -2085,7 +2085,7 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
 }
 
 // Pending session — stored locally until the first message is sent
-let _pendingChat = null; // { url, modelId, endpointId }
+let _pendingChat = null; // { url, modelId, endpointId, autoRoute? }
 
 export function createDirectChat(url, modelId, endpointId) {
   _sessionNavToken++;
@@ -2101,7 +2101,7 @@ export function createDirectChat(url, modelId, endpointId) {
   }
 
   // Don't hit the API — just store the model info and prepare the UI
-  _pendingChat = { url, modelId, endpointId };
+  _pendingChat = { url, modelId, endpointId, autoRoute: false };
   _skipAutoSelect = true;
   _suppressNextSessionLoading = true;
   currentSessionId = null;
@@ -2159,6 +2159,9 @@ export async function materializePendingSession() {
   fd.append('name', name);
   fd.append('endpoint_url', pending.url || '');
   fd.append('model', pending.modelId || '');
+  if (pending.autoRoute) {
+    fd.append('auto_route', 'true');
+  }
   if (pending.url && pending.modelId) {
     fd.append('skip_validation', 'true');
   }

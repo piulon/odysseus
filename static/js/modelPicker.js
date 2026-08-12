@@ -121,7 +121,11 @@ async function _ensureDefaultPendingChat() {
   if (!_deps || _defaultChatPickInFlight) return;
   if (_deps.getCurrentSessionId && _deps.getCurrentSessionId()) return;
   const pending = _deps.getPendingChat && _deps.getPendingChat();
-  if (pending && pending.modelId && pending.source === 'manual') return;
+  if (
+    pending &&
+    pending.modelId &&
+    (pending.source === 'manual' || pending.autoRoute)
+  ) return;
   _defaultChatPickInFlight = true;
   try {
     await _ensureModelCacheForFallback();
@@ -354,7 +358,37 @@ function _initModelPickerDropdown() {
       searchRow.classList.toggle('searching', !!q);
     }
 
-    if (!hasAnyModel) return; // collapsed empty list — nothing to render
+    // Auto is routing state, never a synthetic model ID. Only offer it when
+    // this session/pending chat already has a real persistent model+endpoint
+    // to use for capability bypass or an unconfigured Auto lane.
+    const _autoCurrentId = _deps.getCurrentSessionId();
+    const _autoSessions = _deps.getSessions();
+    const _autoSession = _autoSessions.find(x => x.id === _autoCurrentId);
+    const _autoPending = _deps.getPendingChat();
+    const _autoBaseReady = _autoCurrentId
+      ? !!(_autoSession && _autoSession.model && _autoSession.endpoint_url)
+      : !!(_autoPending && _autoPending.modelId && _autoPending.url);
+
+    if (!q && _autoBaseReady) {
+      const autoRow = document.createElement('div');
+      autoRow.className = 'model-switch-item model-switch-auto';
+
+      const autoName = document.createElement('span');
+      autoName.className = 'mp-model-name';
+      autoName.textContent = 'Auto';
+      autoName.title = 'Automatic model routing';
+      autoRow.appendChild(autoName);
+
+      const autoDesc = document.createElement('span');
+      autoDesc.className = 'model-switch-ep';
+      autoDesc.textContent = 'Automatic routing';
+      autoRow.appendChild(autoDesc);
+
+      autoRow.addEventListener('click', () => _pickAuto());
+      listEl.appendChild(autoRow);
+    }
+
+    if (!hasAnyModel) return; // Auto may still be available above.
 
     // Unique lookup so Recent/Favorites (stored as bare model IDs) can be
     // resolved back to full model objects; drops anything no longer offered.
@@ -548,6 +582,72 @@ function _initModelPickerDropdown() {
     }
   }
 
+  async function _pickAuto() {
+    const currentSessionId = _deps.getCurrentSessionId();
+    const sessions = _deps.getSessions();
+    const pending = _deps.getPendingChat();
+    const session = sessions.find(x => x.id === currentSessionId);
+
+    // Auto must always retain a real persistent route underneath it.
+    const hasBase = currentSessionId
+      ? !!(session && session.model && session.endpoint_url)
+      : !!(pending && pending.modelId && pending.url);
+
+    if (!hasBase) {
+      uiModule.showError('Choose a model before enabling Auto');
+      return;
+    }
+
+    try {
+      document.dispatchEvent(new CustomEvent(
+        'odysseus:model-picked',
+        { detail: { autoRoute: true, display: 'Auto' } },
+      ));
+    } catch {}
+
+    if (document.activeElement) document.activeElement.blur();
+    _close();
+
+    if (window.innerWidth >= 768) {
+      const ta = document.getElementById('message');
+      if (ta) setTimeout(() => ta.focus(), 50);
+    }
+
+    if (!currentSessionId) {
+      // Preserve the real pending model/endpoint; Auto is only an extra flag.
+      _deps.setPendingChat({
+        ...pending,
+        autoRoute: true,
+      });
+      updateModelPicker();
+      uiModule.showToast('Automatic model routing enabled');
+      return;
+    }
+
+    const fd = new FormData();
+    fd.append('auto_route', 'true');
+
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/session/${currentSessionId}`,
+        { method: 'PATCH', body: fd },
+      );
+      if (!res.ok) {
+        uiModule.showError('Failed to enable automatic model routing');
+        return;
+      }
+
+      // Mirror the server state locally without touching model/endpoint.
+      session.auto_route = true;
+    } catch (e) {
+      uiModule.showError('Failed to enable automatic model routing: ' + e);
+      return;
+    }
+
+    updateModelPicker();
+    uiModule.showToast('Automatic model routing enabled');
+  }
+
   async function _pick(m) {
     const currentSessionId = _deps.getCurrentSessionId();
     const _pendingChat = _deps.getPendingChat();
@@ -570,7 +670,13 @@ function _initModelPickerDropdown() {
     }
     if (!currentSessionId && _pendingChat) {
       // Already have a deferred session — just update the model
-      _deps.setPendingChat({ url: m.url, modelId: m.mid, endpointId: m.endpointId, source: 'manual' });
+      _deps.setPendingChat({
+        url: m.url,
+        modelId: m.mid,
+        endpointId: m.endpointId,
+        source: 'manual',
+        autoRoute: false,
+      });
       // Header stays as session name — model switch only updates picker
       updateModelPicker();
       uiModule.showToast(`Using ${m.display}`);
@@ -592,7 +698,11 @@ function _initModelPickerDropdown() {
         }
         const sessions = _deps.getSessions();
         const s = sessions.find(x => x.id === currentSessionId);
-        if (s) { s.model = m.mid; s.endpoint_url = m.url; }
+        if (s) {
+          s.model = m.mid;
+          s.endpoint_url = m.url;
+          s.auto_route = false;
+        }
         // Header stays as session name — model info shown in picker only
       } catch (e) {
         uiModule.showError('Failed to set model: ' + e);
@@ -769,7 +879,13 @@ export function updateModelPicker() {
       const fallback = items.find(item => !item.offline && (item.models || []).length > 0);
       if (fallback) {
         modelId = fallback.models[0];
-        _deps.setPendingChat({ url: fallback.url, modelId, endpointId: fallback.endpoint_id, source: 'fallback' });
+        _deps.setPendingChat({
+          url: fallback.url,
+          modelId,
+          endpointId: fallback.endpoint_id,
+          source: 'fallback',
+          autoRoute: !!_pendingChat.autoRoute,
+        });
       }
     }
   }
@@ -784,11 +900,24 @@ export function updateModelPicker() {
     _ensureDefaultPendingChat();
   }
 
-  const displayName = modelId ? modelId.split('/').pop() : 'Select model';
-  // The header indicator clips long names with ellipsis; show the full model
-  // identifier on hover (#1982). No tooltip on the "Select model" placeholder.
-  label.title = modelId || '';
-  const logo = modelId ? providerLogo(modelId) : null;
+  const autoRoute = !!(
+    (s && s.auto_route)
+    || (!currentSessionId && _pendingChat && _pendingChat.autoRoute)
+  );
+  const displayName = autoRoute
+    ? 'Auto'
+    : (modelId ? modelId.split('/').pop() : 'Select model');
+
+  // Auto is display state only: modelId remains the persistent real model.
+  if (autoRoute) {
+    label.title = modelId
+      ? `Automatic routing · persistent model: ${modelId}`
+      : 'Automatic routing';
+  } else {
+    label.title = modelId || '';
+  }
+
+  const logo = autoRoute ? null : (modelId ? providerLogo(modelId) : null);
   if (logo) {
     label.innerHTML = '<span class="model-picker-logo">' + logo + '</span> ' + displayName;
   } else {
