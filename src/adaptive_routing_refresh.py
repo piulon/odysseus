@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import urllib.request
+from urllib.parse import urlparse, urlunparse
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -50,6 +51,44 @@ def _configured_endpoint_ids(owner: str | None) -> tuple[str, ...]:
             endpoint_ids.append(endpoint_id)
 
     return tuple(endpoint_ids)
+
+
+def _native_ollama_root(base: str) -> str | None:
+    """Return a conservative native Ollama root for an explicit Ollama base.
+
+    Port 11434 is Ollama's standard API port. A hostname containing
+    'ollama' is also explicit evidence. Only a pathless base or the
+    standard OpenAI-compat '/v1' suffix is converted; custom prefixes
+    are deliberately left unknown.
+    """
+
+    raw = str(base or "").strip().rstrip("/")
+    if not raw:
+        return None
+
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+    except ValueError:
+        return None
+
+    host = (parsed.hostname or "").lower()
+
+    if port != 11434 and "ollama" not in host:
+        return None
+
+    path = (parsed.path or "").rstrip("/")
+
+    if path not in {"", "/v1"}:
+        return None
+
+    return urlunparse(
+        parsed._replace(
+            path="",
+            query="",
+            fragment="",
+        )
+    ).rstrip("/")
 
 
 def _load_ollama_endpoint(
@@ -99,15 +138,20 @@ def _load_ollama_endpoint(
             getattr(endpoint, "base_url", "")
             or ""
         )
-        configured_models_url = build_models_url(
+        configured_native_root = _native_ollama_root(
             configured_base,
         )
 
-        if (
-            not configured_models_url
-            or not configured_models_url.rstrip("/").endswith("/api/tags")
-        ):
-            return None
+        if configured_native_root is None:
+            configured_models_url = build_models_url(
+                configured_base,
+            )
+
+            if (
+                not configured_models_url
+                or not configured_models_url.rstrip("/").endswith("/api/tags")
+            ):
+                return None
 
         base, api_key = resolve_endpoint_runtime(
             endpoint,
@@ -115,22 +159,34 @@ def _load_ollama_endpoint(
         )
         base = normalize_base(base)
 
-        models_url = build_models_url(base)
-        if (
-            not models_url
-            or not models_url.rstrip("/").endswith("/api/tags")
-        ):
-            return None
+        native_root = _native_ollama_root(base)
 
-        api_root = models_url.rstrip("/").rsplit("/", 1)[0]
+        if native_root is not None:
+            models_url = native_root + "/api/tags"
+            show_url = native_root + "/api/show"
+            chat_url = native_root + "/api/chat"
+            capability_base = native_root
+        else:
+            models_url = build_models_url(base)
+
+            if (
+                not models_url
+                or not models_url.rstrip("/").endswith("/api/tags")
+            ):
+                return None
+
+            api_root = models_url.rstrip("/").rsplit("/", 1)[0]
+            show_url = api_root + "/show"
+            chat_url = build_chat_url(base)
+            capability_base = base
 
         return {
             "endpoint_id": str(endpoint.id),
-            "base_url": base,
+            "base_url": capability_base,
             "models_url": models_url,
-            "show_url": api_root + "/show",
-            "chat_url": build_chat_url(base),
-            "headers": build_headers(api_key, base),
+            "show_url": show_url,
+            "chat_url": chat_url,
+            "headers": build_headers(api_key, capability_base),
             "hidden_models": frozenset(
                 _endpoint_hidden_models(endpoint)
             ),
