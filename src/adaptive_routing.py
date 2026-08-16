@@ -29,6 +29,7 @@ class RequestProfile:
     workload: str = "general"
     required_capabilities: tuple[str, ...] = ()
     preferred_capabilities: tuple[str, ...] = ()
+    target_preferences: tuple[tuple[str, str, int], ...] = ()
     policy: str = POLICY_LOCAL_PREFERRED
 
     def __post_init__(self) -> None:
@@ -126,6 +127,18 @@ def score_candidate(
             "preferred_capabilities="
             + ",".join(sorted(matched_preferred))
         )
+
+    for endpoint_id, model, bonus in profile.target_preferences:
+        if (
+            candidate.endpoint_id == endpoint_id
+            and candidate.model == model
+        ):
+            bonus = int(bonus)
+            score += bonus
+            reasons.append(
+                f"target_preference={bonus}"
+            )
+            break
 
     if profile.policy == POLICY_LOCAL_PREFERRED:
         if scope == "local":
