@@ -220,3 +220,112 @@ def test_invalid_policy_is_rejected():
         pass
     else:
         raise AssertionError("invalid policy was accepted")
+
+
+def test_explicit_target_preference_breaks_capability_tie():
+    profile = RequestProfile(
+        workload="reasoning",
+        preferred_capabilities=(
+            mc.CAP_REASONING,
+        ),
+        target_preferences=(
+            ("ep-tower", "qwen3:14b", 50),
+        ),
+    )
+
+    decision = build_routing_decision(
+        profile,
+        [
+            candidate(
+                "qwen3:4b",
+                node="msi",
+                capabilities=(
+                    mc.CAP_REASONING,
+                ),
+            ),
+            candidate(
+                "qwen3:14b",
+                node="tower",
+                capabilities=(
+                    mc.CAP_REASONING,
+                ),
+            ),
+        ],
+    )
+
+    assert decision.primary is not None
+    assert decision.primary.node == "tower"
+    assert decision.primary.model == "qwen3:14b"
+
+
+def test_target_preference_never_overrides_hard_capability_requirement():
+    profile = RequestProfile(
+        workload="vision",
+        required_capabilities=(
+            mc.CAP_VISION,
+        ),
+        target_preferences=(
+            ("ep-tower", "qwen3:14b", 1000),
+        ),
+    )
+
+    decision = build_routing_decision(
+        profile,
+        [
+            candidate(
+                "qwen3:14b",
+                node="tower",
+                capabilities=(
+                    mc.CAP_REASONING,
+                ),
+            ),
+            candidate(
+                "gemma3:4b",
+                node="msi",
+                capabilities=(
+                    mc.CAP_VISION,
+                ),
+            ),
+        ],
+    )
+
+    assert decision.primary is not None
+    assert decision.primary.node == "msi"
+    assert decision.primary.model == "gemma3:4b"
+
+
+def test_unreachable_preferred_target_degrades_to_viable_candidate():
+    profile = RequestProfile(
+        workload="agent",
+        required_capabilities=(
+            mc.CAP_TOOL_CALL,
+        ),
+        target_preferences=(
+            ("ep-tower", "qwen3:14b", 50),
+        ),
+    )
+
+    decision = build_routing_decision(
+        profile,
+        [
+            candidate(
+                "qwen3:14b",
+                node="tower",
+                capabilities=(
+                    mc.CAP_TOOL_CALL,
+                ),
+                reachable=False,
+            ),
+            candidate(
+                "qwen3:4b",
+                node="msi",
+                capabilities=(
+                    mc.CAP_TOOL_CALL,
+                ),
+            ),
+        ],
+    )
+
+    assert decision.primary is not None
+    assert decision.primary.node == "msi"
+    assert decision.primary.model == "qwen3:4b"
