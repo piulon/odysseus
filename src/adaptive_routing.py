@@ -46,6 +46,7 @@ class RoutingCandidate:
     node: str
     scope: str
     capabilities: tuple[str, ...] = ()
+    context_tokens: int | None = None
     reachable: bool = True
     preference: int = 0
 
