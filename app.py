@@ -1110,6 +1110,35 @@ async def _startup_event():
 
         _startup_tasks.append(asyncio.create_task(_keepalive_loop()))
 
+    # Adaptive routing snapshot refresh is independent of request routing and
+    # stays default-off until explicitly enabled. The refresher probes outside
+    # the event loop and publishes owner-scoped in-memory snapshots only.
+    try:
+        from src.adaptive_routing_app import (
+            adaptive_routing_owners_from_auth_file,
+            adaptive_routing_refresh_enabled,
+        )
+
+        if adaptive_routing_refresh_enabled():
+            from src.adaptive_routing_refresher import (
+                adaptive_routing_refresh_loop,
+            )
+
+            def _adaptive_routing_owners():
+                return adaptive_routing_owners_from_auth_file(AUTH_FILE)
+
+            _startup_tasks.append(
+                asyncio.create_task(
+                    adaptive_routing_refresh_loop(_adaptive_routing_owners)
+                )
+            )
+            logger.info("Adaptive routing snapshot refresher enabled")
+    except Exception as _e:
+        logger.warning(
+            "Failed to start adaptive routing snapshot refresher: %s",
+            _e,
+        )
+
     async def _ensure_default_tasks():
         # Create/reconcile default automation tasks + personal assistant for every user.
         owners = set()
