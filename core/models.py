@@ -69,6 +69,7 @@ class Session:
     model: str
     rag: bool = False
     archived: bool = False
+    auto_route: bool = False
     headers: Optional[Dict[str, str]] = None
     history: List[ChatMessage] = None
     owner: Optional[str] = None

@@ -130,6 +130,7 @@ class SessionManager:
             model=db_session.model,
             rag=db_session.rag,
             archived=db_session.archived,
+            auto_route=bool(getattr(db_session, "auto_route", False)),
             headers=headers,
             history=[],
             owner=getattr(db_session, "owner", None),
@@ -188,6 +189,7 @@ class SessionManager:
             model=db_session.model,
             rag=db_session.rag,
             archived=db_session.archived,
+            auto_route=bool(getattr(db_session, "auto_route", False)),
             headers=headers,
             history=history,
             owner=getattr(db_session, 'owner', None),
@@ -442,6 +444,7 @@ class SessionManager:
             session.headers = headers or {}
             session.rag = db_session.rag
             session.archived = db_session.archived
+            session.auto_route = bool(getattr(db_session, "auto_route", False))
             session.owner = getattr(db_session, "owner", None)
             session.is_important = getattr(db_session, "is_important", False) or False
             session.message_count = getattr(db_session, "message_count", session.message_count) or 0
@@ -500,7 +503,8 @@ class SessionManager:
         endpoint_url: str,
         model: str,
         rag: bool = False,
-        owner: str = None
+        owner: str = None,
+        auto_route: bool = False,
     ) -> Session:
         """Create a new session and save to database."""
         db = SessionLocal()
@@ -511,6 +515,7 @@ class SessionManager:
                 endpoint_url=endpoint_url,
                 model=model,
                 rag=rag,
+                auto_route=bool(auto_route),
                 headers={},
                 owner=owner,
                 created_at=datetime.now(timezone.utc),
@@ -525,6 +530,7 @@ class SessionManager:
                 endpoint_url=endpoint_url,
                 model=model,
                 rag=rag,
+                auto_route=bool(auto_route),
                 headers={},
                 owner=owner,
             )
