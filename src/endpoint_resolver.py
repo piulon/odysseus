@@ -8,7 +8,9 @@ import json
 import logging
 import socket
 import subprocess
-from typing import Optional, Tuple, Dict
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Dict, Mapping, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
 from core.database import SessionLocal, ModelEndpoint
@@ -204,9 +206,11 @@ def _validated_endpoint_base(url: str) -> str:
     return urlunparse(urlparse(base)._replace(query="", fragment="")).rstrip("/")
 
 
-def _prepare_endpoint_base(base: str) -> str:
+def _prepare_endpoint_base(base: str, *, resolve_host: bool = True) -> str:
     base = _validated_endpoint_base(normalize_base(base))
-    return _validated_endpoint_base(normalize_base(resolve_url(base)))
+    if resolve_host:
+        base = resolve_url(base)
+    return _validated_endpoint_base(normalize_base(base))
 
 
 def _append_endpoint_path(base: str, suffix: str) -> str:
@@ -230,9 +234,9 @@ def _anthropic_api_root(base: str) -> str:
     return base
 
 
-def build_chat_url(base: str) -> str:
+def build_chat_url(base: str, *, resolve_host: bool = True) -> str:
     """Return the correct chat endpoint URL for a given base."""
-    base = _prepare_endpoint_base(base)
+    base = _prepare_endpoint_base(base, resolve_host=resolve_host)
     provider = _detect_provider(base)
     if provider == "anthropic":
         return _append_endpoint_path(_anthropic_api_root(base), "/v1/messages")
@@ -440,6 +444,99 @@ def resolve_endpoint_by_id(
         return None
     finally:
         db.close()
+
+
+@dataclass(frozen=True)
+class StrictEndpointTarget:
+    """Request-local endpoint hydration with no public serialization contract."""
+
+    endpoint_id: str
+    model: str
+    endpoint_url: str = field(repr=False)
+    headers: Mapping[str, str] = field(repr=False, compare=False)
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "headers",
+            MappingProxyType(dict(self.headers or {})),
+        )
+
+
+class StrictEndpointResolutionError(Exception):
+    """Sanitized strict-resolution failure safe to expose by stable code."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def resolve_endpoint_by_id_strict(
+    endpoint_id: str,
+    requested_model: str,
+    owner: Optional[str] = None,
+    *,
+    ownerless_shared_only: bool = True,
+) -> StrictEndpointTarget:
+    """Strictly hydrate one exact endpoint/model selection for this request.
+
+    Unlike :func:`resolve_endpoint_by_id`, this never selects a replacement
+    model. Endpoint and ownership state are re-read on every call, and URL
+    construction deliberately skips DNS/Tailscale host resolution.
+    """
+    endpoint_id = str(endpoint_id or "").strip()
+    model = str(requested_model or "").strip()
+    if not endpoint_id:
+        raise StrictEndpointResolutionError("endpoint_required")
+    if not model:
+        raise StrictEndpointResolutionError("model_required")
+
+    db = None
+    try:
+        db = SessionLocal()
+        query = db.query(ModelEndpoint).filter(
+            ModelEndpoint.id == endpoint_id,
+            ModelEndpoint.is_enabled == True,  # noqa: E712
+        )
+        if owner:
+            from src.auth_helpers import owner_filter
+
+            query = owner_filter(query, ModelEndpoint, owner)
+        elif owner is None:
+            # Strict ownerless resolution is always shared-only. Keep the
+            # explicit flag in the API for call-site clarity, but never let a
+            # false value broaden access to an owned endpoint.
+            query = query.filter(ModelEndpoint.owner == None)  # noqa: E711
+
+        endpoint = query.first()
+        if endpoint is None:
+            raise StrictEndpointResolutionError("endpoint_not_found")
+        if model in _endpoint_hidden_models(endpoint):
+            raise StrictEndpointResolutionError("model_hidden")
+
+        try:
+            base, api_key = resolve_endpoint_runtime(endpoint, owner=owner)
+        except Exception:
+            raise StrictEndpointResolutionError("credentials_unavailable") from None
+        try:
+            endpoint_url = build_chat_url(base, resolve_host=False)
+            headers = build_headers(api_key, base)
+        except Exception:
+            raise StrictEndpointResolutionError("endpoint_unavailable") from None
+
+        return StrictEndpointTarget(
+            endpoint_id=endpoint_id,
+            model=model,
+            endpoint_url=endpoint_url,
+            headers=dict(headers or {}),
+        )
+    except StrictEndpointResolutionError:
+        raise
+    except Exception:
+        raise StrictEndpointResolutionError("endpoint_unavailable") from None
+    finally:
+        if db is not None:
+            db.close()
 
 
 def resolve_chat_fallback_candidates(owner: Optional[str] = None) -> list:

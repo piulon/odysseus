@@ -16,6 +16,7 @@ from src.endpoint_resolver import normalize_base
 from src.context_compactor import maybe_compact, trim_for_context
 from src.model_context import estimate_tokens
 from src.auth_helpers import effective_user
+from src.model_authorization import authorize_model
 from src.prompt_security import untrusted_context_message
 from src.attachment_refs import attachment_ref
 from routes.prefs_routes import _load_for_user as load_prefs_for_user
@@ -140,17 +141,14 @@ def _enforce_chat_privileges(request, sess) -> None:
 
     privs = auth_manager.get_privileges(user) or {}
 
-    # Explicit "block everything" sentinel takes precedence over the
-    # allowlist — it's the only way to distinguish "user clicked [None]"
-    # (block all) from "user clicked [All]" (no restriction), since both
-    # otherwise produce an empty `allowed_models` list.
-    if privs.get("block_all_models"):
-        raise HTTPException(403, f"Your account is not allowed to use model '{sess.model}'.")
-
-    allowed_raw = privs.get("allowed_models")
-    allowed = allowed_raw if isinstance(allowed_raw, list) else []
-    restricted = bool(privs.get("allowed_models_restricted")) or bool(allowed)
-    if restricted and sess.model and sess.model not in allowed:
+    model_authorization = authorize_model(sess.model, privs)
+    if (
+        not model_authorization.allowed
+        and (
+            model_authorization.reason == "block_all_models"
+            or bool(sess.model)
+        )
+    ):
         raise HTTPException(403, f"Your account is not allowed to use model '{sess.model}'.")
 
     cap = int(privs.get("max_messages_per_day") or 0)
