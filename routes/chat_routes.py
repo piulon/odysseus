@@ -15,7 +15,11 @@ from pydantic import ValidationError
 
 from core.models import ChatMessage
 from src.request_models import ChatRequest
-from src.llm_core import llm_call_async, stream_llm, stream_llm_with_fallback
+from src.llm_core import (
+    llm_call_async_with_fallback_result,
+    stream_llm,
+    stream_llm_with_fallback,
+)
 from src.agent_loop import stream_agent_loop
 from src import agent_runs
 from src.model_context import estimate_tokens
@@ -522,6 +526,11 @@ def setup_chat_routes(
             model_override=runtime_route.model,
         )
 
+        allowed_runtime_fallbacks = _filter_allowed_model_candidates(
+            request,
+            runtime_route.fallbacks,
+        )
+
         tool_policy = build_effective_tool_policy(last_user_message=message)
         allow_tool_preprocessing = not tool_policy.block_all_tool_calls
 
@@ -578,19 +587,28 @@ def setup_chat_routes(
             except Exception as e:
                 logger.error(f"Research failed: {e}")
 
-        reply = await llm_call_async(
-            runtime_route.endpoint_url,
-            runtime_route.model,
+        llm_result = await llm_call_async_with_fallback_result(
+            [
+                (
+                    runtime_route.endpoint_url,
+                    runtime_route.model,
+                    runtime_route.headers,
+                ),
+                *allowed_runtime_fallbacks,
+            ],
             ctx.messages,
-            headers=runtime_route.headers,
             temperature=ctx.preset.temperature,
             max_tokens=ctx.preset.max_tokens,
             prompt_type=preset_id,
             session_id=session,
         )
+        reply = llm_result.response
         _clean_reply, _clean_md = clean_thinking_for_save(
             reply,
-            {"model": runtime_route.model},
+            {
+                "model": llm_result.model,
+                "requested_model": runtime_route.model,
+            },
         )
         sess.add_message(ChatMessage("assistant", _clean_reply, metadata=_clean_md))
 

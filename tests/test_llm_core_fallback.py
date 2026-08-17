@@ -13,6 +13,68 @@ import pytest
 from src import llm_core
 
 
+@pytest.mark.asyncio
+async def test_async_fallback_result_identifies_successful_primary(monkeypatch):
+    async def fake_llm_call(url, model, messages, **kwargs):
+        return "primary response"
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+
+    result = await llm_core.llm_call_async_with_fallback_result(
+        [("u1", "primary", {"Authorization": "secret"})],
+        [{"role": "user", "content": "hi"}],
+    )
+
+    assert result == llm_core.LLMFallbackResult(
+        response="primary response",
+        model="primary",
+        endpoint_url="u1",
+        candidate_index=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_fallback_result_identifies_successful_fallback(monkeypatch):
+    calls = []
+
+    async def fake_llm_call(url, model, messages, **kwargs):
+        calls.append((url, model))
+        if model == "primary":
+            raise RuntimeError("primary unavailable")
+        return "fallback response"
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+
+    result = await llm_core.llm_call_async_with_fallback_result(
+        [("u1", "primary", {}), ("u2", "backup", {})],
+        [{"role": "user", "content": "hi"}],
+    )
+
+    assert calls == [("u1", "primary"), ("u2", "backup")]
+    assert result == llm_core.LLMFallbackResult(
+        response="fallback response",
+        model="backup",
+        endpoint_url="u2",
+        candidate_index=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_fallback_legacy_helper_still_returns_string(monkeypatch):
+    async def fake_llm_call(url, model, messages, **kwargs):
+        return "legacy response"
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+
+    response = await llm_core.llm_call_async_with_fallback(
+        [("u1", "primary", {})],
+        [{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "legacy response"
+    assert isinstance(response, str)
+
+
 def _run_fallback(monkeypatch, per_model):
     """Drive stream_llm_with_fallback with a stubbed stream_llm that returns a
     canned SSE line list per candidate model. Returns the emitted chunks."""

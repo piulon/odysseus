@@ -4,6 +4,8 @@ import pytest
 from fastapi import HTTPException
 
 from routes import chat_helpers
+from src.chat_model_router import ChatRoute
+from src.request_models import ChatRequest
 
 
 class _AuthManager:
@@ -202,6 +204,165 @@ async def test_context_uses_runtime_route_without_mutating_session(
     assert sess.endpoint_url == "http://persistent/chat"
     assert sess.model == "persistent-model"
     assert sess.headers == {"X-Persistent": "1"}
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_auto_route_uses_allowed_fallback_chain(
+    monkeypatch,
+):
+    from routes import chat_routes
+    from src import chat_model_router
+    from src import llm_core
+    from core import database
+
+    persistent_route = (
+        "http://persistent/chat",
+        "persistent-model",
+        {"X-Persistent": "1"},
+    )
+    primary = (
+        "http://primary/chat",
+        "primary-model",
+        {"X-Primary": "1"},
+    )
+    fallback = (
+        "http://fallback/chat",
+        "fallback-model",
+        {"X-Fallback": "1", "Authorization": "Bearer fallback-secret"},
+    )
+
+    saved_messages = []
+    sess = SimpleNamespace(
+        id="s1",
+        name="test",
+        endpoint_url=persistent_route[0],
+        model=persistent_route[1],
+        headers=persistent_route[2],
+        owner="pau",
+        add_message=saved_messages.append,
+    )
+
+    class SessionManager:
+        def get_session(self, session_id):
+            assert session_id == "s1"
+            return sess
+
+        def save_sessions(self):
+            return None
+
+    class ChatHandler:
+        async def handle_memory_command(self, _sess, _message):
+            return None
+
+    class ToolPolicy:
+        block_all_tool_calls = False
+
+        def blocks(self, _tool):
+            return False
+
+    async def fake_build_context(*_args, **_kwargs):
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": "hello"}],
+            preset=SimpleNamespace(
+                temperature=0.2,
+                max_tokens=128,
+                character_name=None,
+            ),
+            uprefs={},
+            user="pau",
+        )
+
+    calls = []
+
+    async def fake_llm_call(url, model, messages, headers=None, **kwargs):
+        calls.append((url, model, headers))
+        if model == primary[1]:
+            raise HTTPException(503, "primary unavailable")
+        assert messages == [{"role": "user", "content": "hello"}]
+        assert kwargs["session_id"] == "s1"
+        return "fallback response"
+
+    async def fail_direct_primary(*_args, **_kwargs):
+        raise AssertionError(
+            "non-streaming Auto called the primary directly instead of "
+            "using the fallback helper"
+        )
+
+    monkeypatch.setattr(chat_routes, "_verify_session_owner", lambda *_args: None)
+    monkeypatch.setattr(chat_routes, "effective_user", lambda _request: "pau")
+    monkeypatch.setattr(chat_routes, "_clear_orphaned_session_endpoint", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(chat_routes, "_recover_empty_session_model", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(chat_routes, "_is_image_generation_session", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(chat_routes, "_enforce_chat_privileges", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        chat_routes,
+        "_filter_allowed_model_candidates",
+        lambda _request, candidates: list(candidates),
+    )
+    monkeypatch.setattr(chat_routes, "build_effective_tool_policy", lambda **_kwargs: ToolPolicy())
+    monkeypatch.setattr(chat_routes, "build_chat_context", fake_build_context)
+    monkeypatch.setattr(
+        chat_routes,
+        "llm_call_async",
+        fail_direct_primary,
+        raising=False,
+    )
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+    monkeypatch.setattr(
+        chat_routes,
+        "clean_thinking_for_save",
+        lambda reply, metadata: (reply, dict(metadata)),
+    )
+    monkeypatch.setattr(chat_routes, "run_post_response_tasks", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(database, "update_session_last_accessed", lambda _session_id: None)
+    monkeypatch.setattr(
+        chat_model_router,
+        "resolve_chat_route",
+        lambda *_args, **_kwargs: ChatRoute(
+            endpoint_url=primary[0],
+            model=primary[1],
+            headers=primary[2],
+            fallbacks=(fallback,),
+            reason="adaptive_chat:test",
+            lane="chat",
+            auto=True,
+        ),
+    )
+
+    router = chat_routes.setup_chat_routes(
+        SessionManager(),
+        ChatHandler(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+    endpoint = next(
+        route.endpoint
+        for route in router.routes
+        if route.path == "/api/chat"
+    )
+
+    response = await endpoint(
+        SimpleNamespace(headers={}),
+        ChatRequest(message="hello", session="s1"),
+    )
+
+    assert response == {"response": "fallback response"}
+    assert calls == [primary, fallback]
+    assert saved_messages[-1].content == "fallback response"
+    assert saved_messages[-1].metadata == {
+        "model": fallback[1],
+        "requested_model": primary[1],
+    }
+    metadata_text = repr(saved_messages[-1].metadata)
+    assert fallback[0] not in metadata_text
+    assert "Authorization" not in metadata_text
+    assert "fallback-secret" not in metadata_text
+
+    assert sess.endpoint_url == persistent_route[0]
+    assert sess.model == persistent_route[1]
+    assert sess.headers == persistent_route[2]
 
 
 def test_chat_routes_dispatch_uses_runtime_route():
