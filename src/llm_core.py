@@ -36,6 +36,20 @@ def is_recoverable_chat_dispatch_error(exc: BaseException) -> bool:
     status = int(exc.status_code or 0)
     return status in {408, 429} or 500 <= status <= 599
 
+
+def _typed_or_legacy_stream_error(
+    *,
+    typed_errors: bool,
+    status_code: int,
+    kind: str,
+    detail: str,
+    legacy_chunk: str,
+) -> str:
+    """Raise an internal typed failure or preserve the legacy SSE payload."""
+    if typed_errors:
+        raise ChatDispatchError(status_code, detail, kind=kind)
+    return legacy_chunk
+
 _LOCAL_MODEL_LOCK = asyncio.Lock()
 _LOCAL_MODEL_WAITING_FOREGROUND = 0
 _LOCAL_MODEL_CURRENT: Dict[str, object] = {}
@@ -2165,7 +2179,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                     tool_choice_none: bool = False, workload: str = "foreground"):
+                     tool_choice_none: bool = False, workload: str = "foreground",
+                     typed_errors: bool = False):
     target_url = _stream_target_url(url)
     async with _local_model_slot(target_url, model, workload):
         async for chunk in _stream_llm_inner(
@@ -2180,7 +2195,17 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             tools=tools,
             session_id=session_id,
             tool_choice_none=tool_choice_none,
+            typed_errors=typed_errors,
         ):
+            if typed_errors and chunk.startswith("event: error"):
+                # Provider-specific guards that still emit an SSE error are
+                # terminal in typed mode. Do not parse their public text to
+                # infer recoverability.
+                raise ChatDispatchError(
+                    502,
+                    "Streaming provider response was invalid",
+                    kind="invalid_response",
+                )
             yield chunk
 
 
@@ -2188,7 +2213,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                             timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                            tool_choice_none: bool = False):
+                            tool_choice_none: bool = False, typed_errors: bool = False):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -2199,6 +2224,15 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     """
     provider = _detect_provider(url)
     messages_copy = _sanitize_llm_messages(messages)
+
+    def _stream_failure(status_code: int, kind: str, legacy_chunk: str) -> str:
+        return _typed_or_legacy_stream_error(
+            typed_errors=typed_errors,
+            status_code=status_code,
+            kind=kind,
+            detail="Streaming model request failed",
+            legacy_chunk=legacy_chunk,
+        )
 
     # Consolidate multiple system messages into one at the start.
     # Some models (e.g. Qwen3.5) reject system messages that aren't first.
@@ -2276,7 +2310,13 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     stream_timeout = _stream_timeout(timeout)
 
     if _is_host_dead(target_url):
-        yield f'event: error\ndata: {json.dumps({"error": f"Upstream {_host_key(target_url)} unreachable (cooldown active)", "status": 503})}\n\n'
+        yield _typed_or_legacy_stream_error(
+            typed_errors=typed_errors,
+            status_code=503,
+            kind="network",
+            detail="Upstream endpoint is unavailable",
+            legacy_chunk=f'event: error\ndata: {json.dumps({"error": f"Upstream {_host_key(target_url)} unreachable (cooldown active)", "status": 503})}\n\n',
+        )
         return
     note_model_activity(target_url, model)
     degenerate_guard = _DegenerateStreamGuard(model)
@@ -2293,7 +2333,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                 if r.status_code != 200:
                     raw = (await r.aread()).decode(errors="replace")
                     friendly = _format_chatgpt_subscription_error(r.status_code, raw)
-                    yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
+                    yield _stream_failure(
+                        r.status_code,
+                        "upstream_status",
+                        f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n',
+                    )
                     return
                 async for line in r.aiter_lines():
                     if not line:
@@ -2309,6 +2353,12 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                     try:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
+                        if typed_errors:
+                            raise ChatDispatchError(
+                                502,
+                                "Streaming provider response was invalid",
+                                kind="invalid_response",
+                            )
                         continue
                     evt = data.get("type") or event_name
                     if evt == "response.output_text.delta":
@@ -2330,21 +2380,27 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                     elif evt in ("response.failed", "error"):
                         err = data.get("error") or (data.get("response") or {}).get("error") or {}
                         text = err.get("message") if isinstance(err, dict) else str(err or "ChatGPT Subscription request failed")
-                        yield f'event: error\ndata: {json.dumps({"status": 502, "text": text})}\n\n'
+                        yield _stream_failure(
+                            502,
+                            "invalid_response",
+                            f'event: error\ndata: {json.dumps({"status": 502, "text": text})}\n\n',
+                        )
                         return
                 yield "data: [DONE]\n\n"
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
             logger.warning(f"ChatGPT Subscription stream connect to {target_url} failed: {e}{_tail}")
-            yield f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n'
+            yield _stream_failure(503, "network", f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n')
         except httpx.ReadTimeout:
-            yield f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n'
+            yield _stream_failure(504, "timeout", f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n')
         except httpx.NetworkError:
-            yield f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502})}\n\n'
+            yield _stream_failure(502, "network", f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502})}\n\n')
+        except ChatDispatchError:
+            raise
         except Exception as e:
             logger.error(f"ChatGPT Subscription stream error: {e}")
-            yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n'
+            yield _stream_failure(502, "internal", f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n')
         return
 
     # ── Native Ollama streaming ──
@@ -2358,7 +2414,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                 if r.status_code != 200:
                     raw = (await r.aread()).decode(errors="replace")
                     friendly = _format_upstream_error(r.status_code, raw, target_url)
-                    yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
+                    yield _stream_failure(r.status_code, "upstream_status", f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n')
                     return
                 async for line in r.aiter_lines():
                     if not line:
@@ -2366,6 +2422,12 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                     try:
                         j = json.loads(line)
                     except json.JSONDecodeError:
+                        if typed_errors:
+                            raise ChatDispatchError(
+                                502,
+                                "Streaming provider response was invalid",
+                                kind="invalid_response",
+                            )
                         continue
                     message = j.get("message") or {}
                     thinking = message.get("thinking") or ""
@@ -2399,14 +2461,16 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             _cooled = _mark_host_dead(target_url)
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
             logger.warning(f"Ollama stream connect to {target_url} failed: {e}{_tail}")
-            yield f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n'
+            yield _stream_failure(503, "network", f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n')
         except httpx.ReadTimeout:
-            yield f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n'
+            yield _stream_failure(504, "timeout", f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n')
         except httpx.NetworkError:
-            yield f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502})}\n\n'
+            yield _stream_failure(502, "network", f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502})}\n\n')
+        except ChatDispatchError:
+            raise
         except Exception as e:
             logger.error(f"Ollama stream error: {e}")
-            yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n'
+            yield _stream_failure(502, "internal", f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n')
         return
 
     # ── Anthropic streaming ──
@@ -2424,7 +2488,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                 if r.status_code != 200:
                     raw = (await r.aread()).decode(errors="replace")
                     friendly = _format_upstream_error(r.status_code, raw, target_url)
-                    yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
+                    yield _stream_failure(r.status_code, "upstream_status", f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n')
                     return
                 async for line in r.aiter_lines():
                     # SSE allows "data:value" with no space after the colon
@@ -2497,23 +2561,31 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             return
                         elif evt == "error":
                             err_msg = j.get("error", {}).get("message", "Unknown error")
-                            yield f'event: error\ndata: {json.dumps({"error": err_msg, "status": 400})}\n\n'
+                            yield _stream_failure(400, "upstream_status", f'event: error\ndata: {json.dumps({"error": err_msg, "status": 400})}\n\n')
                             return
                     except json.JSONDecodeError:
+                        if typed_errors:
+                            raise ChatDispatchError(
+                                502,
+                                "Streaming provider response was invalid",
+                                kind="invalid_response",
+                            )
                         continue
                 yield "data: [DONE]\n\n"
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
             logger.warning(f"Anthropic stream connect to {target_url} failed: {e}{_tail}")
-            yield f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n'
+            yield _stream_failure(503, "network", f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n')
         except httpx.ReadTimeout:
-            yield f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n'
+            yield _stream_failure(504, "timeout", f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n')
         except httpx.NetworkError:
-            yield f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502})}\n\n'
+            yield _stream_failure(502, "network", f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502})}\n\n')
+        except ChatDispatchError:
+            raise
         except Exception as e:
             logger.error(f"Anthropic stream error: {e}")
-            yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n'
+            yield _stream_failure(502, "internal", f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n')
         return
 
     # ── OpenAI-compatible streaming ──
@@ -2562,7 +2634,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             if r.status_code != 200:
                 raw = (await r.aread()).decode(errors="replace")
                 friendly = _format_upstream_error(r.status_code, raw, target_url)
-                yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n'
+                yield _stream_failure(r.status_code, "upstream_status", f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly, "raw": raw[:500]})}\n\n')
                 return
 
             async for line in r.aiter_lines():
@@ -2781,6 +2853,12 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                         yield event
                     except Exception as e:
                         logger.error(f"Error parsing stream data: {e}")
+                        if typed_errors:
+                            raise ChatDispatchError(
+                                502,
+                                "Streaming provider response was invalid",
+                                kind="invalid_response",
+                            ) from None
                         continue
 
             # End of stream (no explicit [DONE] received)
@@ -2795,14 +2873,16 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         _cooled = _mark_host_dead(target_url)
         _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
         logger.warning(f"Stream connect to {target_url} failed: {e}{_tail}")
-        yield f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n'
+        yield _stream_failure(503, "network", f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n')
     except httpx.ReadTimeout:
-        yield f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n'
+        yield _stream_failure(504, "timeout", f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n')
     except httpx.NetworkError:
-        yield f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502})}\n\n'
+        yield _stream_failure(502, "network", f'event: error\ndata: {json.dumps({"error": "Network error", "status": 502})}\n\n')
+    except ChatDispatchError:
+        raise
     except Exception as e:
         logger.error(f"Stream error: {e}")
-        yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n'
+        yield _stream_failure(502, "internal", f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n')
 
 
 def _summarize_stream_error(err_chunk: Optional[str]) -> str:
@@ -2821,6 +2901,28 @@ def _summarize_stream_error(err_chunk: Optional[str]) -> str:
     except Exception:
         pass
     return "primary model failed"
+
+
+def _stream_chunk_event_data(chunk: str) -> Dict:
+    if not chunk.startswith("data: ") or chunk.startswith("data: [DONE]"):
+        return {}
+    try:
+        data = json.loads(chunk[6:])
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _is_substantive_stream_chunk(chunk: str) -> bool:
+    """Return whether a model SSE chunk commits its current candidate."""
+    event_data = _stream_chunk_event_data(chunk)
+    delta = event_data.get("delta")
+    event_type = event_data.get("type")
+    return (
+        isinstance(delta, str) and bool(delta)
+    ) or event_type == "tool_call_delta" or (
+        event_type == "tool_calls" and bool(event_data.get("calls"))
+    )
 
 
 async def stream_llm_with_fallback(candidates, messages, **kwargs):
@@ -2869,24 +2971,8 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                 yield chunk
                 continue
 
-            event_data = {}
             is_done = chunk.startswith("data: [DONE]")
-            if chunk.startswith("data: ") and not is_done:
-                try:
-                    event_data = json.loads(chunk[6:])
-                except Exception:
-                    pass
-
-            delta = event_data.get("delta")
-            event_type = event_data.get("type")
-            substantive = (
-                isinstance(delta, str) and bool(delta)
-            ) or (
-                event_type == "tool_call_delta"
-            ) or (
-                event_type == "tool_calls"
-                and bool(event_data.get("calls"))
-            )
+            substantive = _is_substantive_stream_chunk(chunk)
 
             if substantive and not emitted:
                 # First real output from a NON-primary candidate: tell the client

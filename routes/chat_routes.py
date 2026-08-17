@@ -6,6 +6,7 @@ import os
 import re
 import time
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Any, AsyncGenerator, List, Optional
 
@@ -17,6 +18,8 @@ from core.models import ChatMessage
 from src.request_models import ChatRequest
 from src.llm_core import (
     ChatDispatchError,
+    _is_substantive_stream_chunk,
+    _stream_chunk_event_data,
     is_recoverable_chat_dispatch_error,
     llm_call_async,
     stream_llm,
@@ -76,6 +79,121 @@ _AUTHORIZATION_CANDIDATE_UNAVAILABLE = {
 }
 
 
+@dataclass
+class _AutoStreamState:
+    requested_model: str
+    winner_model: Optional[str] = None
+
+
+def _sanitized_stream_error(status_code: int = 502) -> str:
+    status = int(status_code or 502)
+    if status < 400 or status > 599:
+        status = 502
+    return f'event: error\ndata: {json.dumps({"error": "The model stream failed.", "status": status})}\n\n'
+
+
+def _authorization_stream_error(exc: ChatRouteAuthorizationError) -> str:
+    return _sanitized_stream_error(_authorization_http_error(exc).status_code)
+
+
+async def _stream_auto_chat_with_fallback(
+    *,
+    selected_primary: ChatRoute,
+    context_route: ChatRoute,
+    manual_fallback: Optional[ChatRoute],
+    sess,
+    auth,
+    messages,
+    stream_kwargs: Dict[str, Any],
+    state: _AutoStreamState,
+) -> AsyncGenerator[str, None]:
+    """Authorize and stream at most primary + manual fallback request-locally."""
+    route = context_route
+    fallback_available = route is selected_primary and manual_fallback is not None
+
+    while True:
+        try:
+            candidate = authorize_chat_route(route, sess, auth=auth)
+        except ChatRouteAuthorizationError as exc:
+            if (
+                fallback_available
+                and exc.code in _AUTHORIZATION_CANDIDATE_UNAVAILABLE
+            ):
+                route = manual_fallback
+                fallback_available = False
+                continue
+            yield _authorization_stream_error(exc)
+            return
+
+        pending_metadata: List[str] = []
+        committed = False
+        actual_model = None
+        failure: Optional[BaseException] = None
+        try:
+            async for chunk in stream_llm(
+                candidate.endpoint_url,
+                candidate.model,
+                messages,
+                headers=dict(candidate.headers),
+                typed_errors=True,
+                **stream_kwargs,
+            ):
+                if chunk.startswith("data: [DONE]"):
+                    if committed:
+                        yield chunk
+                    break
+
+                substantive = _is_substantive_stream_chunk(chunk)
+                event_data = _stream_chunk_event_data(chunk)
+                if event_data.get("type") == "model_actual":
+                    actual_model = event_data.get("model") or actual_model
+
+                if substantive and not committed:
+                    if route is not selected_primary:
+                        yield "data: " + json.dumps({
+                            "type": "fallback",
+                            "selected_model": state.requested_model,
+                            "answered_by": actual_model or candidate.model,
+                            "reason": "primary model unavailable",
+                        }) + "\n\n"
+                    for metadata_chunk in pending_metadata:
+                        yield metadata_chunk
+                    pending_metadata.clear()
+                    committed = True
+                    state.winner_model = actual_model or candidate.model
+
+                if committed:
+                    if event_data.get("type") == "model_actual":
+                        state.winner_model = event_data.get("model") or state.winner_model
+                    yield chunk
+                else:
+                    pending_metadata.append(chunk)
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception as exc:
+            failure = exc
+
+        if committed:
+            if failure is not None:
+                status = failure.status_code if isinstance(failure, ChatDispatchError) else 500
+                yield _sanitized_stream_error(status)
+            return
+
+        recoverable = (
+            failure is not None
+            and is_recoverable_chat_dispatch_error(failure)
+        )
+        empty_completion = failure is None
+        if fallback_available and (recoverable or empty_completion):
+            route = manual_fallback
+            fallback_available = False
+            continue
+
+        status = failure.status_code if isinstance(failure, ChatDispatchError) else 502
+        yield _sanitized_stream_error(status)
+        return
+
+
 def _manual_chat_route(sess, *, reason: str = "manual") -> ChatRoute:
     return ChatRoute(
         auto=False,
@@ -92,6 +210,50 @@ def _manual_fallback_route(route: ChatRoute, sess) -> ChatRoute | None:
     if route.manual_fallback is None:
         return None
     return _manual_chat_route(sess, reason="manual_fallback")
+
+
+def _select_auto_stream_context_candidate(sess, *, owner, auth):
+    """Select and hydrate the one candidate used to build streaming context."""
+    selected_primary = resolve_chat_route(sess, owner=owner, agent_mode=False)
+    requested_model = selected_primary.target.model
+    manual_fallback = _manual_fallback_route(selected_primary, sess)
+    context_route = selected_primary
+    try:
+        context_candidate = authorize_chat_route(context_route, sess, auth=auth)
+    except ChatRouteAuthorizationError as exc:
+        if (
+            exc.code not in _AUTHORIZATION_CANDIDATE_UNAVAILABLE
+            or manual_fallback is None
+        ):
+            raise
+        context_route = manual_fallback
+        context_candidate = authorize_chat_route(context_route, sess, auth=auth)
+    return (
+        selected_primary,
+        requested_model,
+        manual_fallback,
+        context_route,
+        context_candidate,
+    )
+
+
+def _is_plain_auto_stream_chat(
+    sess,
+    *,
+    chat_mode: str,
+    att_ids,
+    image_bypass: bool,
+    do_research: bool,
+    compare_mode: bool,
+) -> bool:
+    return bool(
+        getattr(sess, "auto_route", False)
+        and chat_mode == "chat"
+        and not att_ids
+        and not image_bypass
+        and not do_research
+        and not compare_mode
+    )
 
 
 def _authorization_http_error(exc: ChatRouteAuthorizationError) -> HTTPException:
@@ -879,20 +1041,6 @@ def setup_chat_routes(
             _verify_session_owner(request, session)
             sess = session_manager.get_session(session)
             owner = effective_user(request)
-            if _clear_orphaned_session_endpoint(sess, owner=owner):
-                raise HTTPException(400, "Selected model endpoint was removed. Pick another model in Settings.")
-            # Issue #587: picker shows a model from the endpoint cache but
-            # s.model never made it onto the DB row (first-send race after
-            # endpoint setup, or a previous endpoint delete/recreate). Pull
-            # the first cached model off the matching endpoint so the
-            # upstream isn't called with model="" (which surfaces as a
-            # generic 401/503).
-            _recover_empty_session_model(sess, session, owner=owner)
-            if not getattr(sess, "model", "").strip():
-                raise HTTPException(
-                    400,
-                    "No model selected for this chat. Open the model picker and choose one before sending.",
-                )
             if (
                 chat_mode == "chat"
                 and isinstance(message, str)
@@ -912,25 +1060,13 @@ def setup_chat_routes(
         except (ValueError, ValidationError):
             raise HTTPException(400, "Invalid request parameters")
 
-        # ------------------------------------------------------------------ #
-        # Privilege gates that must fire BEFORE any LLM work / token spend.
-        #   1. allowed_models — reject if session.model isn't in the user's
-        #      configured allowlist (empty list = "no restriction").
-        #   2. max_messages_per_day — count user-role ChatMessage rows owned
-        #      by this user in the last UTC day; 429 if at/over the cap.
-        # Admins always have full privileges via get_privileges (returns
-        # ADMIN_PRIVILEGES wholesale) so this is a no-op for them.
-        _enforce_chat_privileges(request, sess)
-
-        # Ensure session has auth headers
-        resolve_session_auth(sess, session, owner=effective_user(request))
-
-        # Check for research_pending BEFORE mode persist overwrites it
+        # Resolve bypass flags before any legacy helper can repair or hydrate
+        # the persistent manual target. Auto is intentionally limited to plain
+        # streaming chat in this phase.
         do_research = str(use_research).lower() == "true"
-        if not do_research:
-            if get_session_mode(session) == 'research_pending':
-                do_research = True
-                logger.info(f"Session {session} in research_pending — auto-triggering research")
+        if not do_research and get_session_mode(session) == "research_pending":
+            do_research = True
+            logger.info(f"Session {session} in research_pending — auto-triggering research")
 
         att_ids = []
         if body and isinstance(body.get("attachments"), list):
@@ -941,6 +1077,80 @@ def setup_chat_routes(
             except Exception as e:
                 logger.warning("Failed to parse attachments JSON, ignoring attachments", exc_info=e)
 
+        auto_enabled = bool(getattr(sess, "auto_route", False))
+        image_bypass = auto_enabled and _is_image_generation_session(sess, owner=owner)
+        auto_stream_chat = _is_plain_auto_stream_chat(
+            sess,
+            chat_mode=chat_mode,
+            att_ids=att_ids,
+            image_bypass=image_bypass,
+            do_research=do_research,
+            compare_mode=compare_mode,
+        )
+
+        if not auto_stream_chat:
+            if _clear_orphaned_session_endpoint(sess, owner=owner):
+                raise HTTPException(400, "Selected model endpoint was removed. Pick another model in Settings.")
+            # Issue #587: picker shows a model from the endpoint cache but
+            # s.model never made it onto the DB row (first-send race after
+            # endpoint setup, or a previous endpoint delete/recreate). Pull
+            # the first cached model off the matching endpoint so the
+            # upstream isn't called with model="" (which surfaces as a
+            # generic 401/503).
+            _recover_empty_session_model(sess, session, owner=owner)
+            if not getattr(sess, "model", "").strip():
+                raise HTTPException(
+                    400,
+                    "No model selected for this chat. Open the model picker and choose one before sending.",
+                )
+
+        # ------------------------------------------------------------------ #
+        # Privilege gates that must fire BEFORE any LLM work / token spend.
+        #   1. allowed_models — reject if session.model isn't in the user's
+        #      configured allowlist (empty list = "no restriction").
+        #   2. max_messages_per_day — count user-role ChatMessage rows owned
+        #      by this user in the last UTC day; 429 if at/over the cap.
+        # Admins always have full privileges via get_privileges (returns
+        # ADMIN_PRIVILEGES wholesale) so this is a no-op for them.
+        stream_auth = None
+        selected_primary = None
+        manual_fallback = None
+        context_route = None
+        context_candidate = None
+        requested_model = None
+        if auto_stream_chat:
+            try:
+                _enforce_chat_quota(request)
+            except HTTPException:
+                raise
+            except Exception:
+                raise _authorization_http_error(
+                    ChatRouteAuthorizationError("privileges_unavailable")
+                ) from None
+            stream_auth = build_chat_route_auth_context(request)
+            if owner and not stream_auth.privileges:
+                raise _authorization_http_error(
+                    ChatRouteAuthorizationError("privileges_unavailable")
+                )
+            try:
+                (
+                    selected_primary,
+                    requested_model,
+                    manual_fallback,
+                    context_route,
+                    context_candidate,
+                ) = _select_auto_stream_context_candidate(
+                    sess,
+                    owner=owner,
+                    auth=stream_auth,
+                )
+            except ChatRouteAuthorizationError as exc:
+                raise _authorization_http_error(exc) from None
+        else:
+            _enforce_chat_privileges(request, sess)
+            # Legacy/manual hydration may mutate and persist session headers.
+            resolve_session_auth(sess, session, owner=owner)
+
         no_memory = str(form_data.get("no_memory", "")).lower() == "true"
         pre_context_tool_policy = build_effective_tool_policy(
             last_user_message=message,
@@ -948,6 +1158,14 @@ def setup_chat_routes(
         allow_tool_preprocessing = not pre_context_tool_policy.block_all_tool_calls
 
         # Build shared context (stream path uses enhanced_message for context preface)
+        context_overrides = {}
+        if auto_stream_chat:
+            context_overrides = {
+                "runtime_model": context_candidate.model,
+                "runtime_endpoint_url": context_candidate.endpoint_url,
+                "runtime_headers": dict(context_candidate.headers),
+                "model_event_override": requested_model,
+            }
         ctx = await build_chat_context(
             sess, request, chat_handler, chat_processor,
             message=message,
@@ -968,6 +1186,7 @@ def setup_chat_routes(
             # index would be useless / unwanted noise.
             agent_mode=(chat_mode == "agent"),
             allow_tool_preprocessing=allow_tool_preprocessing,
+            **context_overrides,
         )
 
         _research_flags = {"do": do_research}  # Mutable container for generator scope
@@ -1371,15 +1590,21 @@ def setup_chat_routes(
             # Configured fallback chain for the default chat model. Tried in
             # order if the session's primary model fails before producing
             # output. Resolved once per request.
-            try:
-                from src.endpoint_resolver import resolve_chat_fallback_candidates
-                _fallback_candidates = resolve_chat_fallback_candidates(owner=_user)
-            except Exception:
+            if auto_stream_chat:
                 _fallback_candidates = []
+            else:
+                try:
+                    from src.endpoint_resolver import resolve_chat_fallback_candidates
+                    _fallback_candidates = resolve_chat_fallback_candidates(owner=_user)
+                except Exception:
+                    _fallback_candidates = []
 
             # Send model name early so the frontend can show it during streaming
             _model_suffix = "Research" if effective_do_research else None
-            _model_info = {"type": "model_info", "model": sess.model}
+            _model_info = {
+                "type": "model_info",
+                "model": requested_model if auto_stream_chat else sess.model,
+            }
             if _model_suffix:
                 _model_info["suffix"] = _model_suffix
             if ctx.preset.character_name:
@@ -1428,25 +1653,48 @@ def setup_chat_routes(
             elif chat_mode == "chat":
                 _chat_start = time.time()
                 _answered_by = None  # set if the selected model failed and a fallback answered
-                _requested_model = sess.model
+                _requested_model = requested_model if auto_stream_chat else sess.model
                 _actual_model = None
+                _auto_stream_state = (
+                    _AutoStreamState(requested_model=_requested_model)
+                    if auto_stream_chat
+                    else None
+                )
                 # ── Chat mode: call stream_llm directly, NO tools, NO document access ──
                 try:
-                    _chat_candidates = [(sess.endpoint_url, sess.model, sess.headers)] + _fallback_candidates
-                    async for chunk in stream_llm_with_fallback(
-                        _chat_candidates,
-                        messages,
-                        temperature=ctx.preset.temperature,
+                    _stream_kwargs = {
+                        "temperature": ctx.preset.temperature,
                         # Respect the preset; 0/unset = let the server decide (no
                         # cap), matching agent mode. The old hard 4096 fallback
                         # truncated reasoning models mid-<think> — they'd burn the
                         # whole budget thinking and never emit the answer (seen in
                         # Compare on heavy generation prompts).
-                        max_tokens=ctx.preset.max_tokens,
-                        prompt_type=preset_id,
-                        tools=None,
-                        session_id=session,
-                    ):
+                        "max_tokens": ctx.preset.max_tokens,
+                        "prompt_type": preset_id,
+                        "tools": None,
+                        "session_id": session,
+                    }
+                    if auto_stream_chat:
+                        _chat_stream = _stream_auto_chat_with_fallback(
+                            selected_primary=selected_primary,
+                            context_route=context_route,
+                            manual_fallback=manual_fallback,
+                            sess=sess,
+                            auth=stream_auth,
+                            messages=messages,
+                            stream_kwargs=_stream_kwargs,
+                            state=_auto_stream_state,
+                        )
+                    else:
+                        _chat_candidates = [
+                            (sess.endpoint_url, sess.model, sess.headers)
+                        ] + _fallback_candidates
+                        _chat_stream = stream_llm_with_fallback(
+                            _chat_candidates,
+                            messages,
+                            **_stream_kwargs,
+                        )
+                    async for chunk in _chat_stream:
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
                                 data = json.loads(chunk[6:])
@@ -1526,6 +1774,14 @@ def setup_chat_routes(
                                 yield f'data: {json.dumps({"type": "metrics", "data": last_metrics})}\n\n'
                             if full_response:
                                 _metrics_to_save = dict(last_metrics or {})
+                                if auto_stream_chat:
+                                    _metrics_to_save["requested_model"] = _requested_model
+                                    _metrics_to_save["model"] = (
+                                        _auto_stream_state.winner_model
+                                        or _actual_model
+                                        or _answered_by
+                                        or _requested_model
+                                    )
                                 if thinking_response.strip() and not _metrics_to_save.get("thinking"):
                                     _metrics_to_save["thinking"] = thinking_response.strip()
                                 _saved_id = save_assistant_response(
@@ -1547,6 +1803,11 @@ def setup_chat_routes(
                                     character_name=ctx.preset.character_name,
                                     owner=_user,
                                     allow_background_extraction=not tool_policy.block_all_tool_calls,
+                                    response_model=(
+                                        _metrics_to_save.get("model")
+                                        if auto_stream_chat
+                                        else None
+                                    ),
                                 )
                             _stream_set(session, status="done")
                             yield chunk
@@ -1557,7 +1818,12 @@ def setup_chat_routes(
                             full_response,
                             {
                                 "stopped": True,
-                                "model": _actual_model or _answered_by or _requested_model,
+                                "model": (
+                                    (_auto_stream_state.winner_model if _auto_stream_state else None)
+                                    or _actual_model
+                                    or _answered_by
+                                    or _requested_model
+                                ),
                                 "requested_model": _requested_model,
                             },
                         )
