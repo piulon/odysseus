@@ -15,7 +15,8 @@ from src.llm_core import normalize_model_id
 from src.endpoint_resolver import normalize_base
 from src.context_compactor import maybe_compact, trim_for_context
 from src.model_context import estimate_tokens
-from src.auth_helpers import effective_user
+from src.auth_helpers import effective_user, _auth_disabled
+from src.chat_route_authorizer import ChatRouteAuthContext
 from src.model_authorization import authorize_model
 from src.prompt_security import untrusted_context_message
 from src.attachment_refs import attachment_ref
@@ -119,37 +120,27 @@ class ChatContext:
 
 # ── Helpers ────────────────────────────────────────────────────────────── #
 
-def _enforce_chat_privileges(request, sess) -> None:
-    """Apply the per-user privilege gates (allowed_models + max_messages_per_day)
-    that both /api/chat and /api/chat_stream must enforce BEFORE any LLM work.
-
-    Raises HTTPException(403) if the session's model is not in the user's
-    allowlist, or HTTPException(429) if the user has hit their daily message
-    cap. No-op for unauthenticated callers or when auth_manager is absent
-    (single-user mode). Admins receive ADMIN_PRIVILEGES from get_privileges,
-    which means unrestricted allowed_models / zero cap -> no-op for them.
-    """
+def _resolved_chat_privileges(request):
     try:
         user = effective_user(request)
     except Exception:
         user = None
     if not user:
-        return
+        return user, None
     auth_manager = getattr(getattr(request.app, "state", None), "auth_manager", None)
     if not auth_manager:
+        return user, None
+    return user, auth_manager.get_privileges(user) or {}
+
+
+def _enforce_chat_quota(request, *, _privileges=None) -> None:
+    """Apply max_messages_per_day once for the incoming HTTP request."""
+    user, privileges = _resolved_chat_privileges(request)
+    if not user:
         return
-
-    privs = auth_manager.get_privileges(user) or {}
-
-    model_authorization = authorize_model(sess.model, privs)
-    if (
-        not model_authorization.allowed
-        and (
-            model_authorization.reason == "block_all_models"
-            or bool(sess.model)
-        )
-    ):
-        raise HTTPException(403, f"Your account is not allowed to use model '{sess.model}'.")
+    privs = _privileges if _privileges is not None else privileges
+    if not privs:
+        return
 
     cap = int(privs.get("max_messages_per_day") or 0)
     if cap <= 0:
@@ -171,6 +162,58 @@ def _enforce_chat_privileges(request, sess) -> None:
         db.close()
     if count >= cap:
         raise HTTPException(429, f"Daily message limit reached ({cap}). Try again in 24 hours.")
+
+
+def build_chat_route_auth_context(request) -> ChatRouteAuthContext:
+    """Build fail-closed route authority exclusively from server-side state."""
+    owner = effective_user(request)
+    single_user = owner is None and _auth_disabled()
+    auth_manager = getattr(getattr(request.app, "state", None), "auth_manager", None)
+    privileges = None
+    is_admin = False
+    if owner and auth_manager is not None:
+        try:
+            privileges = auth_manager.get_privileges(owner)
+        except Exception:
+            privileges = None
+        try:
+            is_admin = bool(auth_manager.is_admin(owner))
+        except Exception:
+            privileges = None
+            is_admin = False
+    return ChatRouteAuthContext(
+        owner=owner,
+        privileges=privileges,
+        is_admin=is_admin,
+        single_user=single_user,
+    )
+
+
+def _enforce_chat_privileges(request, sess) -> None:
+    """Apply the per-user privilege gates (allowed_models + max_messages_per_day)
+    that both /api/chat and /api/chat_stream must enforce BEFORE any LLM work.
+
+    Raises HTTPException(403) if the session's model is not in the user's
+    allowlist, or HTTPException(429) if the user has hit their daily message
+    cap. No-op for unauthenticated callers or when auth_manager is absent
+    (single-user mode). Admins receive ADMIN_PRIVILEGES from get_privileges,
+    which means unrestricted allowed_models / zero cap -> no-op for them.
+    """
+    user, privs = _resolved_chat_privileges(request)
+    if not user or privs is None:
+        return
+
+    model_authorization = authorize_model(sess.model, privs)
+    if (
+        not model_authorization.allowed
+        and (
+            model_authorization.reason == "block_all_models"
+            or bool(sess.model)
+        )
+    ):
+        raise HTTPException(403, f"Your account is not allowed to use model '{sess.model}'.")
+
+    _enforce_chat_quota(request, _privileges=privs)
 
 
 def needs_auto_name(name: str) -> bool:
@@ -440,11 +483,21 @@ def add_user_message(sess, chat_handler, preprocessed: PreprocessedMessage, inco
         chat_handler.update_session_name_if_needed(sess, preprocessed.text_for_context)
 
 
-def fire_message_event(request, webhook_manager, session_id: str, sess, message: str, compare_mode: bool = False):
+def fire_message_event(
+    request,
+    webhook_manager,
+    session_id: str,
+    sess,
+    message: str,
+    compare_mode: bool = False,
+    model_override: Optional[str] = None,
+):
     """Fire webhook and event_bus events for a new user message."""
     if webhook_manager and not compare_mode:
         webhook_manager.fire_and_forget("chat.message", {
-            "session_id": session_id, "model": sess.model, "message": message[:2000],
+            "session_id": session_id,
+            "model": model_override if model_override is not None else sess.model,
+            "message": message[:2000],
         })
     from src.event_bus import fire_event
     user = effective_user(request)
@@ -646,6 +699,10 @@ async def build_chat_context(
     use_enhanced_message: bool = False,
     agent_mode: bool = False,
     allow_tool_preprocessing: bool = True,
+    runtime_model: Optional[str] = None,
+    runtime_endpoint_url: Optional[str] = None,
+    runtime_headers: Optional[dict] = None,
+    model_event_override: Optional[str] = None,
 ) -> ChatContext:
     """Build the full context (preface + messages) for an LLM call.
 
@@ -671,7 +728,15 @@ async def build_chat_context(
 
     # Fire events
     if not incognito:
-        fire_message_event(request, webhook_manager, session_id, sess, message, compare_mode)
+        fire_message_event(
+            request,
+            webhook_manager,
+            session_id,
+            sess,
+            message,
+            compare_mode,
+            model_override=model_event_override,
+        )
 
     # Resolve owner-scoped prefs/context. Browser requests keep the cookie user;
     # bearer-token chat requests use the token owner instead of the "api" sentinel.
@@ -748,15 +813,24 @@ async def build_chat_context(
     for transcript in preprocessed.youtube_transcripts:
         preface.append(untrusted_context_message("youtube transcript", transcript))
 
-    # Normalize model ID. Prefer cached endpoint models so group chat does not
-    # re-hit slow local /models endpoints on every participant turn.
-    norm = _normalize_model_id_from_cache(sess) or normalize_model_id(
-        sess.endpoint_url,
-        sess.model,
-        owner=getattr(sess, "owner", None),
+    runtime_override = runtime_model is not None or runtime_endpoint_url is not None
+    context_model = runtime_model if runtime_model is not None else sess.model
+    context_endpoint_url = (
+        runtime_endpoint_url if runtime_endpoint_url is not None else sess.endpoint_url
     )
-    if norm:
-        sess.model = norm
+    context_headers = runtime_headers if runtime_headers is not None else sess.headers
+
+    # Manual callers retain legacy model normalization. Auto callers use an
+    # already-selected request-local target and must not mutate the session.
+    if not runtime_override:
+        norm = _normalize_model_id_from_cache(sess) or normalize_model_id(
+            sess.endpoint_url,
+            sess.model,
+            owner=getattr(sess, "owner", None),
+        )
+        if norm:
+            sess.model = norm
+            context_model = norm
 
     # Build messages
     messages = preface + sess.get_context_messages()
@@ -783,7 +857,12 @@ async def build_chat_context(
 
     # Auto-compact
     messages, context_length, was_compacted = await maybe_compact(
-        sess, sess.endpoint_url, sess.model, messages, sess.headers, owner=user,
+        sess,
+        context_endpoint_url,
+        context_model,
+        messages,
+        context_headers,
+        owner=user,
     )
     _before_trim_messages = len(messages)
     _before_trim_tokens = estimate_tokens(messages)
@@ -1157,6 +1236,7 @@ def run_post_response_tasks(
     owner: str = None,
     extract_skills: bool = True,
     allow_background_extraction: bool = True,
+    response_model: Optional[str] = None,
 ):
     """Fire background tasks after a completed response: memory extraction, webhooks, auto-name, skill extraction.
 
@@ -1239,7 +1319,8 @@ def run_post_response_tasks(
     # Webhook
     if webhook_manager and not compare_mode:
         webhook_manager.fire_and_forget("chat.completed", {
-            "session_id": session_id, "model": sess.model,
+            "session_id": session_id,
+            "model": response_model if response_model is not None else sess.model,
             "user_message": message, "response": full_response[:2000],
         })
 

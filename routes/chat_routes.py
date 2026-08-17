@@ -15,7 +15,18 @@ from pydantic import ValidationError
 
 from core.models import ChatMessage
 from src.request_models import ChatRequest
-from src.llm_core import llm_call_async, stream_llm, stream_llm_with_fallback
+from src.llm_core import (
+    ChatDispatchError,
+    is_recoverable_chat_dispatch_error,
+    llm_call_async,
+    stream_llm,
+    stream_llm_with_fallback,
+)
+from src.chat_model_router import ChatRoute, RouteTarget, resolve_chat_route
+from src.chat_route_authorizer import (
+    ChatRouteAuthorizationError,
+    authorize_chat_route,
+)
 from src.agent_loop import stream_agent_loop
 from src import agent_runs
 from src.model_context import estimate_tokens
@@ -40,6 +51,8 @@ from routes.chat_helpers import (
     run_post_response_tasks,
     clean_thinking_for_save,
     _enforce_chat_privileges,
+    _enforce_chat_quota,
+    build_chat_route_auth_context,
 )
 from src.action_intents import ToolIntent, classify_tool_intent as _classify_tool_intent
 from src.tool_policy import (
@@ -54,6 +67,56 @@ logger = logging.getLogger(__name__)
 # Track active streams for partial-save safety net
 _active_streams: Dict[str, dict] = {}
 _IMAGE_MODEL_PREFIXES = ("gpt-image", "dall-e", "chatgpt-image")
+
+_AUTHORIZATION_CANDIDATE_UNAVAILABLE = {
+    "endpoint_not_found",
+    "endpoint_unavailable",
+    "credentials_unavailable",
+    "model_hidden",
+}
+
+
+def _manual_chat_route(sess, *, reason: str = "manual") -> ChatRoute:
+    return ChatRoute(
+        auto=False,
+        lane="manual",
+        target=RouteTarget(
+            model=str(getattr(sess, "model", "") or "").strip(),
+            endpoint_url=str(getattr(sess, "endpoint_url", "") or "").strip(),
+        ),
+        reason=reason,
+    )
+
+
+def _manual_fallback_route(route: ChatRoute, sess) -> ChatRoute | None:
+    if route.manual_fallback is None:
+        return None
+    return _manual_chat_route(sess, reason="manual_fallback")
+
+
+def _authorization_http_error(exc: ChatRouteAuthorizationError) -> HTTPException:
+    code = exc.code
+    if code in {
+        "invalid_auth_context",
+        "privileges_unavailable",
+        "block_all_models",
+        "model_not_allowed",
+        "manual_endpoint_not_allowed",
+        "model_hidden",
+    }:
+        return HTTPException(403, "The selected model is not authorized for this request.")
+    if code == "endpoint_not_found":
+        return HTTPException(400, "The selected model endpoint is unavailable.")
+    return HTTPException(503, "The selected model endpoint is temporarily unavailable.")
+
+
+def _dispatch_http_error(exc: BaseException) -> HTTPException:
+    if isinstance(exc, ChatDispatchError):
+        status = int(exc.status_code or 502)
+        if status < 400 or status > 599:
+            status = 502
+        return HTTPException(status, "The model request failed.")
+    return HTTPException(500, "The model request failed.")
 
 
 def _stream_set(session_id: str, **fields) -> None:
@@ -443,25 +506,48 @@ def setup_chat_routes(
         except KeyError:
             raise HTTPException(404, f"Session '{session}' not found")
         owner = effective_user(request)
-        if _clear_orphaned_session_endpoint(sess, owner=owner):
-            raise HTTPException(400, "Selected model endpoint was removed. Pick another model in Settings.")
-
-        # Empty model + live endpoint = setup race (Issue #587). Repair from
-        # the endpoint's cached model list before privilege checks, which
-        # otherwise see "" and behave inconsistently with the allowlist.
-        _recover_empty_session_model(sess, session, owner=owner)
-        if not getattr(sess, "model", "").strip():
-            raise HTTPException(
-                400,
-                "No model selected for this chat. Open the model picker and choose one before sending.",
-            )
-
-        # Same allowed_models + daily-cap gate as chat_stream (mirror so the
-        # non-streaming path can't be used to bypass).
-        _enforce_chat_privileges(request, sess)
-
         tool_policy = build_effective_tool_policy(last_user_message=message)
         allow_tool_preprocessing = not tool_policy.block_all_tool_calls
+
+        auto_enabled = bool(getattr(sess, "auto_route", False))
+        attachments_bypass = auto_enabled and bool(att_ids)
+        image_bypass = auto_enabled and _is_image_generation_session(sess, owner=owner)
+        auto_normal = auto_enabled and not (
+            attachments_bypass or image_bypass
+        )
+
+        # Legacy repair mutates the persistent manual selection. It remains
+        # correct for manual/attachment/image requests, but must never run for
+        # a normal Auto request whose manual target is only an optional fallback.
+        if not auto_normal:
+            if _clear_orphaned_session_endpoint(sess, owner=owner):
+                raise HTTPException(400, "Selected model endpoint was removed. Pick another model in Settings.")
+            _recover_empty_session_model(sess, session, owner=owner)
+            if not getattr(sess, "model", "").strip():
+                raise HTTPException(
+                    400,
+                    "No model selected for this chat. Open the model picker and choose one before sending.",
+                )
+
+        # Quota is request-scoped. Model policy is applied independently to
+        # each effective candidate by authorize_chat_route().
+        try:
+            _enforce_chat_quota(request)
+        except HTTPException:
+            raise
+        except Exception:
+            raise _authorization_http_error(
+                ChatRouteAuthorizationError("privileges_unavailable")
+            ) from None
+
+        # Resolve request authority before an inline command can mutate state.
+        # This does not select or hydrate a route; it only preserves the
+        # fail-closed multi-user contract for missing privilege state.
+        auth = build_chat_route_auth_context(request)
+        if owner and not auth.privileges:
+            raise _authorization_http_error(
+                ChatRouteAuthorizationError("privileges_unavailable")
+            )
 
         # Inline memory command
         memory_response = None
@@ -470,7 +556,50 @@ def setup_chat_routes(
         if memory_response:
             return {"response": memory_response}
 
+        selected_primary = (
+            resolve_chat_route(sess, owner=owner, agent_mode=False)
+            if auto_normal
+            else _manual_chat_route(sess)
+        )
+        requested_model = selected_primary.target.model
+        manual_fallback = _manual_fallback_route(selected_primary, sess)
+
+        # Hydrate once for context construction. This is required because
+        # maybe_compact() may call an LLM; the candidate is rehydrated again
+        # immediately before the actual response dispatch.
+        context_route = selected_primary
+        try:
+            context_candidate = authorize_chat_route(
+                context_route,
+                sess,
+                auth=auth,
+            )
+        except ChatRouteAuthorizationError as exc:
+            if (
+                exc.code in _AUTHORIZATION_CANDIDATE_UNAVAILABLE
+                and manual_fallback is not None
+            ):
+                context_route = manual_fallback
+                try:
+                    context_candidate = authorize_chat_route(
+                        context_route,
+                        sess,
+                        auth=auth,
+                    )
+                except ChatRouteAuthorizationError as fallback_exc:
+                    raise _authorization_http_error(fallback_exc) from None
+            else:
+                raise _authorization_http_error(exc) from None
+
         # Build shared context (preset, preprocess, preface, compact)
+        context_overrides = {}
+        if auto_normal:
+            context_overrides = {
+                "runtime_model": context_candidate.model,
+                "runtime_endpoint_url": context_candidate.endpoint_url,
+                "runtime_headers": dict(context_candidate.headers),
+                "model_event_override": requested_model,
+            }
         ctx = await build_chat_context(
             sess, request, chat_handler, chat_processor,
             message=message,
@@ -481,6 +610,7 @@ def setup_chat_routes(
             time_filter=time_filter,
             webhook_manager=webhook_manager,
             allow_tool_preprocessing=allow_tool_preprocessing,
+            **context_overrides,
         )
 
         # Research injection
@@ -501,22 +631,82 @@ def setup_chat_routes(
             except Exception as e:
                 logger.error(f"Research failed: {e}")
 
-        reply = await llm_call_async(
-            sess.endpoint_url,
-            sess.model,
-            ctx.messages,
-            headers=sess.headers,
-            temperature=ctx.preset.temperature,
-            max_tokens=ctx.preset.max_tokens,
-            prompt_type=preset_id,
-            session_id=session,
-        )
-        _clean_reply, _clean_md = clean_thinking_for_save(reply, {"model": sess.model})
-        sess.add_message(ChatMessage("assistant", _clean_reply, metadata=_clean_md))
+        # Requery/re-authorize immediately before dispatch. If the primary
+        # disappeared during context construction, the manual fallback is
+        # hydrated only now. A context already built with the fallback has no
+        # third candidate.
+        dispatch_route = context_route
+        try:
+            dispatch_candidate = authorize_chat_route(
+                dispatch_route,
+                sess,
+                auth=auth,
+            )
+        except ChatRouteAuthorizationError as exc:
+            if (
+                dispatch_route is selected_primary
+                and exc.code in _AUTHORIZATION_CANDIDATE_UNAVAILABLE
+                and manual_fallback is not None
+            ):
+                dispatch_route = manual_fallback
+                try:
+                    dispatch_candidate = authorize_chat_route(
+                        dispatch_route,
+                        sess,
+                        auth=auth,
+                    )
+                except ChatRouteAuthorizationError as fallback_exc:
+                    raise _authorization_http_error(fallback_exc) from None
+            else:
+                raise _authorization_http_error(exc) from None
 
-        from core.database import update_session_last_accessed
-        update_session_last_accessed(session)
-        session_manager.save_sessions()
+        async def _dispatch(candidate):
+            return await llm_call_async(
+                candidate.endpoint_url,
+                candidate.model,
+                ctx.messages,
+                headers=dict(candidate.headers),
+                temperature=ctx.preset.temperature,
+                max_tokens=ctx.preset.max_tokens,
+                prompt_type=preset_id,
+                session_id=session,
+            )
+
+        try:
+            reply = await _dispatch(dispatch_candidate)
+        except Exception as exc:
+            if (
+                dispatch_route is selected_primary
+                and manual_fallback is not None
+                and is_recoverable_chat_dispatch_error(exc)
+            ):
+                try:
+                    dispatch_route = manual_fallback
+                    dispatch_candidate = authorize_chat_route(
+                        dispatch_route,
+                        sess,
+                        auth=auth,
+                    )
+                    reply = await _dispatch(dispatch_candidate)
+                except ChatRouteAuthorizationError as fallback_exc:
+                    raise _authorization_http_error(fallback_exc) from None
+                except Exception as fallback_exc:
+                    raise _dispatch_http_error(fallback_exc) from None
+            else:
+                raise _dispatch_http_error(exc) from None
+
+        winner_model = dispatch_candidate.model
+        save_assistant_response(
+            sess,
+            session_manager,
+            session,
+            reply,
+            {
+                "requested_model": requested_model,
+                "model": winner_model,
+            },
+            character_name=ctx.preset.character_name,
+        )
 
         # Background tasks (memory, webhook, auto-name)
         run_post_response_tasks(
@@ -525,6 +715,7 @@ def setup_chat_routes(
             character_name=ctx.preset.character_name,
             owner=ctx.user,
             allow_background_extraction=not tool_policy.block_all_tool_calls,
+            response_model=winner_model,
         )
 
         return {"response": reply}

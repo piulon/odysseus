@@ -16,6 +16,26 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+
+class ChatDispatchError(HTTPException):
+    """HTTP-compatible LLM failure with a stable internal dispatch category."""
+
+    def __init__(self, status_code: int, detail: str, *, kind: str):
+        self.kind = kind
+        super().__init__(status_code=status_code, detail=detail)
+
+
+def is_recoverable_chat_dispatch_error(exc: BaseException) -> bool:
+    """Return whether a typed dispatch failure may try another candidate."""
+    if not isinstance(exc, ChatDispatchError):
+        return False
+    if exc.kind in {"timeout", "network"}:
+        return True
+    if exc.kind != "upstream_status":
+        return False
+    status = int(exc.status_code or 0)
+    return status in {408, 429} or 500 <= status <= 599
+
 _LOCAL_MODEL_LOCK = asyncio.Lock()
 _LOCAL_MODEL_WAITING_FOREGROUND = 0
 _LOCAL_MODEL_CURRENT: Dict[str, object] = {}
@@ -1993,7 +2013,7 @@ async def llm_call_async(
                 if event_is_error or data.get("error") or (data.get("status") and data.get("text")):
                     status = int(data.get("status") or 502)
                     text = data.get("text") or data.get("error") or "ChatGPT Subscription request failed"
-                    raise HTTPException(status, text)
+                    raise ChatDispatchError(status, text, kind="upstream_status")
                 delta = data.get("delta")
                 if isinstance(delta, str):
                     parts.append(delta)
@@ -2039,7 +2059,11 @@ async def llm_call_async(
         _apply_local_generation_stability(payload, target_url, model)
 
     if _is_host_dead(target_url):
-        raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
+        raise ChatDispatchError(
+            503,
+            f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)",
+            kind="network",
+        )
 
     call_timeout = _call_timeout(timeout)
     attempt = 0
@@ -2061,7 +2085,11 @@ async def llm_call_async(
                 if r.status_code in (429, 502, 503, 504) and attempt < max_retries:
                     await asyncio.sleep(LLMConfig.RETRY_DELAY)
                     continue
-                raise HTTPException(r.status_code, friendly)
+                raise ChatDispatchError(
+                    r.status_code,
+                    friendly,
+                    kind="upstream_status",
+                )
             logger.info(f"LLM async call to {target_url} succeeded in {duration:.2f}s (attempt {attempt})")
             _clear_host_dead(target_url)
             data = r.json()
@@ -2076,20 +2104,50 @@ async def llm_call_async(
                 _set_cached_response(cache_key, response)
                 return response
             except Exception:
-                raise HTTPException(502, f"Unexpected schema from {target_url}: {str(data)[:400]}")
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                raise ChatDispatchError(
+                    502,
+                    f"Unexpected schema from {target_url}: {str(data)[:400]}",
+                    kind="invalid_response",
+                )
+        except httpx.ConnectTimeout as e:
+            _cooled = _mark_host_dead(target_url)
+            duration = time.time() - start
+            _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
+            logger.warning(f"LLM async connect to {target_url} timed out after {duration:.2f}s: {e}{_tail}")
+            if _cooled or attempt >= max_retries:
+                raise ChatDispatchError(
+                    503,
+                    f"Cannot reach {_host_key(target_url)}: {e}",
+                    kind="timeout",
+                )
+            await asyncio.sleep(LLMConfig.RETRY_DELAY)
+        except httpx.ConnectError as e:
             _cooled = _mark_host_dead(target_url)
             duration = time.time() - start
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
             logger.warning(f"LLM async connect to {target_url} failed after {duration:.2f}s: {e}{_tail}")
             if _cooled or attempt >= max_retries:
-                raise HTTPException(503, f"Cannot reach {_host_key(target_url)}: {e}")
+                raise ChatDispatchError(
+                    503,
+                    f"Cannot reach {_host_key(target_url)}: {e}",
+                    kind="network",
+                )
             await asyncio.sleep(LLMConfig.RETRY_DELAY)
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             duration = time.time() - start
             logger.warning(f"LLM async call attempt {attempt} failed after {duration:.2f}s: {e}")
             if attempt >= max_retries:
-                raise HTTPException(502, f"POST {target_url} failed after {max_retries} attempts: {e}")
+                if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                    status = e.response.status_code
+                    kind = "upstream_status"
+                else:
+                    status = 502
+                    kind = "timeout" if isinstance(e, httpx.TimeoutException) else "network"
+                raise ChatDispatchError(
+                    status,
+                    f"POST {target_url} failed after {max_retries} attempts: {e}",
+                    kind=kind,
+                )
             await asyncio.sleep(LLMConfig.RETRY_DELAY)
 
 def _stream_target_url(url: str) -> str:
