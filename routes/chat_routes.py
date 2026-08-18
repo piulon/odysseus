@@ -876,6 +876,7 @@ def setup_chat_routes(
                 max_tokens=ctx.preset.max_tokens,
                 prompt_type=preset_id,
                 session_id=session,
+                safe_logs=auto_normal,
             )
 
         try:
@@ -1828,7 +1829,13 @@ def setup_chat_routes(
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: error"):
-                            logger.warning(f"Stream error for {sess.model} on {sess.endpoint_url}: {chunk!r}")
+                            if auto_stream_chat:
+                                logger.warning(
+                                    "Auto model stream failed requested_model=%s",
+                                    _requested_model,
+                                )
+                            else:
+                                logger.warning(f"Stream error for {sess.model} on {sess.endpoint_url}: {chunk!r}")
                             yield chunk
                         elif chunk.startswith("event: "):
                             yield chunk

@@ -221,7 +221,7 @@ async def _stream_auto_agent_round(
                 continue
             state.fail(403 if exc.code in {
                 "invalid_auth_context", "privileges_unavailable",
-                "block_all_models", "model_not_allowed",
+                "block_all_models", "model_not_allowed", "model_hidden",
             } else 503)
             yield _sanitized_auto_agent_error(state.terminal_status)
             return

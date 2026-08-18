@@ -1967,6 +1967,7 @@ async def llm_call_async(
     prompt_type: Optional[str] = None,
     session_id: Optional[str] = None,
     workload: str = "foreground",
+    safe_logs: bool = False,
 ) -> str:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
@@ -2005,6 +2006,7 @@ async def llm_call_async(
             headers=headers,
             timeout=timeout,
             workload=workload,
+            safe_logs=safe_logs,
         ):
             event_is_error = False
             for line in str(chunk).splitlines():
@@ -2092,10 +2094,17 @@ async def llm_call_async(
             duration = time.time() - start
             if not r.is_success:
                 friendly = _format_upstream_error(r.status_code, r.text, target_url)
-                logger.warning(
-                    f"LLM async call to {target_url} failed in {duration:.2f}s "
-                    f"(attempt {attempt}): HTTP {r.status_code} {friendly}"
-                )
+                if safe_logs:
+                    logger.warning(
+                        "LLM async dispatch failed kind=upstream_status status=%s "
+                        "model=%s attempt=%s duration=%.2fs",
+                        r.status_code, model, attempt, duration,
+                    )
+                else:
+                    logger.warning(
+                        f"LLM async call to {target_url} failed in {duration:.2f}s "
+                        f"(attempt {attempt}): HTTP {r.status_code} {friendly}"
+                    )
                 if r.status_code in (429, 502, 503, 504) and attempt < max_retries:
                     await asyncio.sleep(LLMConfig.RETRY_DELAY)
                     continue
@@ -2104,7 +2113,13 @@ async def llm_call_async(
                     friendly,
                     kind="upstream_status",
                 )
-            logger.info(f"LLM async call to {target_url} succeeded in {duration:.2f}s (attempt {attempt})")
+            if safe_logs:
+                logger.info(
+                    "LLM async dispatch succeeded model=%s attempt=%s duration=%.2fs",
+                    model, attempt, duration,
+                )
+            else:
+                logger.info(f"LLM async call to {target_url} succeeded in {duration:.2f}s (attempt {attempt})")
             _clear_host_dead(target_url)
             data = r.json()
             try:
@@ -2127,7 +2142,13 @@ async def llm_call_async(
             _cooled = _mark_host_dead(target_url)
             duration = time.time() - start
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
-            logger.warning(f"LLM async connect to {target_url} timed out after {duration:.2f}s: {e}{_tail}")
+            if safe_logs:
+                logger.warning(
+                    "LLM async dispatch failed kind=timeout model=%s attempt=%s duration=%.2fs",
+                    model, attempt, duration,
+                )
+            else:
+                logger.warning(f"LLM async connect to {target_url} timed out after {duration:.2f}s: {e}{_tail}")
             if _cooled or attempt >= max_retries:
                 raise ChatDispatchError(
                     503,
@@ -2139,7 +2160,13 @@ async def llm_call_async(
             _cooled = _mark_host_dead(target_url)
             duration = time.time() - start
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
-            logger.warning(f"LLM async connect to {target_url} failed after {duration:.2f}s: {e}{_tail}")
+            if safe_logs:
+                logger.warning(
+                    "LLM async dispatch failed kind=network model=%s attempt=%s duration=%.2fs",
+                    model, attempt, duration,
+                )
+            else:
+                logger.warning(f"LLM async connect to {target_url} failed after {duration:.2f}s: {e}{_tail}")
             if _cooled or attempt >= max_retries:
                 raise ChatDispatchError(
                     503,
@@ -2149,7 +2176,25 @@ async def llm_call_async(
             await asyncio.sleep(LLMConfig.RETRY_DELAY)
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             duration = time.time() - start
-            logger.warning(f"LLM async call attempt {attempt} failed after {duration:.2f}s: {e}")
+            if safe_logs:
+                _kind = (
+                    "upstream_status"
+                    if isinstance(e, httpx.HTTPStatusError)
+                    else "timeout" if isinstance(e, httpx.TimeoutException)
+                    else "network"
+                )
+                _status = (
+                    e.response.status_code
+                    if isinstance(e, httpx.HTTPStatusError) and e.response is not None
+                    else 502
+                )
+                logger.warning(
+                    "LLM async dispatch failed kind=%s status=%s model=%s "
+                    "attempt=%s duration=%.2fs",
+                    _kind, _status, model, attempt, duration,
+                )
+            else:
+                logger.warning(f"LLM async call attempt {attempt} failed after {duration:.2f}s: {e}")
             if attempt >= max_retries:
                 if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
                     status = e.response.status_code
@@ -2180,7 +2225,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                      tool_choice_none: bool = False, workload: str = "foreground",
-                     typed_errors: bool = False):
+                     typed_errors: bool = False, safe_logs: bool = False):
+    safe_logs = bool(safe_logs or typed_errors)
     target_url = _stream_target_url(url)
     async with _local_model_slot(target_url, model, workload):
         async for chunk in _stream_llm_inner(
@@ -2196,6 +2242,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             session_id=session_id,
             tool_choice_none=tool_choice_none,
             typed_errors=typed_errors,
+            safe_logs=safe_logs,
         ):
             if typed_errors and chunk.startswith("event: error"):
                 # Provider-specific guards that still emit an SSE error are
@@ -2213,7 +2260,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                             timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                            tool_choice_none: bool = False, typed_errors: bool = False):
+                            tool_choice_none: bool = False, typed_errors: bool = False,
+                            safe_logs: bool = False):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -2390,7 +2438,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
-            logger.warning(f"ChatGPT Subscription stream connect to {target_url} failed: {e}{_tail}")
+            if safe_logs:
+                logger.warning("LLM stream dispatch failed kind=network model=%s", model)
+            else:
+                logger.warning(f"ChatGPT Subscription stream connect to {target_url} failed: {e}{_tail}")
             yield _stream_failure(503, "network", f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n')
         except httpx.ReadTimeout:
             yield _stream_failure(504, "timeout", f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n')
@@ -2399,7 +2450,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         except ChatDispatchError:
             raise
         except Exception as e:
-            logger.error(f"ChatGPT Subscription stream error: {e}")
+            if safe_logs:
+                logger.error("LLM stream dispatch failed kind=internal model=%s", model)
+            else:
+                logger.error(f"ChatGPT Subscription stream error: {e}")
             yield _stream_failure(502, "internal", f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n')
         return
 
@@ -2460,7 +2514,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
-            logger.warning(f"Ollama stream connect to {target_url} failed: {e}{_tail}")
+            if safe_logs:
+                logger.warning("LLM stream dispatch failed kind=network model=%s", model)
+            else:
+                logger.warning(f"Ollama stream connect to {target_url} failed: {e}{_tail}")
             yield _stream_failure(503, "network", f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n')
         except httpx.ReadTimeout:
             yield _stream_failure(504, "timeout", f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n')
@@ -2469,7 +2526,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         except ChatDispatchError:
             raise
         except Exception as e:
-            logger.error(f"Ollama stream error: {e}")
+            if safe_logs:
+                logger.error("LLM stream dispatch failed kind=internal model=%s", model)
+            else:
+                logger.error(f"Ollama stream error: {e}")
             yield _stream_failure(502, "internal", f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n')
         return
 
@@ -2575,7 +2635,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             _cooled = _mark_host_dead(target_url)
             _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
-            logger.warning(f"Anthropic stream connect to {target_url} failed: {e}{_tail}")
+            if safe_logs:
+                logger.warning("LLM stream dispatch failed kind=network model=%s", model)
+            else:
+                logger.warning(f"Anthropic stream connect to {target_url} failed: {e}{_tail}")
             yield _stream_failure(503, "network", f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n')
         except httpx.ReadTimeout:
             yield _stream_failure(504, "timeout", f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n')
@@ -2584,7 +2647,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         except ChatDispatchError:
             raise
         except Exception as e:
-            logger.error(f"Anthropic stream error: {e}")
+            if safe_logs:
+                logger.error("LLM stream dispatch failed kind=internal model=%s", model)
+            else:
+                logger.error(f"Anthropic stream error: {e}")
             yield _stream_failure(502, "internal", f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n')
         return
 
@@ -2852,7 +2918,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                     for event in _format_routed_content(_harmony_router.feed(data)):
                                         yield event
                     except Exception as e:
-                        logger.error(f"Error parsing stream data: {e}")
+                        if safe_logs:
+                            logger.error("LLM stream dispatch failed kind=invalid_response model=%s", model)
+                        else:
+                            logger.error(f"Error parsing stream data: {e}")
                         if typed_errors:
                             raise ChatDispatchError(
                                 502,
@@ -2872,7 +2941,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     except (httpx.ConnectError, httpx.ConnectTimeout) as e:
         _cooled = _mark_host_dead(target_url)
         _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"
-        logger.warning(f"Stream connect to {target_url} failed: {e}{_tail}")
+        if safe_logs:
+            logger.warning("LLM stream dispatch failed kind=network model=%s", model)
+        else:
+            logger.warning(f"Stream connect to {target_url} failed: {e}{_tail}")
         yield _stream_failure(503, "network", f'event: error\ndata: {json.dumps({"error": f"Cannot reach {_host_key(target_url)}", "status": 503})}\n\n')
     except httpx.ReadTimeout:
         yield _stream_failure(504, "timeout", f'event: error\ndata: {json.dumps({"error": "Read timeout", "status": 504})}\n\n')
@@ -2881,7 +2953,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     except ChatDispatchError:
         raise
     except Exception as e:
-        logger.error(f"Stream error: {e}")
+        if safe_logs:
+            logger.error("LLM stream dispatch failed kind=internal model=%s", model)
+        else:
+            logger.error(f"Stream error: {e}")
         yield _stream_failure(502, "internal", f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n')
 
 

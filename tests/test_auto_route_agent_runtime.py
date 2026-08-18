@@ -219,6 +219,29 @@ def test_auto_agent_model_denial_never_authorizes_fallback(monkeypatch):
     assert "event: error" in "".join(chunks)
 
 
+def test_auto_agent_model_hidden_without_fallback_is_sanitized_403(monkeypatch):
+    primary = _route("primary", auto=True)
+    state = agent_loop.AgentRouteState(
+        requested_model="primary-model",
+        selected_primary_route=primary,
+        manual_fallback_route=None,
+        active_route=primary,
+        authorize_route=lambda route: (_ for _ in ()).throw(
+            ChatRouteAuthorizationError("model_hidden")
+        ),
+    )
+
+    async def stream(*args, **kwargs):
+        raise AssertionError("LLM dispatch must not occur")
+        yield
+
+    chunks = _run_auto(monkeypatch, state, stream)
+    error = next(chunk for chunk in chunks if chunk.startswith("event: error"))
+
+    assert '"status": 403' in error
+    assert state.winner_model is None
+
+
 def test_auto_agent_tool_commits_before_start_and_execution(monkeypatch):
     observations = []
 
