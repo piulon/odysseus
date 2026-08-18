@@ -30,7 +30,7 @@ from src.chat_route_authorizer import (
     ChatRouteAuthorizationError,
     authorize_chat_route,
 )
-from src.agent_loop import stream_agent_loop
+from src.agent_loop import AgentRouteState, stream_agent_loop
 from src import agent_runs
 from src.model_context import estimate_tokens
 from src.chat_helpers import coerce_message_and_session
@@ -237,6 +237,31 @@ def _select_auto_stream_context_candidate(sess, *, owner, auth):
     )
 
 
+def _select_auto_agent_context_candidate(sess, *, owner, auth):
+    """Select and hydrate the one candidate used for one-shot agent context."""
+    selected_primary = resolve_chat_route(sess, owner=owner, agent_mode=True)
+    requested_model = selected_primary.target.model
+    manual_fallback = _manual_fallback_route(selected_primary, sess)
+    context_route = selected_primary
+    try:
+        context_candidate = authorize_chat_route(context_route, sess, auth=auth)
+    except ChatRouteAuthorizationError as exc:
+        if (
+            exc.code not in _AUTHORIZATION_CANDIDATE_UNAVAILABLE
+            or manual_fallback is None
+        ):
+            raise
+        context_route = manual_fallback
+        context_candidate = authorize_chat_route(context_route, sess, auth=auth)
+    return (
+        selected_primary,
+        requested_model,
+        manual_fallback,
+        context_route,
+        context_candidate,
+    )
+
+
 def _is_plain_auto_stream_chat(
     sess,
     *,
@@ -249,6 +274,25 @@ def _is_plain_auto_stream_chat(
     return bool(
         getattr(sess, "auto_route", False)
         and chat_mode == "chat"
+        and not att_ids
+        and not image_bypass
+        and not do_research
+        and not compare_mode
+    )
+
+
+def _is_plain_auto_agent(
+    sess,
+    *,
+    chat_mode: str,
+    att_ids,
+    image_bypass: bool,
+    do_research: bool,
+    compare_mode: bool,
+) -> bool:
+    return bool(
+        getattr(sess, "auto_route", False)
+        and chat_mode == "agent"
         and not att_ids
         and not image_bypass
         and not do_research
@@ -1087,8 +1131,16 @@ def setup_chat_routes(
             do_research=do_research,
             compare_mode=compare_mode,
         )
+        auto_agent = _is_plain_auto_agent(
+            sess,
+            chat_mode=chat_mode,
+            att_ids=att_ids,
+            image_bypass=image_bypass,
+            do_research=do_research,
+            compare_mode=compare_mode,
+        )
 
-        if not auto_stream_chat:
+        if not auto_stream_chat and not auto_agent:
             if _clear_orphaned_session_endpoint(sess, owner=owner):
                 raise HTTPException(400, "Selected model endpoint was removed. Pick another model in Settings.")
             # Issue #587: picker shows a model from the endpoint cache but
@@ -1118,7 +1170,7 @@ def setup_chat_routes(
         context_route = None
         context_candidate = None
         requested_model = None
-        if auto_stream_chat:
+        if auto_stream_chat or auto_agent:
             try:
                 _enforce_chat_quota(request)
             except HTTPException:
@@ -1132,18 +1184,46 @@ def setup_chat_routes(
                 raise _authorization_http_error(
                     ChatRouteAuthorizationError("privileges_unavailable")
                 )
-            try:
-                (
-                    selected_primary,
-                    requested_model,
-                    manual_fallback,
-                    context_route,
-                    context_candidate,
-                ) = _select_auto_stream_context_candidate(
+            if (
+                auto_agent
+                and stream_auth.privileges
+                and not stream_auth.privileges.get("can_use_agent", True)
+            ):
+                chat_mode = "chat"
+                auto_agent = False
+                auto_stream_chat = _is_plain_auto_stream_chat(
                     sess,
-                    owner=owner,
-                    auth=stream_auth,
+                    chat_mode=chat_mode,
+                    att_ids=att_ids,
+                    image_bypass=image_bypass,
+                    do_research=do_research,
+                    compare_mode=compare_mode,
                 )
+            try:
+                if auto_agent:
+                    (
+                        selected_primary,
+                        requested_model,
+                        manual_fallback,
+                        context_route,
+                        context_candidate,
+                    ) = _select_auto_agent_context_candidate(
+                        sess,
+                        owner=owner,
+                        auth=stream_auth,
+                    )
+                else:
+                    (
+                        selected_primary,
+                        requested_model,
+                        manual_fallback,
+                        context_route,
+                        context_candidate,
+                    ) = _select_auto_stream_context_candidate(
+                        sess,
+                        owner=owner,
+                        auth=stream_auth,
+                    )
             except ChatRouteAuthorizationError as exc:
                 raise _authorization_http_error(exc) from None
         else:
@@ -1159,7 +1239,7 @@ def setup_chat_routes(
 
         # Build shared context (stream path uses enhanced_message for context preface)
         context_overrides = {}
-        if auto_stream_chat:
+        if auto_stream_chat or auto_agent:
             context_overrides = {
                 "runtime_model": context_candidate.model,
                 "runtime_endpoint_url": context_candidate.endpoint_url,
@@ -1590,7 +1670,7 @@ def setup_chat_routes(
             # Configured fallback chain for the default chat model. Tried in
             # order if the session's primary model fails before producing
             # output. Resolved once per request.
-            if auto_stream_chat:
+            if auto_stream_chat or auto_agent:
                 _fallback_candidates = []
             else:
                 try:
@@ -1603,7 +1683,7 @@ def setup_chat_routes(
             _model_suffix = "Research" if effective_do_research else None
             _model_info = {
                 "type": "model_info",
-                "model": requested_model if auto_stream_chat else sess.model,
+                "model": requested_model if (auto_stream_chat or auto_agent) else sess.model,
             }
             if _model_suffix:
                 _model_info["suffix"] = _model_suffix
@@ -1838,8 +1918,9 @@ def setup_chat_routes(
                 _agent_rounds = 0
                 _agent_tool_calls = 0
                 _answered_by = None  # set if the selected model failed and a fallback answered
-                _requested_model = sess.model
+                _requested_model = requested_model if auto_agent else sess.model
                 _actual_model = None
+                _agent_route_state = None
                 try:
                     from src.settings import get_setting
                     from src.agent_tools import MAX_AGENT_ROUNDS as _DEFAULT_ROUNDS
@@ -1863,11 +1944,27 @@ def setup_chat_routes(
                     if _search_enabled:
                         _forced_tools = set(WEB_TOOL_NAMES)
 
+                    if auto_agent:
+                        def _authorize_agent_route(route):
+                            return authorize_chat_route(route, sess, auth=stream_auth)
+
+                        _agent_route_state = AgentRouteState(
+                            requested_model=_requested_model,
+                            selected_primary_route=selected_primary,
+                            manual_fallback_route=manual_fallback,
+                            active_route=context_route,
+                            authorize_route=_authorize_agent_route,
+                        )
+
+                    _agent_endpoint = context_candidate.endpoint_url if auto_agent else sess.endpoint_url
+                    _agent_model = context_candidate.model if auto_agent else sess.model
+                    _agent_headers = dict(context_candidate.headers) if auto_agent else sess.headers
+
                     async for chunk in stream_agent_loop(
-                        sess.endpoint_url,
-                        sess.model,
+                        _agent_endpoint,
+                        _agent_model,
                         messages,
-                        headers=sess.headers,
+                        headers=_agent_headers,
                         temperature=ctx.preset.temperature,
                         max_tokens=ctx.preset.max_tokens,
                         prompt_type=preset_id,
@@ -1886,6 +1983,7 @@ def setup_chat_routes(
                         workspace=workspace or None,
                         forced_tools=_forced_tools,
                         uploaded_files=ctx.uploaded_files,
+                        route_state=_agent_route_state,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
@@ -1935,7 +2033,13 @@ def setup_chat_routes(
                                     last_metrics = data.get("data", {})
                                     _reported_model = last_metrics.get("model")
                                     last_metrics["requested_model"] = last_metrics.get("requested_model") or _requested_model
-                                    last_metrics["model"] = _reported_model or _actual_model or _answered_by or _requested_model
+                                    last_metrics["model"] = (
+                                        (_agent_route_state.winner_model if _agent_route_state else None)
+                                        or _reported_model
+                                        or _actual_model
+                                        or _answered_by
+                                        or _requested_model
+                                    )
                                     if ctx.context_trimmed:
                                         last_metrics["context_trimmed"] = True
                                         last_metrics["context_messages_before_trim"] = ctx.context_messages_before_trim
@@ -1952,6 +2056,11 @@ def setup_chat_routes(
                             if full_response or _has_tool_events:
                                 _response_to_save = full_response or "Done."
                                 _metrics_to_save = dict(last_metrics or {})
+                                if _agent_route_state:
+                                    _metrics_to_save["requested_model"] = _requested_model
+                                    _metrics_to_save["model"] = _agent_route_state.winner_model
+                                    if not _metrics_to_save.get("tool_events"):
+                                        _metrics_to_save["tool_events"] = _agent_route_state.safe_tool_events()
                                 if thinking_response.strip() and not _metrics_to_save.get("thinking"):
                                     _metrics_to_save["thinking"] = thinking_response.strip()
                                 _saved_id = save_assistant_response(
@@ -1975,6 +2084,11 @@ def setup_chat_routes(
                                     owner=_user,
                                     extract_skills=user_requested_agent,
                                     allow_background_extraction=not tool_policy.block_all_tool_calls,
+                                    response_model=(
+                                        _metrics_to_save.get("model")
+                                        if _agent_route_state
+                                        else None
+                                    ),
                                 )
                             _stream_set(session, status="done")
                             yield chunk
@@ -1986,14 +2100,27 @@ def setup_chat_routes(
                     # outer finally from running and left _active_streams
                     # with a stale entry).
                     try:
-                        if full_response:
+                        _committed_tool_events = (
+                            _agent_route_state.safe_tool_events()
+                            if _agent_route_state and _agent_route_state.committed
+                            else []
+                        )
+                        if (
+                            full_response or _committed_tool_events
+                        ) and (not _agent_route_state or not incognito):
                             logger.info("Client disconnected mid-stream for session %s, saving partial response (%d chars)", session, len(full_response))
                             _stopped_content2, _stopped_md2 = clean_thinking_for_save(
-                                full_response,
+                                full_response or "Agent stopped after starting a tool.",
                                 {
                                     "stopped": True,
-                                    "model": _actual_model or _answered_by or _requested_model,
+                                    "model": (
+                                        (_agent_route_state.winner_model if _agent_route_state else None)
+                                        or _actual_model
+                                        or _answered_by
+                                        or _requested_model
+                                    ),
                                     "requested_model": _requested_model,
+                                    **({"tool_events": _committed_tool_events} if _committed_tool_events else {}),
                                 },
                             )
                             sess.add_message(ChatMessage("assistant", _stopped_content2, metadata=_stopped_md2))
@@ -2002,6 +2129,31 @@ def setup_chat_routes(
                     except Exception:
                         logger.exception("Failed to save partial response on disconnect (session %s)", session)
                     raise
+                except Exception:
+                    if not (_agent_route_state and _agent_route_state.committed):
+                        raise
+                    logger.warning(
+                        "Auto agent failed after global commit (session %s)",
+                        session,
+                    )
+                    _error_tool_events = _agent_route_state.safe_tool_events()
+                    if not incognito and (full_response or _error_tool_events):
+                        _error_content, _error_md = clean_thinking_for_save(
+                            full_response or "Agent stopped after starting a tool.",
+                            {
+                                "error": True,
+                                "model": _agent_route_state.winner_model,
+                                "requested_model": _requested_model,
+                                **({"tool_events": _error_tool_events} if _error_tool_events else {}),
+                            },
+                        )
+                        sess.add_message(ChatMessage("assistant", _error_content, metadata=_error_md))
+                        session_manager.save_sessions()
+                    yield "event: error\ndata: " + json.dumps({
+                        "error": "The agent run failed after it started.",
+                        "status": 500,
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
                 finally:
                     _active_streams.pop(session, None)
 
