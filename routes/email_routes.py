@@ -4269,7 +4269,7 @@ def setup_email_routes():
                 resolve_utility_fallback_candidates,
                 resolve_chat_fallback_candidates,
             )
-            from src.llm_core import llm_call_async_with_fallback
+            from src.llm_core import llm_call_async_with_fallback_result
 
             body = (data.get("body") or "").strip()
             subject = (data.get("subject") or "").strip()
@@ -4334,7 +4334,7 @@ def setup_email_routes():
             if not candidates:
                 return {"success": False, "error": "No LLM endpoint configured"}
 
-            content = await llm_call_async_with_fallback(
+            llm_result = await llm_call_async_with_fallback_result(
                 candidates,
                 messages=[
                     {
@@ -4362,7 +4362,8 @@ def setup_email_routes():
                 max_tokens=8192,
                 timeout=180,
             )
-            model = candidates[0][1] if candidates else ""
+            content = llm_result.response
+            model = llm_result.model
             content = (content or "").strip()
             content = _extract_reply(content)
             if "<<<SAME_LANGUAGE>>>" in content:
@@ -4587,7 +4588,7 @@ def setup_email_routes():
             # user's Utility / Default endpoints AND their configured
             # fallback chains. Dedupe by url+model so we don't retry
             # the same broken endpoint.
-            from src.llm_core import llm_call_async_with_fallback
+            from src.llm_core import llm_call_async_with_fallback_result
             from src.endpoint_resolver import (
                 resolve_utility_fallback_candidates,
                 resolve_chat_fallback_candidates,
@@ -4625,13 +4626,15 @@ def setup_email_routes():
                 {"role": "user", "content": user_msg},
             ]
             try:
-                reply_raw = await llm_call_async_with_fallback(
+                llm_result = await llm_call_async_with_fallback_result(
                     _candidates,
                     messages=_messages,
                     temperature=0.7,
                     max_tokens=1024 if fast_reply else 6144,
                     timeout=60 if fast_reply else 180,
                 )
+                reply_raw = llm_result.response
+                model = llm_result.model
             except Exception as e:
                 detail = getattr(e, "detail", None) or str(e)
                 _attempted = ", ".join(f"{m}@{u.split('/')[2] if '/' in u else u}" for u, m, _ in _candidates) or "no candidates"

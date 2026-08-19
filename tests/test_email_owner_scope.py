@@ -119,6 +119,126 @@ def test_email_ai_cache_tables_are_owner_scoped_and_migrate_legacy_rows(tmp_path
         conn.close()
 
 
+@pytest.mark.asyncio
+async def test_manual_email_translation_persists_actual_fallback_model(tmp_path, monkeypatch):
+    from routes import email_helpers, email_routes
+    from src import endpoint_resolver, llm_core
+
+    db_path = tmp_path / "scheduled_emails.db"
+    monkeypatch.setattr(email_helpers, "SCHEDULED_DB", db_path)
+    monkeypatch.setattr(email_routes, "SCHEDULED_DB", db_path)
+    email_helpers._init_scheduled_db()
+
+    def fake_resolve_endpoint(kind, owner=None):
+        assert owner == "alice"
+        if kind == "utility":
+            return "http://primary/v1/chat/completions", "primary-model", {}
+        if kind == "default":
+            return "http://fallback/v1/chat/completions", "fallback-model", {}
+        raise AssertionError(f"unexpected endpoint kind: {kind}")
+
+    async def fake_llm_call(url, model, messages, **kwargs):
+        if model == "primary-model":
+            raise RuntimeError("primary unavailable")
+        assert model == "fallback-model"
+        return "<<<TRANSLATION>>>\nHola des del fallback\n<<<END>>>"
+
+    monkeypatch.setattr(endpoint_resolver, "resolve_endpoint", fake_resolve_endpoint)
+    monkeypatch.setattr(endpoint_resolver, "resolve_utility_fallback_candidates", lambda owner=None: [])
+    monkeypatch.setattr(endpoint_resolver, "resolve_chat_fallback_candidates", lambda owner=None: [])
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+
+    translate = _route_endpoint(email_routes.setup_email_routes(), "/api/email/translate", "POST")
+    result = await translate(
+        {
+            "body": "Hello from the primary email body.",
+            "subject": "Hello",
+            "from": "sender@example.com",
+            "target_language": "Catalan",
+            "uid": "11",
+            "folder": "INBOX",
+        },
+        owner="alice",
+    )
+
+    assert result == {
+        "success": True,
+        "translation": "Hola des del fallback",
+        "language": "Catalan",
+        "model_used": "fallback-model",
+    }
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT translation, model_used FROM email_translations WHERE owner = ?",
+            ("alice",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("Hola des del fallback", "fallback-model")
+
+
+@pytest.mark.asyncio
+async def test_manual_ai_reply_persists_actual_fallback_model(tmp_path, monkeypatch):
+    from routes import email_helpers, email_routes
+    from src import endpoint_resolver, llm_core
+
+    db_path = tmp_path / "scheduled_emails.db"
+    monkeypatch.setattr(email_helpers, "SCHEDULED_DB", db_path)
+    monkeypatch.setattr(email_routes, "SCHEDULED_DB", db_path)
+    email_helpers._init_scheduled_db()
+
+    def fake_resolve_endpoint(kind, owner=None):
+        assert owner == "alice"
+        if kind == "utility":
+            return "http://primary/v1/chat/completions", "primary-model", {}
+        if kind == "default":
+            return "http://fallback/v1/chat/completions", "fallback-model", {}
+        raise AssertionError(f"unexpected endpoint kind: {kind}")
+
+    async def fake_llm_call(url, model, messages, **kwargs):
+        if model == "primary-model":
+            raise RuntimeError("primary unavailable")
+        assert model == "fallback-model"
+        return "<<<REPLY>>>\nFallback reply body\n<<<END>>>"
+
+    monkeypatch.setattr(endpoint_resolver, "resolve_endpoint", fake_resolve_endpoint)
+    monkeypatch.setattr(endpoint_resolver, "resolve_utility_fallback_candidates", lambda owner=None: [])
+    monkeypatch.setattr(endpoint_resolver, "resolve_chat_fallback_candidates", lambda owner=None: [])
+    monkeypatch.setattr(llm_core, "list_model_ids", lambda url, headers=None: [])
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+    monkeypatch.setattr(email_routes, "_load_settings", lambda: {})
+
+    ai_reply = _route_endpoint(email_routes.setup_email_routes(), "/api/email/ai-reply", "POST")
+    result = await ai_reply(
+        {
+            "to": "sender@example.com",
+            "subject": "Re: Hello",
+            "original_body": "Please reply to this email.",
+            "message_id": "<fallback-reply@example.com>",
+            "uid": "12",
+            "folder": "INBOX",
+            "fast": True,
+        },
+        owner="alice",
+    )
+
+    assert result == {
+        "success": True,
+        "reply": "Fallback reply body",
+        "model_used": "fallback-model",
+    }
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT reply, model_used FROM email_ai_replies WHERE message_id = ? AND owner = ?",
+            ("<fallback-reply@example.com>", "alice"),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("Fallback reply body", "fallback-model")
+
+
 def test_sender_signature_cache_is_owner_scoped_and_migrates_legacy_rows(tmp_path, monkeypatch):
     import routes.email_helpers as email_helpers
 
