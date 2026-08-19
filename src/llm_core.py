@@ -8,6 +8,7 @@ import hashlib
 import threading
 import re
 import os
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from fastapi import HTTPException
 from typing import Optional, Dict, List, Tuple
@@ -1938,21 +1939,47 @@ def llm_call_with_fallback(candidates, messages, **kwargs) -> str:
     raise last_err if last_err else HTTPException(503, "All fallback candidates failed")
 
 
-async def llm_call_async_with_fallback(candidates, messages, **kwargs) -> str:
-    """Async variant of `llm_call_with_fallback` — same semantics."""
+@dataclass(frozen=True)
+class LLMFallbackResult:
+    """Response and non-sensitive identity of the candidate that answered."""
+
+    response: str
+    model: str
+    endpoint_url: str
+    candidate_index: int
+
+
+async def llm_call_async_with_fallback_result(
+    candidates, messages, **kwargs
+) -> LLMFallbackResult:
+    """Run an async fallback chain and identify the candidate that answered."""
     cands = _dedupe_candidates(candidates)
     if not cands:
         raise HTTPException(503, "No model endpoint configured")
     last_err = None
     for i, (url, model, headers) in enumerate(cands):
         try:
-            return await llm_call_async(url, model, messages, headers=headers, **kwargs)
+            response = await llm_call_async(
+                url, model, messages, headers=headers, **kwargs
+            )
+            return LLMFallbackResult(
+                response=response,
+                model=model,
+                endpoint_url=url,
+                candidate_index=i,
+            )
         except Exception as e:
             last_err = e
             tag = "primary" if i == 0 else "candidate"
             logger.warning(f"[fallback] {tag} {model} failed ({type(e).__name__}); trying next")
             continue
     raise last_err if last_err else HTTPException(503, "All fallback candidates failed")
+
+
+async def llm_call_async_with_fallback(candidates, messages, **kwargs) -> str:
+    """Async fallback call preserving the legacy string return contract."""
+    result = await llm_call_async_with_fallback_result(candidates, messages, **kwargs)
+    return result.response
 
 
 async def llm_call_async(
