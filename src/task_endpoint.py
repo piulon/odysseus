@@ -5,7 +5,7 @@ from src.endpoint_resolver import (
     resolve_endpoint,
     resolve_utility_fallback_candidates,
 )
-from src.llm_core import llm_call_async_with_fallback
+from src.llm_core import LLMFallbackResult, llm_call_async_with_fallback_result
 from src.interactive_gate import wait_for_interactive_quiet
 
 
@@ -55,7 +55,7 @@ def resolve_task_candidates(
     return candidates
 
 
-async def task_llm_call_async(
+async def task_llm_call_async_result(
     messages,
     *,
     fallback_url=None,
@@ -63,8 +63,8 @@ async def task_llm_call_async(
     fallback_headers=None,
     owner=None,
     **kwargs,
-):
-    """Call the shared background-task LLM candidate chain."""
+) -> LLMFallbackResult:
+    """Call the shared background-task LLM chain and identify its responder."""
     candidates = resolve_task_candidates(
         fallback_url=fallback_url,
         fallback_model=fallback_model,
@@ -75,4 +75,27 @@ async def task_llm_call_async(
         raise RuntimeError("No LLM endpoint available for background task")
     await wait_for_interactive_quiet("background task LLM")
     kwargs.setdefault("workload", "background")
-    return await llm_call_async_with_fallback(candidates, messages=messages, **kwargs)
+    return await llm_call_async_with_fallback_result(
+        candidates, messages=messages, **kwargs
+    )
+
+
+async def task_llm_call_async(
+    messages,
+    *,
+    fallback_url=None,
+    fallback_model=None,
+    fallback_headers=None,
+    owner=None,
+    **kwargs,
+):
+    """Call the shared background-task LLM chain and return response text."""
+    result = await task_llm_call_async_result(
+        messages,
+        fallback_url=fallback_url,
+        fallback_model=fallback_model,
+        fallback_headers=fallback_headers,
+        owner=owner,
+        **kwargs,
+    )
+    return result.response
