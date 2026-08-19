@@ -3058,6 +3058,58 @@ body.bg-pattern-sparkles {
       color: var(--fg);
       gap: 6px;
     }
+    .model-picker-list .model-switch-auto {
+      width: 100%;
+      border: 0;
+      background: transparent;
+      font-family: inherit;
+      text-align: left;
+    }
+    .model-picker-list .model-switch-auto[aria-pressed="true"] {
+      background: color-mix(in srgb, var(--red) 12%, transparent);
+    }
+    .model-picker-list .model-switch-auto:focus-visible {
+      outline: 1px solid var(--red);
+      outline-offset: -1px;
+    }
+    .model-picker-auto-warning {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 5px;
+      padding: 6px 8px;
+      border-radius: 4px;
+      background: color-mix(in srgb, var(--red) 10%, transparent);
+      color: var(--fg);
+      font-size: 11px;
+    }
+    .model-picker-auto-warning.hidden { display: none; }
+    .model-picker-auto-warning button {
+      border: 0;
+      background: transparent;
+      color: var(--red);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 600;
+      padding: 2px;
+    }
+    .model-picker-auto-warning button:focus-visible {
+      outline: 1px solid var(--red);
+      outline-offset: 2px;
+    }
+    .auto-routing-status {
+      font-size: 11px;
+      color: color-mix(in srgb, var(--fg) 55%, transparent);
+    }
+    .auto-routing-status[data-status="invalid"],
+    .auto-routing-status[data-status="error"] {
+      color: var(--red);
+    }
+    #auto-routing-settings:focus-visible {
+      outline: 1px solid var(--red);
+      outline-offset: 2px;
+    }
     .model-picker-list .model-switch-item:hover {
       background: color-mix(in srgb, var(--red) 8%, transparent);
     }

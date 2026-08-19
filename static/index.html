@@ -1030,6 +1030,10 @@
               </button>
             </div>
             <div class="model-picker-list" id="model-picker-list"></div>
+            <div class="model-picker-auto-warning hidden" id="model-picker-auto-warning" role="status">
+              <span data-auto-warning-text>Auto routing is not configured</span>
+              <button type="button" data-open-auto-settings>Configure</button>
+            </div>
           </div>
         </div>
       </div>
@@ -1423,6 +1427,34 @@
         <!-- ═══ AI TAB ═══ -->
 
         <div data-settings-panel="ai" class="hidden">
+          <div class="admin-card" id="auto-routing-settings" tabindex="-1">
+            <h2>Auto Routing</h2>
+            <div class="admin-toggle-sub" style="margin-bottom:10px">Choose independent automatic targets for normal chat and Agent mode. These preferences apply only to your account.</div>
+            <div class="settings-col">
+              <div class="settings-row" style="align-items:flex-start">
+                <label class="settings-label" for="set-autoChatEndpoint">Auto Chat Target</label>
+                <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0">
+                  <select id="set-autoChatEndpoint" class="settings-select" aria-label="Auto Chat endpoint"><option value="">Choose endpoint</option></select>
+                  <select id="set-autoChatModel" class="settings-select" aria-label="Auto Chat model"><option value="">Choose model</option></select>
+                  <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+                    <span id="set-autoChatStatus" class="auto-routing-status" role="status">Not configured</span>
+                    <button type="button" id="set-autoChatClear" class="settings-fallback-remove">Clear</button>
+                  </div>
+                </div>
+              </div>
+              <div class="settings-row" style="align-items:flex-start">
+                <label class="settings-label" for="set-autoAgentEndpoint">Auto Agent Target</label>
+                <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0">
+                  <select id="set-autoAgentEndpoint" class="settings-select" aria-label="Auto Agent endpoint"><option value="">Choose endpoint</option></select>
+                  <select id="set-autoAgentModel" class="settings-select" aria-label="Auto Agent model"><option value="">Choose model</option></select>
+                  <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+                    <span id="set-autoAgentStatus" class="auto-routing-status" role="status">Not configured</span>
+                    <button type="button" id="set-autoAgentClear" class="settings-fallback-remove">Clear</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
           <div class="admin-card">
             <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>Default Chat Model</h2>
             <div class="admin-toggle-sub" style="margin-bottom:8px">The model used when creating a new chat session.</div>
