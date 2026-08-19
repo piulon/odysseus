@@ -136,6 +136,8 @@ async def test_learn_sender_signatures_resolves_llm_for_task_owner(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_learn_sender_signatures_writes_owner_scoped_cache(monkeypatch, tmp_path):
+    import asyncio
+
     from routes import email_helpers
     from src import llm_core, task_endpoint
     from src.builtin_actions import action_learn_sender_signatures
@@ -201,19 +203,39 @@ async def test_learn_sender_signatures_writes_owner_scoped_cache(monkeypatch, tm
     monkeypatch.setattr(
         task_endpoint,
         "resolve_task_candidates",
-        lambda *args, **kwargs: [("http://llm", "alice-model", {})],
+        lambda *args, **kwargs: [
+            ("https://primary.example/v1", "primary-model", {"Authorization": "primary-secret"}),
+            ("https://fallback.example/v1", "fallback-model", {"Authorization": "fallback-secret"}),
+        ],
     )
 
-    async def fake_llm_call_async(_candidates, **_kwargs):
+    attempted = []
+
+    async def fake_llm_call_async(_url, model, _messages, **_kwargs):
+        attempted.append(model)
+        if model == "primary-model":
+            raise RuntimeError("primary unavailable")
         return "Writer Example\nExample Co.\nwriter@example.com"
 
-    monkeypatch.setattr(llm_core, "llm_call_async_with_fallback", fake_llm_call_async)
+    gate_calls = []
+
+    async def fake_gate(label):
+        gate_calls.append(label)
+
+    async def fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call_async)
+    monkeypatch.setattr("src.builtin_actions.wait_for_interactive_quiet", fake_gate)
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
 
     message, ok = await action_learn_sender_signatures("alice")
 
     assert ok is True
     assert message.startswith("Learned sigs: 1 found")
     assert imap_owners == ["alice", "alice"]
+    assert attempted == ["primary-model", "fallback-model"]
+    assert gate_calls == ["sender signature action"]
 
     conn = sqlite3.connect(db_path)
     try:
@@ -230,9 +252,12 @@ async def test_learn_sender_signatures_writes_owner_scoped_cache(monkeypatch, tm
         conn.close()
 
     assert rows == [
-        ("alice", "Writer Example\nExample Co.\nwriter@example.com", "alice-model"),
+        ("alice", "Writer Example\nExample Co.\nwriter@example.com", "fallback-model"),
         ("bob", "bob cached signature", "old-model"),
     ]
+    assert "primary-secret" not in repr(rows)
+    assert "fallback-secret" not in repr(rows)
+    assert "https://" not in repr(rows)
 
 
 @pytest.mark.asyncio
