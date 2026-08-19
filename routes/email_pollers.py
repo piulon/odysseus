@@ -29,7 +29,11 @@ from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-from src.task_endpoint import resolve_task_candidates, task_llm_call_async
+from src.task_endpoint import (
+    resolve_task_candidates,
+    task_llm_call_async,
+    task_llm_call_async_result,
+)
 
 from routes.email_helpers import (
     _strip_think, _extract_reply, _apply_email_style_mechanics, _load_settings, _save_settings, _get_email_config,
@@ -468,7 +472,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
 
                 if need_sum:
                     try:
-                        summary = await task_llm_call_async(
+                        summary_result = await task_llm_call_async_result(
                             messages=[
                                 {"role": "system", "content": "You are an email summarizer. Format: 1-3 short bullet points (use '- '). Cover: main point, action items, deadlines. If the email has attachments (marked '--- ATTACHMENTS ---'), USE THEIR CONTENTS — pull out invoice totals, deadlines, key clauses, any concrete numbers/dates in PDFs/docs, and reflect them in the bullets. Be terse.\n\nOUTPUT FORMAT: Put ONLY the bullet points between these exact markers, each on its own line:\n<<<SUMMARY>>>\n- ...\n<<<END>>>\nAny reasoning or planning must come BEFORE <<<SUMMARY>>> (ideally inside <think>...</think>). Only the text between the markers is kept."},
                                 {"role": "user", "content": f"From: {sender}\nSubject: {subject}\n\n{body_for_llm[:12000]}\n\n---\n\nSummarize the email. Output the bullets between <<<SUMMARY>>> and <<<END>>>."},
@@ -477,14 +481,14 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             owner=account_owner or None,
                             temperature=0.3, max_tokens=16384, timeout=240,
                         )
-                        summary = _extract_reply((summary or "").strip())
+                        summary = _extract_reply((summary_result.response or "").strip())
                         if summary:
                             _c = _sql3.connect(SCHEDULED_DB)
                             _c.execute("""
                                 INSERT OR REPLACE INTO email_summaries
                                 (message_id, owner, uid, folder, subject, sender, summary, model_used, created_at)
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (message_id, account_owner or "", uid.decode() if isinstance(uid, bytes) else str(uid), _folder, subject, sender, summary, model, datetime.utcnow().isoformat()))
+                            """, (message_id, account_owner or "", uid.decode() if isinstance(uid, bytes) else str(uid), _folder, subject, sender, summary, summary_result.model, datetime.utcnow().isoformat()))
                             _c.commit()
                             _c.close()
                             _sum_existing.add(message_id)
@@ -511,7 +515,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                     if context_snippets:
                         sys_prompt += "\n\nRELEVANT CONTEXT FROM PAST EMAILS AND CONTACTS:\n" + "\n\n---\n\n".join(context_snippets[:5])
                     try:
-                        reply = await task_llm_call_async(
+                        reply_result = await task_llm_call_async_result(
                             messages=[
                                 {"role": "system", "content": sys_prompt},
                                 {"role": "user", "content": f"Original email:\nFrom: {sender}\nSubject: {subject}\n\n{body_for_llm[:12000]}\n\nDraft a reply. Return only the reply body text."},
@@ -520,14 +524,14 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             owner=account_owner or None,
                             temperature=0.7, max_tokens=1024, timeout=90,
                         )
-                        reply = _apply_email_style_mechanics(_extract_reply(reply or ""))
+                        reply = _apply_email_style_mechanics(_extract_reply(reply_result.response or ""))
                         if reply:
                             _c = _sql3.connect(SCHEDULED_DB)
                             _c.execute("""
                                 INSERT OR REPLACE INTO email_ai_replies
                                 (message_id, owner, uid, folder, reply, model_used, created_at)
                                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                            """, (message_id, account_owner or "", uid.decode() if isinstance(uid, bytes) else str(uid), _folder, reply, model, datetime.utcnow().isoformat()))
+                            """, (message_id, account_owner or "", uid.decode() if isinstance(uid, bytes) else str(uid), _folder, reply, reply_result.model, datetime.utcnow().isoformat()))
                             _c.commit()
                             _c.close()
                             _reply_existing.add(message_id)
@@ -929,7 +933,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             "If it's a mass-mailed generic update with no personal CTA, mark spam=true even if from a legitimate service. "
                             "Reason should be 5-10 words."
                         )
-                        raw_out = await task_llm_call_async(
+                        tagging_result = await task_llm_call_async_result(
                             messages=[
                                 {"role": "system", "content": class_sys},
                                 {"role": "user", "content": f"From: {sender}\nSubject: {subject}\n\n{body[:4000]}"},
@@ -938,7 +942,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             owner=account_owner or None,
                             temperature=0.1, max_tokens=512, timeout=120,
                         )
-                        raw_out = _strip_think((raw_out or "").strip())
+                        raw_out = _strip_think((tagging_result.response or "").strip())
                         raw_out = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_out, flags=re.MULTILINE).strip()
                         jm = re.search(r'\{.*\}', raw_out, re.DOTALL)
                         parsed = None
@@ -974,7 +978,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (message_id, account_owner or "", account_id or "", uid.decode() if isinstance(uid, bytes) else str(uid), _folder, subject, sender,
                                   json.dumps(tags), 1 if is_spam else 0,
-                                  spam_reason, moved_to, model, datetime.utcnow().isoformat()))
+                                  spam_reason, moved_to, tagging_result.model, datetime.utcnow().isoformat()))
                             _c.commit()
                             _c.close()
                             _tag_existing.add(message_id)
