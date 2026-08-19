@@ -12,14 +12,18 @@ import json
 import re
 import time
 import logging
-from typing import AsyncGenerator, List, Dict, Optional, Set
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator, Callable, List, Dict, Optional, Set
 from urllib.parse import urlparse
 
 from src.llm_core import (
+    ChatDispatchError,
+    is_recoverable_chat_dispatch_error,
     stream_llm,
     stream_llm_with_fallback,
     _is_ollama_native_url,
 )
+from src.chat_route_authorizer import ChatRouteAuthorizationError
 from src.model_context import estimate_tokens
 from src.settings import get_setting
 from src.prompt_security import untrusted_context_message
@@ -41,6 +45,280 @@ from src.agent_tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_AUTO_AGENT_CANDIDATE_UNAVAILABLE = {
+    "endpoint_not_found",
+    "endpoint_unavailable",
+    "credentials_unavailable",
+    "model_hidden",
+}
+
+
+@dataclass
+class AgentRouteState:
+    """Request-local routing and global commit state for one Auto agent run."""
+
+    requested_model: str
+    selected_primary_route: Any = field(repr=False)
+    manual_fallback_route: Any = field(default=None, repr=False)
+    active_route: Any = field(default=None, repr=False)
+    authorize_route: Callable[[Any], Any] = field(default=None, repr=False)
+    winner_model: Optional[str] = None
+    committed: bool = False
+    commit_reason: Optional[str] = None
+    fallback_available: bool = False
+    tool_execution_started: bool = False
+    tool_execution_uncertain: bool = False
+    terminal_error: bool = False
+    terminal_status: int = 502
+    current_candidate_model: Optional[str] = None
+    current_actual_model: Optional[str] = None
+    fallback_notice_emitted: bool = False
+    tool_events: list = field(default_factory=list, repr=False)
+    last_tool_name: Optional[str] = None
+    last_tool_round: Optional[int] = None
+    _pinned_route_identity: Optional[tuple] = field(default=None, repr=False)
+    _current_route_identity: Optional[tuple] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        if self.active_route is None:
+            self.active_route = self.selected_primary_route
+        self.fallback_available = bool(
+            self.active_route is self.selected_primary_route
+            and self.manual_fallback_route is not None
+        )
+
+    @staticmethod
+    def candidate_identity(candidate) -> tuple:
+        endpoint_identity = getattr(candidate, "endpoint_id", None)
+        if not endpoint_identity:
+            endpoint_identity = str(getattr(candidate, "endpoint_url", "") or "").rstrip("/")
+        return endpoint_identity, str(getattr(candidate, "model", "") or "")
+
+    def set_round_candidate(self, candidate) -> bool:
+        identity = self.candidate_identity(candidate)
+        if self.committed and identity != self._pinned_route_identity:
+            self.fail(503)
+            return False
+        self.current_candidate_model = candidate.model
+        self.current_actual_model = candidate.model
+        self._current_route_identity = identity
+        return True
+
+    def commit(self, candidate, *, reason: str, actual_model: Optional[str] = None) -> bool:
+        identity = self.candidate_identity(candidate)
+        if self.committed:
+            return identity == self._pinned_route_identity
+        self.committed = True
+        self.commit_reason = reason
+        self.winner_model = actual_model or candidate.model
+        self._pinned_route_identity = identity
+        self.fallback_available = False
+        return True
+
+    def forbid_fallback(self) -> None:
+        self.fallback_available = False
+
+    def switch_to_manual_fallback(self) -> bool:
+        if self.committed or not self.fallback_available or self.manual_fallback_route is None:
+            return False
+        self.active_route = self.manual_fallback_route
+        self.fallback_available = False
+        return True
+
+    def mark_current_tool_execution(self, *, tool: str, round_num: int) -> bool:
+        if self._current_route_identity is None or not self.current_candidate_model:
+            return False
+        if not self.committed:
+            self.committed = True
+            self.commit_reason = "tool_execution"
+            self.winner_model = self.current_actual_model or self.current_candidate_model
+            self._pinned_route_identity = self._current_route_identity
+            self.fallback_available = False
+        elif self._current_route_identity != self._pinned_route_identity:
+            return False
+        self.tool_execution_started = True
+        self.tool_execution_uncertain = True
+        self.last_tool_name = str(tool or "tool")
+        self.last_tool_round = round_num
+        return True
+
+    def commit_current_visible_output(self) -> bool:
+        if self._current_route_identity is None or not self.current_candidate_model:
+            return False
+        if self.committed:
+            return self._current_route_identity == self._pinned_route_identity
+        self.committed = True
+        self.commit_reason = "visible_output"
+        self.winner_model = self.current_actual_model or self.current_candidate_model
+        self._pinned_route_identity = self._current_route_identity
+        self.fallback_available = False
+        return True
+
+    def fail(self, status: int = 502) -> None:
+        self.terminal_error = True
+        status = int(status or 502)
+        self.terminal_status = status if 400 <= status <= 599 else 502
+
+    def safe_tool_events(self) -> list:
+        if self.tool_events:
+            return list(self.tool_events)
+        if self.tool_execution_started:
+            return [{
+                "round": self.last_tool_round or 1,
+                "tool": self.last_tool_name or "tool",
+                "command": "",
+                "output": "Tool execution was interrupted before completion.",
+                "exit_code": 1,
+            }]
+        return []
+
+
+def _sanitized_auto_agent_error(status: int = 502) -> str:
+    status = int(status or 502)
+    if status < 400 or status > 599:
+        status = 502
+    return (
+        "event: error\n"
+        f'data: {json.dumps({"error": "The agent model request failed.", "status": status})}\n\n'
+    )
+
+
+def _auto_agent_fallback_event(state: AgentRouteState) -> Optional[str]:
+    if (
+        state.active_route is state.selected_primary_route
+        or state.fallback_notice_emitted
+    ):
+        return None
+    state.fallback_notice_emitted = True
+    return "data: " + json.dumps({
+        "type": "fallback",
+        "selected_model": state.requested_model,
+        "answered_by": state.winner_model or state.current_actual_model or state.current_candidate_model,
+        "reason": "primary model unavailable",
+    }) + "\n\n"
+
+
+async def _stream_auto_agent_round(
+    state: AgentRouteState,
+    messages: List[Dict],
+    **stream_kwargs,
+) -> AsyncGenerator[str, None]:
+    """JIT-authorize and stream one globally committed Auto agent candidate."""
+    while True:
+        try:
+            candidate = state.authorize_route(state.active_route)
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except ChatRouteAuthorizationError as exc:
+            if (
+                not state.committed
+                and state.fallback_available
+                and exc.code in _AUTO_AGENT_CANDIDATE_UNAVAILABLE
+                and state.switch_to_manual_fallback()
+            ):
+                continue
+            state.fail(403 if exc.code in {
+                "invalid_auth_context", "privileges_unavailable",
+                "block_all_models", "model_not_allowed", "model_hidden",
+            } else 503)
+            yield _sanitized_auto_agent_error(state.terminal_status)
+            return
+        except Exception:
+            state.fail(500)
+            yield _sanitized_auto_agent_error(500)
+            return
+
+        if not state.set_round_candidate(candidate):
+            yield _sanitized_auto_agent_error(state.terminal_status)
+            return
+
+        pending: List[str] = []
+        has_tool_proposal = False
+        completed = False
+        failure: Optional[Exception] = None
+        try:
+            async for chunk in stream_llm(
+                candidate.endpoint_url,
+                candidate.model,
+                messages,
+                headers=dict(candidate.headers),
+                typed_errors=True,
+                **stream_kwargs,
+            ):
+                if chunk.startswith("data: [DONE]"):
+                    completed = True
+                    if state.committed or has_tool_proposal:
+                        for buffered in pending:
+                            yield buffered
+                        pending.clear()
+                        yield chunk
+                    break
+
+                data = {}
+                if chunk.startswith("data: "):
+                    try:
+                        parsed = json.loads(chunk[6:])
+                        if isinstance(parsed, dict):
+                            data = parsed
+                    except json.JSONDecodeError:
+                        data = {}
+
+                event_type = data.get("type")
+                if event_type == "model_actual":
+                    state.current_actual_model = data.get("model") or state.current_actual_model
+                elif event_type == "usage":
+                    usage = data.get("data") or {}
+                    state.current_actual_model = usage.get("model") or state.current_actual_model
+                elif event_type == "tool_calls" and data.get("calls"):
+                    has_tool_proposal = True
+
+                visible_output = (
+                    isinstance(data.get("delta"), str) and bool(data.get("delta"))
+                )
+                if visible_output and not state.committed:
+                    state.commit(
+                        candidate,
+                        reason="visible_output",
+                        actual_model=state.current_actual_model,
+                    )
+                    fallback_event = _auto_agent_fallback_event(state)
+                    if fallback_event:
+                        yield fallback_event
+                    for buffered in pending:
+                        yield buffered
+                    pending.clear()
+
+                if state.committed:
+                    yield chunk
+                else:
+                    pending.append(chunk)
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception as exc:
+            failure = exc
+
+        if failure is not None:
+            if (
+                not state.committed
+                and state.fallback_available
+                and is_recoverable_chat_dispatch_error(failure)
+                and state.switch_to_manual_fallback()
+            ):
+                continue
+            status = failure.status_code if isinstance(failure, ChatDispatchError) else 500
+            state.fail(status)
+            yield _sanitized_auto_agent_error(state.terminal_status)
+            return
+
+        if state.committed or has_tool_proposal:
+            return
+        if completed and state.fallback_available and state.switch_to_manual_fallback():
+            continue
+        state.fail(502)
+        yield _sanitized_auto_agent_error(502)
+        return
 
 
 def _looks_like_notes_list_request(text: str) -> bool:
@@ -2564,6 +2842,7 @@ async def stream_agent_loop(
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
     _is_teacher_run: bool = False,
+    route_state: Optional[AgentRouteState] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
 
@@ -2632,6 +2911,7 @@ async def stream_agent_loop(
         and (_casual_low_signal_turn or not workspace)
         and not forced_tools
         and not relevant_tools
+        and route_state is None
     )
     # Tool retrieval uses the latest message by default. It may inherit recent
     # user turns only for explicit continuations ("yes", "do it", "1").
@@ -3209,7 +3489,9 @@ async def stream_agent_loop(
     total_start = time.time()
     time_to_first_token = None
     first_token_received = False
-    tool_events = []   # Persist tool executions for history reload
+    tool_events = route_state.tool_events if route_state is not None else []
+    # Persist tool executions for history reload. Auto shares this request-local
+    # list with its route state so cancellation can save tool-only committed work.
     round_texts = []   # Cleaned text per round for history reload
     # Completion-verifier state (mechanism 3a). _effectful_used flips on when
     # a tool that produces a checkable artifact runs; the verifier only fires
@@ -3223,7 +3505,7 @@ async def stream_agent_loop(
     has_real_usage = False
     backend_gen_tps = 0      # backend-reported true gen speed (llama.cpp timings)
     backend_prefill_tps = 0  # backend-reported prefill speed
-    requested_model = model
+    requested_model = route_state.requested_model if route_state is not None else model
     actual_model = model
     total_tool_calls = 0  # for budget enforcement
     _ody_notes_tool_completed = False
@@ -3342,9 +3624,9 @@ async def stream_agent_loop(
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
         logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent[:15]} relevant_tools={sorted(_relevant_tools)[:15] if _relevant_tools else 'ALL'}")
 
-        # Primary target + any configured fallback models. stream_llm_with_fallback
-        # only switches on a pre-content failure, so streamed output is never
-        # duplicated; the dead-host cooldown keeps repeat primary attempts cheap.
+        # Legacy rebuilds its configured fallback chain per round. Auto uses a
+        # request-global route state instead: one JIT-authorized candidate at a
+        # time, with fallback available only before the first global commit.
         _candidates = [(endpoint_url, model, headers)] + list(fallbacks or [])
         # stream_llm enforces a per-read INACTIVITY timeout (httpx read=timeout),
         # which kills a wedged/silent endpoint. This wall-clock deadline is the
@@ -3364,18 +3646,29 @@ async def stream_agent_loop(
             bool(all_tool_schemas),
             agent_stream_timeout,
         )
-        async for chunk in stream_llm_with_fallback(
-            _candidates,
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            prompt_type=prompt_type if round_num == 1 else None,
-            tools=all_tool_schemas if all_tool_schemas else None,
-            tool_choice_none=_ody_doc_finetune_mode,
-            timeout=agent_stream_timeout,
-            session_id=session_id,
-            workload=workload,
-        ):
+        _round_stream_kwargs = {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "prompt_type": prompt_type if round_num == 1 else None,
+            "tools": all_tool_schemas if all_tool_schemas else None,
+            "tool_choice_none": _ody_doc_finetune_mode,
+            "timeout": agent_stream_timeout,
+            "session_id": session_id,
+            "workload": workload,
+        }
+        if route_state is not None:
+            _round_stream = _stream_auto_agent_round(
+                route_state,
+                messages,
+                **_round_stream_kwargs,
+            )
+        else:
+            _round_stream = stream_llm_with_fallback(
+                _candidates,
+                messages,
+                **_round_stream_kwargs,
+            )
+        async for chunk in _round_stream:
             if not _round_first_event_logged:
                 _round_first_event_logged = True
                 logger.info(
@@ -3429,6 +3722,14 @@ async def stream_agent_loop(
                                     except Exception:
                                         lang = lm.group(1)
                                 logger.info(f"Doc streaming: open title={title!r} lang={lang!r}")
+                                if route_state is not None:
+                                    if not route_state.commit_current_visible_output():
+                                        route_state.fail(503)
+                                        yield _sanitized_auto_agent_error(route_state.terminal_status)
+                                        break
+                                    fallback_event = _auto_agent_fallback_event(route_state)
+                                    if fallback_event:
+                                        yield fallback_event
                                 yield f'data: {json.dumps({"type": "doc_stream_open", "title": title, "language": lang})}\n\n'
                         if _doc_opened:
                             cm = re.search(r'"content"\s*:\s*"', _doc_acc)
@@ -3444,6 +3745,14 @@ async def stream_agent_loop(
                                         decoded = raw.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
                                 if len(decoded) > _doc_last_len:
                                     _doc_last_len = len(decoded)
+                                    if route_state is not None:
+                                        if not route_state.commit_current_visible_output():
+                                            route_state.fail(503)
+                                            yield _sanitized_auto_agent_error(route_state.terminal_status)
+                                            break
+                                        fallback_event = _auto_agent_fallback_event(route_state)
+                                        if fallback_event:
+                                            yield fallback_event
                                     yield f'data: {json.dumps({"type": "doc_stream_delta", "content": decoded})}\n\n'
                     elif data.get("type") == "tool_calls":
                         native_tool_calls = data.get("calls", [])
@@ -3585,6 +3894,11 @@ async def stream_agent_loop(
             _round_first_event_logged,
             _round_first_token_logged,
         )
+        if route_state is not None and route_state.terminal_error:
+            if not route_state.committed:
+                yield "data: [DONE]\n\n"
+                return
+            break
         _normalized_doc_round = (
             _normalize_stream_document_fences(
                 round_response,
@@ -4015,6 +4329,8 @@ async def stream_agent_loop(
                 cmd_display = full_command
 
             if tool_policy and tool_policy.blocks(block.tool_type):
+                if route_state is not None:
+                    route_state.forbid_fallback()
                 desc = f"{block.tool_type}: BLOCKED"
                 result = {
                     "error": tool_policy.reason_for(block.tool_type),
@@ -4023,6 +4339,18 @@ async def stream_agent_loop(
                 }
                 logger.info("Tool blocked before start by policy: %s", block.tool_type)
             else:
+                if route_state is not None:
+                    if not route_state.mark_current_tool_execution(
+                        tool=block.tool_type,
+                        round_num=round_num,
+                    ):
+                        route_state.fail(503)
+                        yield _sanitized_auto_agent_error(route_state.terminal_status)
+                        budget_hit = True
+                        break
+                    fallback_event = _auto_agent_fallback_event(route_state)
+                    if fallback_event:
+                        yield fallback_event
                 yield (
                     f'data: {json.dumps({"type": "tool_start", "tool": block.tool_type, "command": cmd_display, "full_command": full_command, "round": round_num})}\n\n'
                 )
@@ -4063,6 +4391,8 @@ async def stream_agent_loop(
                             f'data: {json.dumps({"type": "tool_progress", "tool": block.tool_type, "round": round_num, **evt})}\n\n'
                         )
                     desc, result = await _tool_task
+                    if route_state is not None:
+                        route_state.tool_execution_uncertain = False
                 finally:
                     # If the SSE client disconnects (or this generator is
                     # otherwise closed) while we're awaiting a progress event
@@ -4505,6 +4835,8 @@ async def stream_agent_loop(
         backend_prefill_tps=backend_prefill_tps,
     )
     metrics["requested_model"] = requested_model
+    if route_state is not None:
+        metrics["model"] = route_state.winner_model or actual_model
     yield f"data: {json.dumps({'type': 'metrics', 'data': metrics})}\n\n"
 
     # Teacher-escalation: inline takeover visible in the chat stream.
@@ -4512,7 +4844,7 @@ async def stream_agent_loop(
     # gets a turn (with its own tool calls forwarded to the user) and
     # a skill is saved ONLY if the teacher actually succeeds. Skipped
     # when we ARE the teacher to avoid recursion.
-    if not _is_teacher_run and not guide_only:
+    if route_state is None and not _is_teacher_run and not guide_only:
         try:
             from src.teacher_escalation import run_teacher_inline
             async for evt in run_teacher_inline(

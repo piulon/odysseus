@@ -5,6 +5,17 @@ import { providerLogo } from './providers.js';
 import uiModule from './ui.js';
 import settingsModule from './settings.js';
 import { sortModelObjects } from './modelSort.js';
+import {
+  autoPickerState,
+  applyPendingModelPick,
+  createAutoPickerButton,
+  createAutoSelectModelHandler,
+  createLatestConfigController,
+  createManualSelectionFormData,
+  loadAutoRoutingConfig,
+  patchSessionAutoRoute,
+  resolveDefaultPendingChat,
+} from './autoRoutingUi.js';
 
 const API_BASE = window.location.origin;
 
@@ -78,6 +89,27 @@ function _handlePickerKeydown(e, listEl, itemSelector, closeFn) {
 let _deps = null;
 let _autoSelectingDefault = false;
 let _defaultChatPickInFlight = false;
+let _pickerInitialized = false;
+let _autoConfig = { prefs: {}, catalog: [] };
+const _autoConfigController = createLatestConfigController(
+  () => loadAutoRoutingConfig(),
+  value => {
+    _autoConfig = value;
+    updateModelPicker();
+  },
+);
+
+function _activeAutoLane() {
+  const agent = document.getElementById('mode-agent-btn');
+  return agent && agent.classList.contains('active') ? 'agent' : 'chat';
+}
+
+async function _refreshAutoConfig() {
+  try {
+    await _autoConfigController.refresh();
+  } catch (_) {}
+  return _autoConfig;
+}
 
 function _modelExists(modelId, url) {
   if (!modelId || !window.modelsModule || !window.modelsModule.getCachedItems) return false;
@@ -121,38 +153,22 @@ async function _ensureDefaultPendingChat() {
   if (!_deps || _defaultChatPickInFlight) return;
   if (_deps.getCurrentSessionId && _deps.getCurrentSessionId()) return;
   const pending = _deps.getPendingChat && _deps.getPendingChat();
-  if (pending && pending.modelId && pending.source === 'manual') return;
+  if (pending && (pending.autoRoute || (pending.modelId && pending.source === 'manual'))) return;
   _defaultChatPickInFlight = true;
   try {
-    await _ensureModelCacheForFallback();
-    let dc = null;
-    try {
-      const res = await fetch(`${API_BASE}/api/default-chat`, { credentials: 'same-origin' });
-      if (res.ok) dc = await res.json();
-    } catch (_) {}
-    if (dc && dc.endpoint_url && dc.model && _modelExists(dc.model, dc.endpoint_url)) {
-      const pendingUrl = String((pending && pending.url) || '').replace(/\/+$/, '');
-      const defaultUrl = String(dc.endpoint_url || '').replace(/\/+$/, '');
-      _deps.setPendingChat({
-        url: dc.endpoint_url,
-        modelId: dc.model,
-        endpointId: dc.endpoint_id || '',
-        source: 'default',
-      });
-      try { window.__odysseusDefaultChat = dc; } catch (_) {}
-      if (!pending || pending.modelId !== dc.model || pendingUrl !== defaultUrl || pending.source !== 'default') {
-        updateModelPicker();
-      }
-      return;
-    }
-    if (pending && pending.modelId) return;
-    // No configured default, or the configured default is gone/offline:
-    // preserve the convenience fallback and keep the picker usable.
-    const fallback = _firstAvailableModel();
-    if (fallback) {
-      _deps.setPendingChat({ ...fallback, source: 'fallback' });
-      updateModelPicker();
-    }
+    const applied = await resolveDefaultPendingChat({
+      getPending: () => _deps.getPendingChat(),
+      setPending: value => _deps.setPendingChat(value),
+      ensureCatalog: _ensureModelCacheForFallback,
+      loadDefault: async () => {
+        const res = await fetch(`${API_BASE}/api/default-chat`, { credentials: 'same-origin' });
+        return res.ok ? res.json() : null;
+      },
+      modelExists: _modelExists,
+      firstFallback: _firstAvailableModel,
+      onDefaultLoaded: dc => { try { window.__odysseusDefaultChat = dc; } catch (_) {} },
+    });
+    if (applied) updateModelPicker();
   } finally {
     _defaultChatPickInFlight = false;
   }
@@ -169,7 +185,10 @@ async function _ensureDefaultPendingChat() {
  */
 export function initModelPicker(deps) {
   _deps = deps;
-  _initModelPickerDropdown();
+  if (!_pickerInitialized) {
+    _pickerInitialized = _initModelPickerDropdown();
+  }
+  _refreshAutoConfig();
 }
 
 function _initModelPickerDropdown() {
@@ -180,7 +199,28 @@ function _initModelPickerDropdown() {
   const listEl = document.getElementById('model-picker-list');
   const searchRow = menu ? menu.querySelector('.model-picker-search-row') : null;
   const refreshBtn = document.getElementById('model-picker-refresh-btn');
-  if (!wrap || !btn || !menu || !search || !listEl) return;
+  const autoWarning = document.getElementById('model-picker-auto-warning');
+  if (!wrap || !btn || !menu || !search || !listEl) return false;
+
+  function _currentPickerState() {
+    const currentSessionId = _deps.getCurrentSessionId();
+    const session = _deps.getSessions().find(item => item.id === currentSessionId) || null;
+    return autoPickerState(
+      session,
+      currentSessionId ? null : _deps.getPendingChat(),
+      _activeAutoLane(),
+      _autoConfig.prefs,
+      _autoConfig.catalog,
+    );
+  }
+
+  function _renderAutoWarning() {
+    if (!autoWarning) return;
+    const state = _currentPickerState();
+    autoWarning.classList.toggle('hidden', !state.warning);
+    const text = autoWarning.querySelector('[data-auto-warning-text]');
+    if (text) text.textContent = state.warning;
+  }
 
   function _close() {
     if (menu.classList.contains('hidden')) return;
@@ -345,8 +385,8 @@ function _initModelPickerDropdown() {
     const all = _getAllModels();
     const q = (filter || '').trim().toLowerCase();
     const hasAnyModel = all.length > 0;
-    listEl.classList.toggle('is-empty', !hasAnyModel);
-    menu.classList.toggle('no-models', !hasAnyModel);
+    listEl.classList.toggle('is-empty', false);
+    menu.classList.toggle('no-models', false);
     if (search) {
       search.placeholder = hasAnyModel ? 'Search models…' : 'No models connected';
     }
@@ -354,7 +394,18 @@ function _initModelPickerDropdown() {
       searchRow.classList.toggle('searching', !!q);
     }
 
-    if (!hasAnyModel) return; // collapsed empty list — nothing to render
+    if (!q) {
+      const pickerState = _currentPickerState();
+      const autoRow = createAutoPickerButton(
+        document,
+        pickerState.autoRoute,
+        enabled => _toggleAuto(enabled),
+      );
+      listEl.appendChild(autoRow);
+    }
+
+    _renderAutoWarning();
+    if (!hasAnyModel) return; // Auto remains available without a manual target.
 
     // Unique lookup so Recent/Favorites (stored as bare model IDs) can be
     // resolved back to full model objects; drops anything no longer offered.
@@ -548,9 +599,45 @@ function _initModelPickerDropdown() {
     }
   }
 
-  async function _pick(m) {
+  async function _toggleAuto(enabled) {
+    const currentSessionId = _deps.getCurrentSessionId();
+    const sessions = _deps.getSessions();
+    const pending = _deps.getPendingChat();
+    const session = sessions.find(item => item.id === currentSessionId);
+
+    if (currentSessionId && session) {
+      const result = await patchSessionAutoRoute(session, enabled, fetch, API_BASE);
+      if (!result.ok) {
+        uiModule.showError(`Failed to ${enabled ? 'enable' : 'disable'} automatic model routing`);
+        updateModelPicker();
+        return;
+      }
+    } else {
+      const nextPending = {
+        ...(pending || {}),
+        autoRoute: enabled,
+        source: enabled ? 'auto' : (pending && pending.source),
+      };
+      _deps.setPendingChat(
+        !enabled && !nextPending.modelId && !nextPending.url ? null : nextPending,
+      );
+    }
+
+    try {
+      document.dispatchEvent(new CustomEvent('odysseus:model-picked', {
+        detail: { autoRoute: enabled, display: enabled ? 'Auto' : 'Manual' },
+      }));
+    } catch (_) {}
+    _close();
+    updateModelPicker();
+    uiModule.showToast(`Automatic model routing ${enabled ? 'enabled' : 'disabled'}`);
+  }
+
+  async function _pick(m, { automatic = false } = {}) {
     const currentSessionId = _deps.getCurrentSessionId();
     const _pendingChat = _deps.getPendingChat();
+    const current = _deps.getSessions().find(item => item.id === currentSessionId);
+    if (automatic && ((current && current.auto_route) || (_pendingChat && _pendingChat.autoRoute))) return;
 
     // Remember this pick so it surfaces under "Recent" next time the picker
     // opens — the whole point of quick-switch.
@@ -570,7 +657,13 @@ function _initModelPickerDropdown() {
     }
     if (!currentSessionId && _pendingChat) {
       // Already have a deferred session — just update the model
-      _deps.setPendingChat({ url: m.url, modelId: m.mid, endpointId: m.endpointId, source: 'manual' });
+      const applied = applyPendingModelPick(
+        () => _deps.getPendingChat(),
+        value => _deps.setPendingChat(value),
+        m,
+        { automatic },
+      );
+      if (!applied) return;
       // Header stays as session name — model switch only updates picker
       updateModelPicker();
       uiModule.showToast(`Using ${m.display}`);
@@ -580,10 +673,7 @@ function _initModelPickerDropdown() {
       await _deps.createDirectChat(m.url, m.mid, m.endpointId);
     } else {
       // Existing session with no model — PATCH it
-      const fd = new FormData();
-      fd.append('model', m.mid);
-      fd.append('endpoint_url', m.url);
-      if (m.endpointId) fd.append('endpoint_id', m.endpointId);
+      const fd = createManualSelectionFormData(m);
       try {
         const res = await fetch(`${API_BASE}/api/session/${currentSessionId}`, { method: 'PATCH', body: fd });
         if (!res.ok) {
@@ -592,7 +682,7 @@ function _initModelPickerDropdown() {
         }
         const sessions = _deps.getSessions();
         const s = sessions.find(x => x.id === currentSessionId);
-        if (s) { s.model = m.mid; s.endpoint_url = m.url; }
+        if (s) { s.model = m.mid; s.endpoint_url = m.url; s.auto_route = false; }
         // Header stays as session name — model info shown in picker only
       } catch (e) {
         uiModule.showError('Failed to set model: ' + e);
@@ -604,51 +694,57 @@ function _initModelPickerDropdown() {
     uiModule.showToast(`Using ${m.display}`);
   }
 
-  document.addEventListener('odysseus:auto-select-model', async (e) => {
-    const detail = (e && e.detail) || {};
-    const currentSessionId = _deps.getCurrentSessionId();
-    const sessions = _deps.getSessions();
-    const current = sessions.find(x => x.id === currentSessionId);
-    const pending = _deps.getPendingChat();
-    if ((current && current.model) || (pending && pending.modelId)) return;
-
-    if (window.modelsModule && window.modelsModule.refreshModels) {
-      try { await window.modelsModule.refreshModels(false); } catch (_) {}
-    }
-    const items = window.modelsModule && window.modelsModule.getCachedItems ? window.modelsModule.getCachedItems() : [];
-    const targetEndpointId = detail.endpointId ? String(detail.endpointId) : '';
-    const targetModel = detail.modelId || '';
-    let match = null;
-    for (const item of items) {
-      if (item.offline) continue;
-      if (targetEndpointId && String(item.endpoint_id || '') !== targetEndpointId) continue;
-      const models = (item.models || []).concat(item.models_extra || []);
-      const displays = (item.models_display || []).concat(item.models_extra_display || []);
-      const idx = targetModel ? models.indexOf(targetModel) : (models.length ? 0 : -1);
-      if (idx >= 0) {
-        match = {
-          mid: models[idx],
-          display: (displays[idx] || models[idx]).split('/').pop(),
-          url: item.url || detail.url || '',
-          endpointId: item.endpoint_id || detail.endpointId || '',
-          epName: item.endpoint_name || detail.endpointName || '',
-          providerText: [item.endpoint_name || detail.endpointName || '', item.url || detail.url || ''].filter(Boolean).join(' '),
-        };
-        break;
-      }
-    }
-    if (!match && detail.modelId && detail.url) {
-      match = {
-        mid: detail.modelId,
-        display: String(detail.modelId).split('/').pop(),
-        url: detail.url,
-        endpointId: detail.endpointId || '',
-        epName: detail.endpointName || '',
-        providerText: [detail.endpointName || '', detail.url || ''].filter(Boolean).join(' '),
+  const autoSelectModelHandler = createAutoSelectModelHandler({
+    getState: () => {
+      const currentSessionId = _deps.getCurrentSessionId();
+      return {
+        current: _deps.getSessions().find(item => item.id === currentSessionId),
+        pending: _deps.getPendingChat(),
       };
-    }
-    if (match) await _pick(match);
+    },
+    refreshModels: async () => {
+      if (window.modelsModule && window.modelsModule.refreshModels) {
+        await window.modelsModule.refreshModels(false);
+      }
+    },
+    resolveModel: detail => {
+      const items = window.modelsModule && window.modelsModule.getCachedItems ? window.modelsModule.getCachedItems() : [];
+      const targetEndpointId = detail.endpointId ? String(detail.endpointId) : '';
+      const targetModel = detail.modelId || '';
+      let match = null;
+      for (const item of items) {
+        if (item.offline) continue;
+        if (targetEndpointId && String(item.endpoint_id || '') !== targetEndpointId) continue;
+        const models = (item.models || []).concat(item.models_extra || []);
+        const displays = (item.models_display || []).concat(item.models_extra_display || []);
+        const idx = targetModel ? models.indexOf(targetModel) : (models.length ? 0 : -1);
+        if (idx >= 0) {
+          match = {
+            mid: models[idx],
+            display: (displays[idx] || models[idx]).split('/').pop(),
+            url: item.url || detail.url || '',
+            endpointId: item.endpoint_id || detail.endpointId || '',
+            epName: item.endpoint_name || detail.endpointName || '',
+            providerText: [item.endpoint_name || detail.endpointName || '', item.url || detail.url || ''].filter(Boolean).join(' '),
+          };
+          break;
+        }
+      }
+      if (!match && detail.modelId && detail.url) {
+        match = {
+          mid: detail.modelId,
+          display: String(detail.modelId).split('/').pop(),
+          url: detail.url,
+          endpointId: detail.endpointId || '',
+          epName: detail.endpointName || '',
+          providerText: [detail.endpointName || '', detail.url || ''].filter(Boolean).join(' '),
+        };
+      }
+      return match;
+    },
+    pick: _pick,
   });
+  document.addEventListener('odysseus:auto-select-model', autoSelectModelHandler);
 
   btn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -656,6 +752,9 @@ function _initModelPickerDropdown() {
       // Force-clear any in-progress close animation
       menu.classList.remove('closing', 'hidden');
       _populate('');
+      _refreshAutoConfig().then(() => {
+        if (!menu.classList.contains('hidden')) _populate(search.value || '');
+      });
       if (window.modelsModule && window.modelsModule.refreshModels) {
         window.modelsModule.refreshModels().then(() => {
           if (!menu.classList.contains('hidden')) _populate(search.value || '');
@@ -703,11 +802,41 @@ function _initModelPickerDropdown() {
       _openPickerShortcut('models');
     });
   }
+  if (autoWarning) {
+    const settingsBtn = autoWarning.querySelector('[data-open-auto-settings]');
+    if (settingsBtn) settingsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _close();
+      settingsModule.open('ai');
+      requestAnimationFrame(() => {
+        const card = document.getElementById('auto-routing-settings');
+        if (card) { card.scrollIntoView({ block: 'center' }); card.focus({ preventScroll: true }); }
+      });
+    });
+  }
+  if (typeof MutationObserver !== 'undefined') {
+    const modeObserver = new MutationObserver(() => {
+      updateModelPicker();
+      if (!menu.classList.contains('hidden')) _populate(search.value || '');
+    });
+    ['mode-agent-btn', 'mode-chat-btn'].forEach(id => {
+      const modeBtn = document.getElementById(id);
+      if (modeBtn) modeObserver.observe(modeBtn, {
+        attributes: true,
+        attributeFilter: ['class', 'aria-pressed'],
+      });
+    });
+  }
+  document.addEventListener('odysseus:auto-routing-config-changed', (event) => {
+    if (event.detail) _autoConfigController.applyLatest(event.detail);
+    if (!menu.classList.contains('hidden')) _populate(search.value || '');
+  });
   document.addEventListener('click', (e) => {
     if (!menu.classList.contains('hidden') && !menu.contains(e.target) && e.target !== btn) {
       _close();
     }
   });
+  return true;
 }
 
 /**
@@ -744,7 +873,9 @@ export function updateModelPicker() {
   } else if (_pendingChat && _pendingChat.modelId) {
     modelId = _pendingChat.modelId;
     if (!_modelExists(modelId, _pendingChat.url || '')) {
-      _deps.setPendingChat(null);
+      _deps.setPendingChat(_pendingChat.autoRoute
+        ? { ..._pendingChat, url: '', modelId: '', endpointId: '' }
+        : null);
       modelId = null;
     }
   }
@@ -769,7 +900,10 @@ export function updateModelPicker() {
       const fallback = items.find(item => !item.offline && (item.models || []).length > 0);
       if (fallback) {
         modelId = fallback.models[0];
-        _deps.setPendingChat({ url: fallback.url, modelId, endpointId: fallback.endpoint_id, source: 'fallback' });
+        _deps.setPendingChat({
+          url: fallback.url, modelId, endpointId: fallback.endpoint_id,
+          source: 'fallback', autoRoute: !!_pendingChat.autoRoute,
+        });
       }
     }
   }
@@ -779,16 +913,25 @@ export function updateModelPicker() {
     !_autoSelectingDefault &&
     window.modelsModule &&
     window.modelsModule.getCachedItems &&
+    (!latestPending || !latestPending.autoRoute) &&
     (!modelId || (latestPending && latestPending.source === 'fallback'))
   ) {
     _ensureDefaultPendingChat();
   }
 
-  const displayName = modelId ? modelId.split('/').pop() : 'Select model';
+  const pickerState = autoPickerState(
+    s || null,
+    currentSessionId ? null : _deps.getPendingChat(),
+    _activeAutoLane(),
+    _autoConfig.prefs,
+    _autoConfig.catalog,
+  );
+  const displayName = pickerState.label;
   // The header indicator clips long names with ellipsis; show the full model
   // identifier on hover (#1982). No tooltip on the "Select model" placeholder.
   label.title = modelId || '';
-  const logo = modelId ? providerLogo(modelId) : null;
+  if (pickerState.autoRoute) label.title = 'Automatic model routing';
+  const logo = pickerState.autoRoute ? null : (modelId ? providerLogo(modelId) : null);
   if (logo) {
     label.innerHTML = '<span class="model-picker-logo">' + logo + '</span> ' + displayName;
   } else {

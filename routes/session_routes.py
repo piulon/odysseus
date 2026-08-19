@@ -306,6 +306,7 @@ def setup_session_routes(
 
         sessions = [{"id": s.id, "name": s.name, "model": _public_model(s.name, s.model),
                      "endpoint_url": s.endpoint_url, "rag": s.rag,
+                     "auto_route": bool(getattr(s, "auto_route", False)),
                      "archived": s.archived, "folder": folder_map.get(s.id),
                      "total_tokens": token_map.get(s.id, 0),
                      "is_important": important_map.get(s.id, False),
@@ -333,8 +334,14 @@ def setup_session_routes(
         skip_validation: str = Form(None),
         api_key: str = Form(""),
         endpoint_id: str = Form(""),
+        auto_route: str = Form(None),
     ):
         skip_val = str(skip_validation).lower() == "true"
+        auto_route_val = (
+            str(auto_route).lower() == "true"
+            if auto_route is not None
+            else False
+        )
         user = effective_user(request)
         endpoint_api_key = ""
         endpoint_base_url = ""
@@ -428,6 +435,7 @@ def setup_session_routes(
             model=model_to_use,
             rag=str(rag).lower() == "true" if rag else False,
             owner=user,
+            auto_route=auto_route_val,
         )
         # Set auth headers for custom API-key endpoints
         resolved_key = request_api_key
@@ -452,7 +460,8 @@ def setup_session_routes(
             name=session.name,
             model=model_to_use,
             rag=str(rag).lower() == "true" if rag else False,
-            archived=False
+            archived=False,
+            auto_route=auto_route_val,
         )    
     @router.patch("/session/{sid}")
     def rename_session(
@@ -460,6 +469,7 @@ def setup_session_routes(
         name: str = Form(None), folder: str = Form(None),
         model: str = Form(None), endpoint_url: str = Form(None),
         endpoint_id: str = Form(None),
+        auto_route: str = Form(None),
     ):
         _verify_session_owner(request, sid)
         try:
@@ -467,6 +477,11 @@ def setup_session_routes(
         except KeyError:
             raise HTTPException(404, f"Session {sid} not found")
         result = {"id": sid}
+        requested_auto_route = (
+            str(auto_route).lower() == "true"
+            if auto_route is not None
+            else None
+        )
         if name is not None:
             session_manager.update_session_name(sid, name)
             result["name"] = name
@@ -516,6 +531,11 @@ def setup_session_routes(
                 session.headers = build_headers(endpoint_api_key, endpoint_base_url)
             else:
                 session.headers = {}
+            session.auto_route = (
+                requested_auto_route
+                if requested_auto_route is not None
+                else False
+            )
             # Persist to DB
             db = SessionLocal()
             try:
@@ -524,12 +544,26 @@ def setup_session_routes(
                     db_session.model = model
                     db_session.endpoint_url = endpoint_url
                     db_session.headers = session.headers or {}
+                    db_session.auto_route = bool(session.auto_route)
                     db_session.updated_at = utcnow_naive()
                     db.commit()
             finally:
                 db.close()
             result["model"] = model
             result["endpoint_url"] = endpoint_url
+            result["auto_route"] = bool(session.auto_route)
+        elif requested_auto_route is not None:
+            session.auto_route = requested_auto_route
+            db = SessionLocal()
+            try:
+                db_session = db.query(DbSession).filter(DbSession.id == sid).first()
+                if db_session:
+                    db_session.auto_route = requested_auto_route
+                    db_session.updated_at = utcnow_naive()
+                    db.commit()
+            finally:
+                db.close()
+            result["auto_route"] = requested_auto_route
         return result
     
     @router.post("/session/{sid}/inject_messages")

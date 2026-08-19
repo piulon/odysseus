@@ -6,6 +6,7 @@ import uiModule, { autoResize, styledPrompt } from './ui.js';
 import chatRenderer from './chatRenderer.js';
 import { providerLogo } from './providers.js';
 import { initModelPicker, updateModelPicker } from './modelPicker.js';
+import { createPendingSessionFormData } from './autoRoutingUi.js';
 import themeModule from './theme.js';
 import spinnerModule from './spinner.js';
 
@@ -1694,7 +1695,7 @@ export async function loadSessions() {
         try {
           const dcRes = await fetch(`${API_BASE}/api/default-chat`);
           const dc = await dcRes.json();
-          if (dc.endpoint_url && dc.model) {
+          if (dc.endpoint_url && dc.model && !_pendingChat) {
             // Check if there's already an empty session with this model we can reuse
             const emptyDefault = activeSessions.find(s =>
               s.model === dc.model && s.message_count === 0
@@ -1745,7 +1746,7 @@ export async function loadSessions() {
         try {
           const dcRes = await fetch(`${API_BASE}/api/default-chat`);
           const dc = await dcRes.json();
-          if (dc.endpoint_url && dc.model) {
+          if (dc.endpoint_url && dc.model && !_pendingChat) {
             await createDirectChat(dc.endpoint_url, dc.model, dc.endpoint_id);
           }
         } catch (_) { /* no default model — that's fine, user can /setup */ }
@@ -2085,7 +2086,7 @@ export async function selectSession(id, { keepSidebar = false, showLoading = tru
 }
 
 // Pending session — stored locally until the first message is sent
-let _pendingChat = null; // { url, modelId, endpointId }
+let _pendingChat = null; // { url?, modelId?, endpointId?, autoRoute }
 
 export function createDirectChat(url, modelId, endpointId) {
   _sessionNavToken++;
@@ -2101,7 +2102,7 @@ export function createDirectChat(url, modelId, endpointId) {
   }
 
   // Don't hit the API — just store the model info and prepare the UI
-  _pendingChat = { url, modelId, endpointId };
+  _pendingChat = { url, modelId, endpointId, autoRoute: false };
   _skipAutoSelect = true;
   _suppressNextSessionLoading = true;
   currentSessionId = null;
@@ -2155,16 +2156,7 @@ export async function materializePendingSession() {
   const base = (pending.modelId || 'model').split('/').pop();
   const name = isIncognito ? 'Nobody' : `${base} ${new Date().toLocaleTimeString()}`;
 
-  const fd = new FormData();
-  fd.append('name', name);
-  fd.append('endpoint_url', pending.url || '');
-  fd.append('model', pending.modelId || '');
-  if (pending.url && pending.modelId) {
-    fd.append('skip_validation', 'true');
-  }
-  if (pending.endpointId) {
-    fd.append('endpoint_id', pending.endpointId);
-  }
+  const fd = createPendingSessionFormData(pending, name);
 
   let res;
   try {
@@ -2220,9 +2212,8 @@ export function getSessions() {
 export function getCurrentModel() {
   const sess = sessions.find(x => x.id === currentSessionId);
   if (sess && sess.model) return sess.model;
-  // Pending session not yet materialized — read from model picker label
-  const label = document.getElementById('model-picker-label');
-  return label ? label.textContent.trim() : null;
+  // Auto is picker state, not a synthetic model identifier.
+  return (_pendingChat && _pendingChat.modelId) || null;
 }
 
 /** Endpoint URL serving the current (or pending) session's model. Used to

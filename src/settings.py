@@ -136,6 +136,10 @@ DEFAULT_SETTINGS = {
     "task_model": "",
     "default_endpoint_id": "",
     "default_model": "",
+    "auto_chat_endpoint_id": "",
+    "auto_chat_model": "",
+    "auto_agent_endpoint_id": "",
+    "auto_agent_model": "",
     # Optional prose style used only for normal document writing/editing.
     # Email replies use email_writing_style instead because greetings,
     # signatures, and mailbox identity rules are medium-specific.
@@ -273,18 +277,27 @@ _PER_USER_KEYS = {
     # account inherited whatever the most-recent admin picked, which then
     # got injected into the chat composer on first open.
     "default_endpoint_id", "default_model", "default_model_fallbacks",
+    "auto_chat_endpoint_id", "auto_chat_model",
+    "auto_agent_endpoint_id", "auto_agent_model",
     "utility_endpoint_id", "utility_model", "utility_model_fallbacks",
     "research_endpoint_id", "research_model",
 }
 
 
-def get_user_setting(key: str, owner: str = "", default: Any = None) -> Any:
+def get_user_setting(
+    key: str,
+    owner: str = "",
+    default: Any = None,
+    *,
+    inherit_global: bool = True,
+) -> Any:
     """Resolve `key` from the caller's per-user prefs first, falling back to
     the global setting. Only the small whitelist in `_PER_USER_KEYS` is
     eligible — for any other key this is equivalent to `get_setting(key)`.
 
     Falls back gracefully if the prefs module can't be imported (cycle/early
-    boot) — admin-global settings keep working.
+    boot). Callers may disable the global fallback for an explicit owner;
+    ownerless/single-user lookups still read global settings.
     """
     if owner and key in _PER_USER_KEYS:
         try:
@@ -294,6 +307,8 @@ def get_user_setting(key: str, owner: str = "", default: Any = None) -> Any:
                 return prefs[key]
         except Exception:
             pass
+        if not inherit_global:
+            return default
     return get_setting(key, default)
 
 

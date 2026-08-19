@@ -9,10 +9,18 @@ import { sortModelIds } from './modelSort.js';
 import { providerLogo } from './providers.js';
 import { isAltGrEvent } from './platform.js';
 import { bindMenuDismiss } from './escMenuStack.js';
+import {
+  autoTargetForLane,
+  createLatestConfigController,
+  loadAutoRoutingConfig,
+  saveAutoTarget,
+} from './autoRoutingUi.js';
 
 let initialized = false;
 let modalEl = null;
 let _authPolicy = { password_min_length: 8 };
+let _refreshAutoRoutingSettings = null;
+let _autoRoutingInitialized = false;
 
 function el(id) { return document.getElementById(id); }
 function esc(s) { return uiModule.esc(s); }
@@ -40,7 +48,10 @@ function initTabs() {
       // they flip toggles instead of having to close + reopen the modal.
       document.body.classList.toggle('settings-appearance-open', tab === 'appearance');
       syncAppearanceOpacity(tab === 'appearance');
-      if (tab === 'ai') refreshAiModelEndpoints();
+      if (tab === 'ai') {
+        refreshAiModelEndpoints();
+        if (_refreshAutoRoutingSettings) _refreshAutoRoutingSettings();
+      }
     });
   });
 }
@@ -572,6 +583,160 @@ async function initDefaultChat() {
     _endpoints = endpoints;
     refreshEndpointOptions(epSel.value, modelSel.value);
   });
+}
+
+/* ── Automatic routing targets (owner-scoped prefs + catalog) ── */
+async function initAutoRouting() {
+  if (_autoRoutingInitialized) return;
+  const card = el('auto-routing-settings');
+  if (!card) return;
+  _autoRoutingInitialized = true;
+  let config = { prefs: {}, catalog: [] };
+
+  const controls = {
+    chat: {
+      endpoint: el('set-autoChatEndpoint'),
+      model: el('set-autoChatModel'),
+      status: el('set-autoChatStatus'),
+      clear: el('set-autoChatClear'),
+    },
+    agent: {
+      endpoint: el('set-autoAgentEndpoint'),
+      model: el('set-autoAgentModel'),
+      status: el('set-autoAgentStatus'),
+      clear: el('set-autoAgentClear'),
+    },
+  };
+
+  function appendOption(select, value, label, disabled = false) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    option.disabled = disabled;
+    select.appendChild(option);
+  }
+
+  function renderLane(lane) {
+    const ui = controls[lane];
+    if (!ui.endpoint || !ui.model || !ui.status) return;
+    const target = autoTargetForLane(lane, config.prefs, config.catalog);
+
+    ui.endpoint.innerHTML = '';
+    appendOption(ui.endpoint, '', 'Choose endpoint');
+    config.catalog.forEach(endpoint => appendOption(ui.endpoint, endpoint.id, endpoint.name));
+    if (target.endpointId && !config.catalog.some(endpoint => endpoint.id === target.endpointId)) {
+      appendOption(ui.endpoint, target.endpointId, 'Unavailable endpoint', true);
+    }
+    ui.endpoint.value = target.endpointId;
+
+    renderModels(lane, target.model);
+    const current = autoTargetForLane(lane, config.prefs, config.catalog);
+    ui.status.dataset.status = current.status;
+    ui.status.textContent = current.status === 'valid'
+      ? 'Configured'
+      : (current.status === 'invalid' ? 'Saved target is unavailable' : 'Not configured');
+  }
+
+  function renderModels(lane, selected = '') {
+    const ui = controls[lane];
+    const endpoint = config.catalog.find(item => item.id === ui.endpoint.value);
+    ui.model.innerHTML = '';
+    appendOption(ui.model, '', 'Choose model');
+    (endpoint ? endpoint.models : []).forEach(model => appendOption(ui.model, model, model.split('/').pop()));
+    if (selected && (!endpoint || !endpoint.models.includes(selected))) {
+      appendOption(ui.model, selected, 'Unavailable model', true);
+    }
+    ui.model.value = selected;
+  }
+
+  function announceConfig() {
+    try {
+      document.dispatchEvent(new CustomEvent('odysseus:auto-routing-config-changed', {
+        detail: config,
+      }));
+    } catch (_) {}
+  }
+
+  function applyConfig(value) {
+    config = value;
+    renderLane('chat');
+    renderLane('agent');
+    announceConfig();
+  }
+
+  const configController = createLatestConfigController(
+    () => loadAutoRoutingConfig(),
+    applyConfig,
+  );
+
+  async function reload() {
+    try {
+      await configController.refresh();
+    } catch (_) {
+      Object.values(controls).forEach(ui => {
+        if (ui.status) { ui.status.dataset.status = 'error'; ui.status.textContent = 'Failed to load settings'; }
+      });
+    }
+  }
+  _refreshAutoRoutingSettings = reload;
+
+  async function persist(lane, endpointId, model) {
+    const ui = controls[lane];
+    ui.endpoint.disabled = true;
+    ui.model.disabled = true;
+    if (ui.clear) ui.clear.disabled = true;
+    // A save is newer than any settings GET already in flight.
+    const saveGeneration = configController.begin();
+    const result = await saveAutoTarget(lane, endpointId, model, config.catalog);
+    if (!configController.isCurrent(saveGeneration)) {
+      ui.endpoint.disabled = false;
+      ui.model.disabled = false;
+      if (ui.clear) ui.clear.disabled = false;
+      return;
+    }
+    if (result.ok) {
+      const prefix = lane === 'agent' ? 'auto_agent' : 'auto_chat';
+      config.prefs[`${prefix}_endpoint_id`] = endpointId;
+      config.prefs[`${prefix}_model`] = model;
+      configController.applyIfCurrent(saveGeneration, config);
+    } else {
+      if (result.authoritative) configController.applyIfCurrent(saveGeneration, result.authoritative);
+      if (!result.authoritative) {
+        renderLane('chat');
+        renderLane('agent');
+      }
+      ui.status.dataset.status = 'error';
+      ui.status.textContent = result.status === 'invalid'
+        ? 'Choose a visible endpoint and model'
+        : 'Failed to save; settings reloaded';
+      announceConfig();
+    }
+    ui.endpoint.disabled = false;
+    ui.model.disabled = false;
+    if (ui.clear) ui.clear.disabled = false;
+  }
+
+  configController.initialize(() => Object.entries(controls).forEach(([lane, ui]) => {
+    if (!ui.endpoint || !ui.model) return;
+    ui.endpoint.addEventListener('change', () => {
+      // Endpoint changes intentionally leave the model blank. Never carry an
+      // incompatible model across endpoints or save a partial pair.
+      renderModels(lane, '');
+      ui.status.dataset.status = 'unconfigured';
+      ui.status.textContent = ui.endpoint.value ? 'Choose a model to save' : 'Not configured';
+    });
+    ui.model.addEventListener('change', () => {
+      if (!ui.endpoint.value || !ui.model.value) {
+        ui.status.dataset.status = 'unconfigured';
+        ui.status.textContent = 'Choose an endpoint and model';
+        return;
+      }
+      persist(lane, ui.endpoint.value, ui.model.value);
+    });
+    if (ui.clear) ui.clear.addEventListener('click', () => persist(lane, '', ''));
+  }));
+
+  await reload();
 }
 
 /* ── Utility Model ── */
@@ -2324,6 +2489,7 @@ function initAll() {
   initOpacityToggle();
   initialized = true;
   initDefaultChat();
+  initAutoRouting();
   initTeacherModel();
   initUtilityModel();
   initImageSettings();
@@ -5719,6 +5885,7 @@ function syncAdminVisibility() {
    PUBLIC API
    ═══════════════════════════════════════════ */
 export function open(tab) {
+  const wasInitialized = initialized;
   if (!initialized) initAll();
   syncAppearanceCheckboxes();
   if (modalEl.classList.contains('hidden')) {
@@ -5735,7 +5902,10 @@ export function open(tab) {
   const activeTab = tab || (modalEl.querySelector('[data-settings-tab].active') || {}).dataset?.settingsTab || 'services';
   document.body.classList.toggle('settings-appearance-open', activeTab === 'appearance');
   syncAppearanceOpacity(activeTab === 'appearance');
-  if (activeTab === 'ai') refreshAiModelEndpoints();
+  if (activeTab === 'ai') {
+    refreshAiModelEndpoints();
+    if (wasInitialized && _refreshAutoRoutingSettings) _refreshAutoRoutingSettings();
+  }
   if (ADMIN_TABS.has(activeTab) && window.adminModule && !window.adminModule._initialized) {
     window.adminModule._initData();
   }
