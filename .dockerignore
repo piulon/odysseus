@@ -52,3 +52,11 @@ timetree*.png
 .gitignore
 .env.save
 .env.prod
+
+# P0 security: exclude local and secret data
+.env.*
+*.backup-*
+*.bak
+*.bak-*
+data/
+logs/

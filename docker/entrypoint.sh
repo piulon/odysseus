@@ -29,6 +29,13 @@ fi
 ODY_USER="$(getent passwd "$PUID" | cut -d: -f1)"
 [ -z "$ODY_USER" ] && ODY_USER=odysseus
 
+# gosu changes UID/GID but intentionally preserves the caller environment.
+# Make the application user's HOME explicit so libraries never inherit
+# root's /root (or /) after the privilege drop.
+ODY_HOME="$(getent passwd "$PUID" | cut -d: -f6)"
+[ -z "$ODY_HOME" ] && ODY_HOME=/app
+export HOME="$ODY_HOME"
+
 # Docker-socket group plumbing for the explicit host-Docker overlay. When
 # opted in, the socket is owned by root:<host docker gid>. Add the app user
 # to that group and later call gosu by username so supplementary groups are
@@ -99,6 +106,11 @@ repair_app_tree_ownership
 for dir in /app/data /app/logs /app/.ssh /app/.cache/huggingface /app/.local; do
     repair_bind_mount_ownership "$dir"
 done
+
+# HOME is /app for the standard container user. Ensure its cache root itself
+# is writable without recursively changing ownership of any mounted cache.
+mkdir -p "$HOME/.cache"
+chown "$PUID:$PGID" "$HOME/.cache" 2>/dev/null || true
 
 # Cookbook installs vllm/etc. via `pip install --user`, which pulls
 # nvidia-cuda-* wheels into /app/.local but does not set CUDA_HOME or

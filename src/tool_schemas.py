@@ -89,6 +89,33 @@ FUNCTION_TOOL_SCHEMAS = [
             }
         }
     },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "homelab",
+            "description": "Inspect Homelab services through the read-only Homelab Operator API.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "status",
+                            "doctor",
+                            "service"
+                        ]
+                    },
+                    "service": {
+                        "type": "string",
+                        "description": "Service name when required."
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    },
+
     {
         "type": "function",
         "function": {
@@ -1353,6 +1380,8 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         tf = args.get("time_filter")
         if content and isinstance(tf, str) and tf in ("day", "week", "month", "year"):
             content = json.dumps({"query": content, "time_filter": tf})
+    elif tool_type == "homelab":
+        content = json.dumps(args) if args else "{}"
     elif tool_type == "read_file":
         # Plain path (back-compat) unless a line range is requested → JSON.
         if args.get("offset") or args.get("limit"):

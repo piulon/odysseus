@@ -16,7 +16,7 @@ FROM python:3.14-slim
 # downloads, and serves from Docker installs.
 # git/cmake are required when Cookbook builds llama.cpp on first llama.cpp
 # launch inside Docker.
-# nodejs/npm provide npx for the optional built-in Browser MCP server.
+# nodejs/npm install the pinned built-in Browser MCP package at image build time.
 # gosu lets the entrypoint drop privileges cleanly so signals still reach
 # uvicorn directly (no extra shell layer like `su`/`sudo` would add).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -49,6 +49,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # absent the import can block or raise, so keeping it image-only avoids
 # regressing pip/venv installs on hosts without libmagic. Debian always has the
 # lib here, so the import is instant and detection actually works.
+
+# Built-in Browser MCP.
+#
+# Install a pinned MCP binary globally at build time. Runtime executes the
+# local binary directly: no npm/npx resolution and no network dependency.
+ARG PLAYWRIGHT_MCP_VERSION=0.0.78
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+
+RUN npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" \
+    && PW="$(find "$(npm root -g)" \
+         -path "*/node_modules/.bin/playwright" -print -quit)" \
+    && test -n "$PW" \
+    && test -x "$PW" \
+    && DEBIAN_FRONTEND=noninteractive \
+       "$PW" install --with-deps --no-shell chromium \
+    && CHROME="$(find "$PLAYWRIGHT_BROWSERS_PATH" \
+         -type f -path "*/chrome-linux64/chrome" \
+         -perm /111 -print -quit)" \
+    && test -n "$CHROME" \
+    && ln -sf "$CHROME" /usr/local/bin/odysseus-chromium \
+    && playwright-mcp --version \
+    && /usr/local/bin/odysseus-chromium --version \
+    && chmod -R a+rX "$(npm root -g)" "$PLAYWRIGHT_BROWSERS_PATH" \
+    && rm -rf /root/.npm /var/lib/apt/lists/*
 
 # Docker CLI (client only — daemon stays on the host via the
 # /var/run/docker.sock mount). The Debian `docker.io` package ships

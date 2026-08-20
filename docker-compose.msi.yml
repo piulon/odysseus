@@ -1,3 +1,14 @@
+# Odysseus runtime for the MSI GT72VR node.
+#
+# The MSI is the persistent Odysseus application node:
+#   - Odysseus + ChromaDB + SearXNG + ntfy run in Docker.
+#   - Ollama runs natively on the MSI host and is reached through
+#     host.docker.internal.
+#   - Additional LLM hosts (for example the RTX 3080 tower) are discovered
+#     through LLM_HOSTS.
+#   - The GPU is intentionally not passed into the Odysseus container.
+#
+# Keep host-specific addresses and secrets in .env, not in this file.
 services:
   odysseus:
     build: .
@@ -22,13 +33,12 @@ services:
       # Ollama at http://host.docker.internal:11434.
       - "host.docker.internal:host-gateway"
     environment:
-      - LLM_HOST=${LLM_HOST:-localhost}
+      - LLM_HOST=${LLM_HOST:-host.docker.internal}
       - LLM_HOSTS=${LLM_HOSTS:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
-      - HOMELAB_OPERATOR_URL=http://homelab-operator:8765
-      - HOMELAB_OPERATOR_READ_TOKEN=${HOMELAB_OPERATOR_READ_TOKEN}
-      - HOMELAB_OPERATOR_ACTION_TOKEN=${HOMELAB_OPERATOR_ACTION_TOKEN:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      - HOMELAB_OPERATOR_URL=${HOMELAB_OPERATOR_URL:-}
+      - HOMELAB_OPERATOR_READ_TOKEN=${HOMELAB_OPERATOR_READ_TOKEN:-}
       - RESEARCH_LLM_ENDPOINT=${RESEARCH_LLM_ENDPOINT:-}
       - HF_TOKEN=${HF_TOKEN:-}
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
@@ -46,7 +56,7 @@ services:
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
       - FASTEMBED_MODEL=${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
-      - FASTEMBED_CACHE_PATH=/app/data/fastembed_cache
+      - FASTEMBED_CACHE_PATH=${FASTEMBED_CACHE_PATH:-/app/data/fastembed_cache}
       - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
       - ODYSSEUS_INPROCESS_POLLERS=${ODYSSEUS_INPROCESS_POLLERS:-1}
       - ODYSSEUS_INPROCESS_TASKS=${ODYSSEUS_INPROCESS_TASKS:-1}
@@ -78,11 +88,10 @@ services:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
     depends_on:
+      searxng:
+        condition: service_healthy
       chromadb:
         condition: service_started
-    networks:
-      - default
-      - ai_net
     restart: unless-stopped
 
   chromadb:
@@ -93,11 +102,61 @@ services:
       - ANONYMIZED_TELEMETRY=FALSE
     restart: unless-stopped
 
+  searxng:
+    # Pinned, not :latest — odysseus waits on searxng's healthcheck
+    # (depends_on: condition: service_healthy), so a broken upstream `latest`
+    # tag blocks the whole app from starting. 2026.6.2 crashes on boot with
+    # `KeyError: 'default_doi_resolver'`, failing the healthcheck (issue #1414).
+    # Bump this deliberately after verifying a newer tag boots clean.
+    image: docker.io/searxng/searxng:2026.5.31-7159b8aed
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        if [ ! -s /etc/searxng/settings.yml ] || grep -q 'odysseus-local-searxng-json-2026-05-30\|__SEARXNG_SECRET__' /etc/searxng/settings.yml; then
+          secret="$${SEARXNG_SECRET:-}"
+          if [ -z "$$secret" ]; then
+            secret="$$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
+          fi
+          sed "s|__SEARXNG_SECRET__|$$secret|g" /tmp/searxng-settings.yml.template > /etc/searxng/settings.yml
+        fi
+        exec /usr/local/searxng/entrypoint.sh
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - searxng-data:/etc/searxng
+      - ./config/searxng/settings.yml:/tmp/searxng-settings.yml.template:ro,z
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-}
+    # The official searxng image runs as the non-root `searxng` user, but its
+    # entrypoint still needs to chown /etc/searxng on first boot, drop privs via
+    # su-exec, and (with our wrapper above) write settings.yml into the named
+    # volume. Without these capabilities the wrapper aborts at the redirection
+    # with EACCES and the container fails its healthcheck with permission
+    # errors during setup. Mirrors the cap set recommended by the upstream
+    # searxng-docker compose file. See issue #721.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/', timeout=5).read(1)\""]
+      interval: 5s
+      timeout: 6s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
   ntfy:
     image: docker.io/binwiederhier/ntfy
     command: serve
     ports:
-      - "100.87.190.46:8091:80"
+      - "${ODYSSEUS_TAILSCALE_IP:?ODYSSEUS_TAILSCALE_IP is required}:8091:80"
     volumes:
       - ntfy-cache:/var/cache/ntfy
     environment:
@@ -105,9 +164,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  searxng-data:
   chromadb-data:
   ntfy-cache:
-
-networks:
-  ai_net:
-    external: true

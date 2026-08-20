@@ -24,12 +24,14 @@ def _format_mcp_connection_error(name: str, command: str = "", args: Optional[Li
     command_line = " ".join([command or "", *args]).strip()
     lower_command = command_line.lower()
 
-    if "@playwright/mcp" in lower_command:
+    if "playwright-mcp" in lower_command or "@playwright/mcp" in lower_command:
         return (
             f"{raw_error}\n\n"
-            "Browser MCP could not start. On fresh installs, cache the Playwright MCP package once before connecting:\n\n"
-            "npx -y @playwright/mcp@latest --version\n\n"
-            "Then restart Odysseus and reconnect the Browser MCP server."
+            "Browser MCP could not start. Verify that the Docker image contains "
+            "the pinned Browser MCP executable and Chromium:\n\n"
+            "playwright-mcp --version\n"
+            "/usr/local/bin/odysseus-chromium --version\n\n"
+            "Then restart Odysseus."
         )
 
     return raw_error
