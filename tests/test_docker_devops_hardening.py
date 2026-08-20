@@ -100,6 +100,38 @@ def test_docker_entrypoint_does_not_resolve_root_commands_from_app_local_path():
     assert final_exec > path_export
 
 
+def test_docker_entrypoint_fails_closed_when_setup_fails():
+    script = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+
+    setup_guard = (
+        'if ! "$GOSU_BIN" "$ODY_USER" "$PYTHON_BIN" /app/setup.py; then'
+    )
+
+    assert setup_guard in script
+    assert "/app/setup.py || true" not in script
+
+    start = script.index(setup_guard)
+    end = script.index(
+        'exec "$GOSU_BIN" "$ODY_USER" "$@"',
+        start,
+    )
+    setup_block = script[start:end]
+
+    assert 'exit 1' in setup_block
+    assert (
+        "refusing to start the application"
+        in setup_block
+    )
+    assert "unset ODYSSEUS_ADMIN_PASSWORD" in setup_block
+
+    unset_pos = setup_block.index(
+        "unset ODYSSEUS_ADMIN_PASSWORD"
+    )
+    guard_pos = setup_block.index(setup_guard)
+
+    assert guard_pos < unset_pos
+
+
 def test_docker_entrypoint_ownership_repair_stays_inside_expected_mounts():
     script = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
     assert "find /app -xdev" in script
@@ -121,6 +153,42 @@ def test_dockerignore_excludes_secrets_editor_backups():
         "**/#secrets.env#",
     } <= patterns
     assert "!secrets.env.example" in patterns
+
+
+def test_admin_bootstrap_docs_never_direct_users_to_password_logs():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    setup_doc = (ROOT / "docs" / "setup.md").read_text(encoding="utf-8")
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    docs = (readme + "\n" + setup_doc).lower()
+
+    stale_phrases = (
+        "first admin password is printed",
+        "prints a temporary password",
+        "generated admin password",
+        "for docker installs, the same line is in `docker compose logs odysseus`",
+        "use that for the first login",
+    )
+
+    for phrase in stale_phrases:
+        assert phrase not in docs
+
+    assert "odysseus_admin_password" in docs
+    assert "refuses to start" in readme.lower()
+    assert "never printed to logs" in readme.lower()
+
+    # Generic container-log inspection is legitimate operational
+    # troubleshooting. Only password-retrieval instructions are forbidden.
+    assert (
+        "docker compose logs odysseus | grep"
+        in setup_doc.lower()
+    )
+
+    assert (
+        "required if data/auth.json does not exist"
+        in env_example.lower()
+    )
+    assert "remove this variable from .env" in env_example.lower()
 
 
 def test_cors_allow_methods_include_patch():

@@ -34,7 +34,9 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open `http://localhost:7000` when the containers are healthy. The first admin password is printed in `docker compose logs odysseus`.
+Before the first unattended Docker boot, set `ODYSSEUS_ADMIN_PASSWORD` in `.env` or the deployment environment. If `data/auth.json` does not yet exist and no password is supplied, Odysseus refuses to start. The bootstrap password is never printed to logs.
+
+After the first successful boot, remove `ODYSSEUS_ADMIN_PASSWORD` from `.env` and recreate the Odysseus container. Existing `auth.json` installations do not need the bootstrap password again.
 
 Native installs, GPU notes, Windows/macOS instructions, HTTPS, and configuration live in the [setup guide](docs/setup.md).
 

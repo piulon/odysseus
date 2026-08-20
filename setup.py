@@ -97,27 +97,42 @@ def create_default_admin():
         import bcrypt
         import json
 
-        # Priority: env vars > interactive prompt > random password
+        # Priority: explicit environment credentials > interactive prompt.
+        #
+        # Non-interactive first boot is deliberately fail-closed: generating a
+        # password here would require exposing it somewhere for the operator to
+        # retrieve it, and stdout/stderr are persisted by Docker logging.
         username = os.getenv("ODYSSEUS_ADMIN_USER", "").strip().lower()
         password = os.getenv("ODYSSEUS_ADMIN_PASSWORD", "").strip()
 
-        if username and password:
-            # Both provided via env — validate before using
-            if username in RESERVED_USERNAMES:
-                print(f"  [error] ODYSSEUS_ADMIN_USER '{username}' is a reserved username")
-                return "failed"
-            if len(password) < PASSWORD_MIN_LENGTH:
-                print(f"  [error] ODYSSEUS_ADMIN_PASSWORD must be at least {PASSWORD_MIN_LENGTH} characters")
-                return "failed"
+        if password:
+            username = username or "admin"
         elif sys.stdin.isatty() and not os.getenv("ODYSSEUS_SKIP_ADMIN_PROMPT"):
-            # Interactive terminal — ask the user
             username, password = _prompt_admin_credentials()
         else:
-            # Non-interactive (Docker, CI) — fall back to generated password
-            username = username or "admin"
-            password = password or __import__("secrets").token_urlsafe(18)
+            print(
+                "  [error] ODYSSEUS_ADMIN_PASSWORD is required for "
+                "non-interactive first-time setup."
+            )
+            print(
+                "          Set it before starting Odysseus; unattended setup "
+                "will not generate or log an admin password."
+            )
+            return "failed"
 
         username = username or "admin"
+
+        if username in RESERVED_USERNAMES:
+            print(f"  [error] ODYSSEUS_ADMIN_USER '{username}' is a reserved username")
+            return "failed"
+
+        if len(password) < PASSWORD_MIN_LENGTH:
+            print(
+                f"  [error] ODYSSEUS_ADMIN_PASSWORD must be at least "
+                f"{PASSWORD_MIN_LENGTH} characters"
+            )
+            return "failed"
+
         hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
         auth_data = {
             "users": {
@@ -134,9 +149,6 @@ def create_default_admin():
             print(f"  [ok] Admin account created ({username})")
         else:
             print(f"  [ok] Initial admin user created ({username})")
-            if not os.getenv("ODYSSEUS_ADMIN_PASSWORD"):
-                print(f"        Temporary password: {password}")
-                print(f"        ** Change it after first login. Set ODYSSEUS_ADMIN_PASSWORD to choose your own. **")
         return "created"
     except ImportError as e:
         if "incompatible architecture" in str(e).lower():
@@ -298,6 +310,8 @@ def main():
     else:  # handling "failed" or any unhandled edge case
         print("Admin creation did not happen: a system or file error occurred.\nCheck write permissions for the 'data' directory and rerun setup.\n")
 
+    return 0 if admin_status in ("created", "exists") else 1
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

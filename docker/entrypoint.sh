@@ -148,9 +148,17 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 export PATH="/app/.local/bin:$PATH"
 
 # Run first-time setup as the app user so data/ files get the right ownership.
-# setup.py is idempotent — skips auth.json / .env if they already exist.
-# || true so a setup failure never prevents the container from starting.
-"$GOSU_BIN" "$ODY_USER" "$PYTHON_BIN" /app/setup.py || true
+# setup.py is idempotent — existing auth.json installations continue normally.
+# First-time unattended bootstrap is security-critical, so setup failure must
+# prevent the application from starting.
+if ! "$GOSU_BIN" "$ODY_USER" "$PYTHON_BIN" /app/setup.py; then
+    echo "Odysseus setup failed; refusing to start the application." >&2
+    exit 1
+fi
+
+# The bootstrap credential is no longer needed once auth.json exists. Do not
+# expose it to the long-running application or any subprocess it launches.
+unset ODYSSEUS_ADMIN_PASSWORD
 
 # Drop root and run the actual app. `gosu` is preferred over `su` /
 # `sudo` because it cleans up the process tree (no extra shell layer)
