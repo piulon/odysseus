@@ -191,6 +191,103 @@ def test_admin_bootstrap_docs_never_direct_users_to_password_logs():
     assert "remove this variable from .env" in env_example.lower()
 
 
+def test_nightly_skill_audit_is_opt_in_by_default():
+    import ast
+
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    calls = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        if not isinstance(node.func, ast.Name):
+            continue
+
+        if node.func.id != "get_setting":
+            continue
+
+        if not node.args:
+            continue
+
+        first = node.args[0]
+
+        if (
+            isinstance(first, ast.Constant)
+            and first.value == "skill_audit_nightly"
+        ):
+            calls.append(node)
+
+    assert len(calls) == 1
+
+    call = calls[0]
+
+    assert len(call.args) >= 2
+    assert isinstance(call.args[1], ast.Constant)
+    assert call.args[1].value is False
+
+    # Preserve the execution gate: false/default skips the autonomous
+    # nightly call; an explicitly truthy setting allows execution.
+    assert (
+        'if not get_setting("skill_audit_nightly", False):'
+        in source
+    )
+    assert (
+        'get_setting("skill_audit_nightly", True)'
+        not in source
+    )
+
+
+def test_manual_skill_audit_is_independent_of_nightly_gate():
+    import ast
+
+    source = (
+        ROOT / "routes" / "skills_routes.py"
+    ).read_text(encoding="utf-8")
+
+    tree = ast.parse(source)
+
+    functions = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "run_scheduled_skill_audit"
+        )
+    ]
+
+    assert len(functions) == 1
+
+    function = functions[0]
+
+    nightly_gate_calls = []
+
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+
+        if not isinstance(node.func, ast.Name):
+            continue
+
+        if node.func.id != "get_setting":
+            continue
+
+        if not node.args:
+            continue
+
+        first = node.args[0]
+
+        if (
+            isinstance(first, ast.Constant)
+            and first.value == "skill_audit_nightly"
+        ):
+            nightly_gate_calls.append(node)
+
+    assert nightly_gate_calls == []
+
+
 def test_cors_allow_methods_include_patch():
     methods = _cors_allow_methods()
     assert "PATCH" in methods
