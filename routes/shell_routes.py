@@ -855,6 +855,66 @@ async def _generate_win_detached(cmd: str, request: Request):
             pass
 
 
+_REALESRGAN_WHEELHOUSE = "/opt/odysseus-wheelhouse"
+
+_REALESRGAN_PATCHED_WHEELS = (
+    "basicsr-1.4.2-py3-none-any.whl",
+    "facexlib-0.3.0-py3-none-any.whl",
+    "gfpgan-1.3.8-py3-none-any.whl",
+)
+
+
+def _pip_install_argv(
+    python_executable: str,
+    pip_name: str,
+    *,
+    wheelhouse: str = _REALESRGAN_WHEELHOUSE,
+) -> list[str]:
+    """Build the argv for an allowlisted Cookbook pip install.
+
+    Real-ESRGAN's released basicsr/facexlib/gfpgan sdists fail to build on
+    Python 3.14. Docker images contain deterministic patched wheels for those
+    exact releases. Supply them explicitly when available instead of globally
+    installing incomplete distributions into the base runtime or globally
+    changing pip's package search path.
+    """
+    import os as _os
+
+    cmd = [
+        python_executable,
+        "-m",
+        "pip",
+        "install",
+    ]
+
+    if pip_name in {"realesrgan", "gfpgan"}:
+        wheels = [
+            _os.path.join(
+                wheelhouse,
+                filename,
+            )
+            for filename
+            in _REALESRGAN_PATCHED_WHEELS
+        ]
+
+        if all(
+            _os.path.isfile(wheel)
+            for wheel in wheels
+        ):
+            cmd.extend(wheels)
+
+            # gfpgan itself is already one of the exact local wheels.
+            # RealESRGAN remains index-resolved, with its three problematic
+            # helper distributions pinned by the explicit local wheel args.
+            if pip_name == "realesrgan":
+                cmd.append(pip_name)
+
+            return cmd
+
+    cmd.append(pip_name)
+    return cmd
+
+
 def setup_shell_routes() -> APIRouter:
     router = APIRouter(tags=["shell"])
 
@@ -1604,7 +1664,7 @@ def setup_shell_routes() -> APIRouter:
         }
         if pip_name not in known:
             return {"ok": False, "error": f"Unknown package: {pip_name}"}
-        cmd = [_sys.executable, "-m", "pip", "install", pip_name]
+        cmd = _pip_install_argv(_sys.executable, pip_name)
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )

@@ -269,14 +269,22 @@ RUN PYTHON_MAGIC_WHEEL=/tmp/python_magic-0.4.27-py2.py3-none-any.whl \
     && python -m pip check \
     && rm -f "$PYTHON_MAGIC_WHEEL"
 
-# Pre-install the patched basicsr/gfpgan/facexlib wheels built in the
-# realesrgan-wheels stage (--no-deps keeps the image lean — torch & friends are
-# pulled only when realesrgan is actually installed). With these dists already
-# satisfied, the Cookbook's plain `pip install realesrgan` resolves them from
-# wheels instead of rebuilding the sdists that fail on Python 3.14.
-COPY --from=realesrgan-wheels /wheels/ /tmp/odysseus-wheels/
-RUN pip install --no-cache-dir --no-deps /tmp/odysseus-wheels/*.whl \
-    && rm -rf /tmp/odysseus-wheels
+# Keep the deterministic Python-3.14-compatible Real-ESRGAN helper wheels in
+# an immutable image wheelhouse, but do NOT install them into the base Python
+# environment. Installing them with --no-deps leaves their declared
+# torch/torchvision/OpenCV/SciPy/etc. requirements unsatisfied and makes
+# `pip check` fail before the user has even enabled Real-ESRGAN.
+#
+# The Cookbook installer explicitly supplies these exact local wheels when the
+# user requests realesrgan/gfpgan. Their heavy dependencies are resolved only
+# at that point.
+COPY --from=realesrgan-wheels /wheels/ /opt/odysseus-wheelhouse/
+RUN test -f /opt/odysseus-wheelhouse/basicsr-1.4.2-py3-none-any.whl \
+    && test -f /opt/odysseus-wheelhouse/facexlib-0.3.0-py3-none-any.whl \
+    && test -f /opt/odysseus-wheelhouse/gfpgan-1.3.8-py3-none-any.whl \
+    && test "$(find /opt/odysseus-wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 3 \
+    && chmod -R a+rX /opt/odysseus-wheelhouse \
+    && python -m pip check
 
 # Copy app code
 # Copy only the application runtime surface.
