@@ -34,15 +34,16 @@ GFPGAN_URL='https://files.pythonhosted.org/packages/6b/e9/b2db24ed840f188792581d
 GFPGAN_SHA256='21618b06ce8ea6230448cb526b012004f23a9ab956b55c833f69b9fc8a60c4f9'
 
 REALESRGAN_WHEEL_URL='https://files.pythonhosted.org/packages/b2/3e/e2f79917a04991b9237df264f7abab2b58cf94748e7acfb6677b55232ca1/realesrgan-0.3.0-py3-none-any.whl'
-REALESRGAN_WHEEL_SHA256='59336c16c30dd5130eff350dd27424acb9b7281d18a6810130e265606c9a6088'
+REALESRGAN_UPSTREAM_WHEEL_SHA256='59336c16c30dd5130eff350dd27424acb9b7281d18a6810130e265606c9a6088'
+REALESRGAN_WHEEL_SHA256='45331f0447ae90355a70872c13b114e640c17200255ff0b2607a0a0f03e60ad4'
 REALESRGAN_WHEEL_SIZE=26012
 
 SETUPTOOLS_URL='https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/setuptools-83.0.0-py3-none-any.whl'
 SETUPTOOLS_SHA256='29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3'
 
-BASICSR_WHEEL_SHA256='148ebcf7ebd20c09dc94a639bdcb3b5a057509e8ac5d8a4d56b376d07c61d254'
-FACEXLIB_WHEEL_SHA256='457a3b58869a488b78ae6c3eea852791fd419950a9875e0544f8d80670f4cb0d'
-GFPGAN_WHEEL_SHA256='c8ef4b9aa0c6b82fffdfc464d99f1e48cd086f75e9a09257e507eea31e78b89c'
+BASICSR_WHEEL_SHA256='783bc54ecc749073ba4df9b37559a36e6e25d8bd14831b7763d8ca92d5021fe9'
+FACEXLIB_WHEEL_SHA256='29cc2a9055d7859e38364c5c5868012d93b419e342b947d37288406857dc2ec7'
+GFPGAN_WHEEL_SHA256='4b8ac56147daaa226c9def62fa65ac9727f608c1aef4af02bace4b943a256f27'
 
 # The output must contain only artifacts produced by this invocation.
 rm -rf -- "$OUT"
@@ -65,7 +66,7 @@ test "$(
   stat     --printf='%s'     "$input/realesrgan-0.3.0-py3-none-any.whl"
 )" -eq "$REALESRGAN_WHEEL_SIZE"
 
-printf '%s  %s\n'   "$REALESRGAN_WHEEL_SHA256"   "$input/realesrgan-0.3.0-py3-none-any.whl"   | sha256sum -c -
+printf '%s  %s\n'   "$REALESRGAN_UPSTREAM_WHEEL_SHA256"   "$input/realesrgan-0.3.0-py3-none-any.whl"   | sha256sum -c -
 
 
 echo ">> downloading fixed source artifacts"
@@ -389,6 +390,628 @@ export PYTHONDONTWRITEBYTECODE=1
 echo ">> publishing verified Real-ESRGAN main wheel"
 
 install   -m 0644   "$input/realesrgan-0.3.0-py3-none-any.whl"   "$OUT/realesrgan-0.3.0-py3-none-any.whl"
+
+echo ">> normalizing inference-only wheels"
+
+python - "$OUT" <<'PY_NORMALIZE'
+from __future__ import annotations
+
+from pathlib import Path
+import base64
+import csv
+import datetime
+import hashlib
+import io
+import os
+import re
+import tempfile
+import zipfile
+import sys
+
+
+root = Path(
+    sys.argv[1]
+)
+
+FORBIDDEN = {
+    "addict",
+    "filterpy",
+    "future",
+    "lmdb",
+    "numba",
+    "scikit-image",
+    "scipy",
+    "tb-nightly",
+    "yapf",
+}
+
+
+def canonical(
+    name: str,
+) -> str:
+    return (
+        name
+        .lower()
+        .replace("_", "-")
+        .replace(".", "-")
+    )
+
+
+def requirement_names(
+    metadata: bytes,
+) -> list[str]:
+    names = []
+
+    text = metadata.decode(
+        "utf-8"
+    )
+
+    for line in text.splitlines():
+        match = re.match(
+            r"^Requires-Dist:\s*"
+            r"([A-Za-z0-9_.-]+)",
+            line,
+        )
+
+        if match:
+            names.append(
+                canonical(
+                    match.group(1)
+                )
+            )
+
+    return names
+
+
+def rewrite_requires(
+    metadata: bytes,
+    requirements: list[str],
+) -> bytes:
+    text = metadata.decode(
+        "utf-8"
+    )
+
+    ended_newline = text.endswith(
+        "\n"
+    )
+
+    lines = text.splitlines()
+
+    try:
+        separator = lines.index(
+            ""
+        )
+    except ValueError:
+        raise RuntimeError(
+            "METADATA has no header/body separator"
+        )
+
+    headers = lines[
+        :separator
+    ]
+
+    body = lines[
+        separator + 1:
+    ]
+
+    headers = [
+        line
+        for line in headers
+        if not line.startswith(
+            "Requires-Dist:"
+        )
+    ]
+
+    headers.extend(
+        f"Requires-Dist: {item}"
+        for item in requirements
+    )
+
+    rebuilt = "\n".join(
+        headers
+        + [""]
+        + body
+    )
+
+    if ended_newline:
+        rebuilt += "\n"
+
+    return rebuilt.encode(
+        "utf-8"
+    )
+
+
+def record_hash(
+    payload: bytes,
+) -> str:
+    digest = hashlib.sha256(
+        payload
+    ).digest()
+
+    encoded = base64.urlsafe_b64encode(
+        digest
+    ).rstrip(
+        b"="
+    ).decode(
+        "ascii"
+    )
+
+    return (
+        "sha256="
+        + encoded
+    )
+
+
+def normalized_datetime():
+    raw_epoch = int(
+        os.environ.get(
+            "SOURCE_DATE_EPOCH",
+            "315532800",
+        )
+    )
+
+    # ZIP timestamps cannot represent dates before 1980.
+    epoch = max(
+        raw_epoch,
+        315532800,
+    )
+
+    stamp = datetime.datetime.fromtimestamp(
+        epoch,
+        tz=datetime.timezone.utc,
+    )
+
+    return (
+        stamp.year,
+        stamp.month,
+        stamp.day,
+        stamp.hour,
+        stamp.minute,
+        stamp.second,
+    )
+
+
+POLICY = {
+    "basicsr-1.4.2-py3-none-any.whl": {
+        "exact_files": {
+            "basicsr/__init__.py": (
+                "# https://github.com/xinntao/BasicSR\n"
+                "# flake8: noqa\n"
+                "from .archs import *\n"
+                "from .data import *\n"
+                "from .losses import *\n"
+                "from .metrics import *\n"
+                "from .models import *\n"
+                "from .ops import *\n"
+                "from .test import *\n"
+                "from .train import *\n"
+                "from .utils import *\n"
+                "from .version import __gitsha__, __version__\n"
+            ),
+        },
+        "replace_files": {
+            "basicsr/__init__.py": (
+                "# https://github.com/xinntao/BasicSR\n"
+                "# flake8: noqa\n"
+                "from .version import __gitsha__, __version__\n"
+            ),
+        },
+        "empty_arch_init": (
+            "basicsr/archs/__init__.py",
+        ),
+        "requirements": [
+            "numpy>=1.17",
+            "opencv-python",
+            "Pillow",
+            "pyyaml",
+            "requests",
+            "torch>=1.7",
+            "torchvision",
+            "tqdm",
+        ],
+    },
+
+    "facexlib-0.3.0-py3-none-any.whl": {
+        "exact_files": {
+            "facexlib/__init__.py": (
+                "# flake8: noqa\n"
+                "from .alignment import *\n"
+                "from .detection import *\n"
+                "from .recognition import *\n"
+                "from .tracking import *\n"
+                "from .utils import *\n"
+                "from .version import __gitsha__, __version__\n"
+                "from .visualization import *\n"
+            ),
+        },
+        "replace_files": {
+            "facexlib/__init__.py": (
+                "# flake8: noqa\n"
+                "from .version import __gitsha__, __version__\n"
+            ),
+        },
+        "empty_arch_init": (),
+        "requirements": [
+            "numpy",
+            "opencv-python",
+            "Pillow",
+            "torch",
+            "torchvision",
+            "tqdm",
+        ],
+    },
+
+    "gfpgan-1.3.8-py3-none-any.whl": {
+        "exact_files": {
+            "gfpgan/__init__.py": (
+                "# flake8: noqa\n"
+                "from .archs import *\n"
+                "from .data import *\n"
+                "from .models import *\n"
+                "from .utils import *\n"
+                "\n"
+                "# from .version import *\n"
+            ),
+        },
+        "replace_files": {
+            "gfpgan/__init__.py": (
+                "# flake8: noqa\n"
+                "from .utils import GFPGANer\n"
+            ),
+        },
+        "empty_arch_init": (
+            "gfpgan/archs/__init__.py",
+        ),
+        "requirements": [
+            "basicsr>=1.4.2",
+            "facexlib>=0.2.5",
+            "numpy",
+            "opencv-python",
+            "pyyaml",
+            "torch>=1.7",
+            "torchvision",
+            "tqdm",
+        ],
+    },
+
+    "realesrgan-0.3.0-py3-none-any.whl": {
+        "exact_files": {
+            "realesrgan/__init__.py": (
+                "# flake8: noqa\n"
+                "from .archs import *\n"
+                "from .data import *\n"
+                "from .models import *\n"
+                "from .utils import *\n"
+                "from .version import *\n"
+            ),
+        },
+        "replace_files": {
+            "realesrgan/__init__.py": (
+                "# flake8: noqa\n"
+                "from .utils import RealESRGANer\n"
+                "from .version import *\n"
+            ),
+        },
+        "empty_arch_init": (
+            "realesrgan/archs/__init__.py",
+        ),
+        "requirements": None,
+    },
+}
+
+
+expected_names = set(
+    POLICY
+)
+
+actual_names = {
+    item.name
+    for item in root.glob(
+        "*.whl"
+    )
+}
+
+if actual_names != expected_names:
+    raise RuntimeError(
+        "unexpected wheel set: "
+        f"{sorted(actual_names)}"
+    )
+
+
+for wheel_name, policy in POLICY.items():
+    wheel = root / wheel_name
+
+    print(
+        f">> normalize {wheel.name}"
+    )
+
+    with zipfile.ZipFile(
+        wheel,
+        "r",
+    ) as archive:
+
+        infos = {
+            item.filename: item
+            for item in archive.infolist()
+            if not item.is_dir()
+        }
+
+        payloads = {
+            name: archive.read(
+                name
+            )
+            for name in infos
+        }
+
+    metadata_names = [
+        name
+        for name in payloads
+        if name.endswith(
+            ".dist-info/METADATA"
+        )
+    ]
+
+    record_names = [
+        name
+        for name in payloads
+        if name.endswith(
+            ".dist-info/RECORD"
+        )
+    ]
+
+    if len(metadata_names) != 1:
+        raise RuntimeError(
+            f"{wheel_name}: unexpected METADATA count"
+        )
+
+    if len(record_names) != 1:
+        raise RuntimeError(
+            f"{wheel_name}: unexpected RECORD count"
+        )
+
+    metadata_name = metadata_names[0]
+    record_name = record_names[0]
+
+    for member, expected_text in policy[
+        "exact_files"
+    ].items():
+
+        actual = payloads[
+            member
+        ].decode(
+            "utf-8"
+        )
+
+        if actual != expected_text:
+            raise RuntimeError(
+                f"{wheel_name}: unexpected source bytes "
+                f"for {member}"
+            )
+
+    for member, replacement in policy[
+        "replace_files"
+    ].items():
+
+        payloads[
+            member
+        ] = replacement.encode(
+            "utf-8"
+        )
+
+    for member in policy[
+        "empty_arch_init"
+    ]:
+        original = payloads[
+            member
+        ].decode(
+            "utf-8"
+        )
+
+        if (
+            "importlib.import_module"
+            not in original
+            or "_arch.py"
+            not in original
+        ):
+            raise RuntimeError(
+                f"{wheel_name}: dynamic arch initializer "
+                f"contract changed: {member}"
+            )
+
+        payloads[
+            member
+        ] = (
+            "# Odysseus inference-only wheel.\n"
+            "# Architecture modules are imported explicitly.\n"
+        ).encode(
+            "utf-8"
+        )
+
+    requirements = policy[
+        "requirements"
+    ]
+
+    if requirements is not None:
+        payloads[
+            metadata_name
+        ] = rewrite_requires(
+            payloads[
+                metadata_name
+            ],
+            requirements,
+        )
+
+    names = requirement_names(
+        payloads[
+            metadata_name
+        ]
+    )
+
+    forbidden_present = (
+        set(names)
+        & FORBIDDEN
+    )
+
+    if forbidden_present:
+        raise RuntimeError(
+            f"{wheel_name}: forbidden production dependencies: "
+            f"{sorted(forbidden_present)}"
+        )
+
+    if requirements is not None:
+        expected_requirements = [
+            canonical(
+                re.match(
+                    r"([A-Za-z0-9_.-]+)",
+                    item,
+                ).group(1)
+            )
+            for item in requirements
+        ]
+
+        if names != expected_requirements:
+            raise RuntimeError(
+                f"{wheel_name}: normalized dependency "
+                "metadata mismatch"
+            )
+
+    payloads.pop(
+        record_name,
+        None,
+    )
+
+    output = io.StringIO()
+
+    writer = csv.writer(
+        output,
+        lineterminator="\n",
+    )
+
+    for name in sorted(
+        payloads
+    ):
+        data = payloads[
+            name
+        ]
+
+        writer.writerow(
+            [
+                name,
+                record_hash(
+                    data
+                ),
+                str(
+                    len(data)
+                ),
+            ]
+        )
+
+    writer.writerow(
+        [
+            record_name,
+            "",
+            "",
+        ]
+    )
+
+    payloads[
+        record_name
+    ] = output.getvalue().encode(
+        "utf-8"
+    )
+
+    stamp = normalized_datetime()
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=wheel.name + ".",
+        suffix=".tmp",
+        dir=root,
+    )
+
+    os.close(
+        fd
+    )
+
+    tmp = Path(
+        tmp_name
+    )
+
+    try:
+        with zipfile.ZipFile(
+            tmp,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+            allowZip64=True,
+        ) as archive:
+
+            for name in sorted(
+                payloads
+            ):
+                data = payloads[
+                    name
+                ]
+
+                original = infos.get(
+                    name
+                )
+
+                info = zipfile.ZipInfo(
+                    filename=name,
+                    date_time=stamp,
+                )
+
+                info.create_system = 3
+                info.compress_type = (
+                    zipfile.ZIP_DEFLATED
+                )
+
+                if original is not None:
+                    info.external_attr = (
+                        original.external_attr
+                    )
+                else:
+                    info.external_attr = (
+                        0o100644
+                        << 16
+                    )
+
+                info.extra = b""
+                info.comment = b""
+
+                archive.writestr(
+                    info,
+                    data,
+                    compress_type=zipfile.ZIP_DEFLATED,
+                    compresslevel=9,
+                )
+
+        os.chmod(
+            tmp,
+            0o644,
+        )
+
+        os.replace(
+            tmp,
+            wheel,
+        )
+
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+print(
+    "inference_only_wheel_normalization = 1"
+)
+
+print(
+    "pruned_dependency_names =",
+    sorted(FORBIDDEN),
+)
+PY_NORMALIZE
 
 echo ">> verifying final wheel identities"
 

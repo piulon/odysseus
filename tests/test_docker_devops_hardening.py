@@ -649,14 +649,14 @@ def test_facexlib_gfpgan_runtime_models_are_fail_closed():
     ).read_text()
 
     assert (
-        "457a3b58869a488b78ae6c3eea852791"
-        "fd419950a9875e0544f8d80670f4cb0d"
+        "29cc2a9055d7859e38364c5c5868012"
+        "d93b419e342b947d37288406857dc2ec7"
         in builder
     )
 
     assert (
-        "c8ef4b9aa0c6b82fffdfc464d99f1e48"
-        "cd086f75e9a09257e507eea31e78b89c"
+        "4b8ac56147daaa226c9def62fa65ac972"
+        "7f608c1aef4af02bace4b943a256f27"
         in builder
     )
 
@@ -743,4 +743,138 @@ def test_facexlib_gfpgan_runtime_models_are_fail_closed():
     assert (
         "provision_facexlib_models"
         in shell
+    )
+
+def test_realesrgan_wheels_are_normalized_for_inference():
+    from pathlib import Path
+
+    repo = Path(
+        __file__
+    ).resolve().parents[1]
+
+    builder = (
+        repo
+        / "docker"
+        / "build-realesrgan-wheels.sh"
+    ).read_text(
+        encoding="utf-8"
+    )
+
+    dockerfile = (
+        repo
+        / "Dockerfile"
+    ).read_text(
+        encoding="utf-8"
+    )
+
+    final_hashes = {
+        "BASICSR_WHEEL_SHA256":
+            "783bc54ecc749073ba4df9b37559a36e6e25d8bd14831b7763d8ca92d5021fe9",
+
+        "FACEXLIB_WHEEL_SHA256":
+            "29cc2a9055d7859e38364c5c5868012d93b419e342b947d37288406857dc2ec7",
+
+        "GFPGAN_WHEEL_SHA256":
+            "4b8ac56147daaa226c9def62fa65ac9727f608c1aef4af02bace4b943a256f27",
+
+        "REALESRGAN_WHEEL_SHA256":
+            "45331f0447ae90355a70872c13b114e640c17200255ff0b2607a0a0f03e60ad4",
+    }
+
+    for variable, digest in final_hashes.items():
+        assert (
+            f"{variable}='{digest}'"
+            in builder
+        )
+
+        # Wheel identities live in one place: the builder.
+        assert digest not in dockerfile
+
+    upstream_realesrgan = (
+        "59336c16c30dd5130eff350dd27424ac"
+        "b9b7281d18a6810130e265606c9a6088"
+    )
+
+    assert (
+        "REALESRGAN_UPSTREAM_WHEEL_SHA256="
+        f"'{upstream_realesrgan}'"
+        in builder
+    )
+
+    assert (
+        '"$REALESRGAN_UPSTREAM_WHEEL_SHA256"'
+        in builder
+    )
+
+    assert (
+        '"$input/realesrgan-0.3.0-py3-none-any.whl"'
+        in builder
+    )
+
+    assert (
+        "inference_only_wheel_normalization = 1"
+        in builder
+    )
+
+    assert (
+        "Architecture modules are imported explicitly"
+        in builder
+    )
+
+    assert (
+        "from .utils import GFPGANer"
+        in builder
+    )
+
+    assert (
+        "from .utils import RealESRGANer"
+        in builder
+    )
+
+    for dependency in (
+        '"addict"',
+        '"filterpy"',
+        '"future"',
+        '"lmdb"',
+        '"numba"',
+        '"scikit-image"',
+        '"scipy"',
+        '"tb-nightly"',
+        '"yapf"',
+    ):
+        assert dependency in builder
+
+    assert (
+        "os.chmod("
+        in builder
+    )
+
+    assert "0o644" in builder
+
+    # The production builder must fail closed on final artifact drift.
+    assert (
+        'sha256sum -c "$work/wheels.sha256"'
+        in builder
+    )
+
+    assert (
+        "disposable normalized output hashes"
+        not in builder
+    )
+
+    # Docker delegates wheel production/integrity to the single builder.
+    assert (
+        "RUN bash /usr/local/bin/build-realesrgan-wheels.sh /wheels"
+        in dockerfile
+    )
+
+    assert (
+        "COPY --from=realesrgan-wheels /wheels/ "
+        "/opt/odysseus-wheelhouse/"
+        in dockerfile
+    )
+
+    assert (
+        "chmod -R a+rX /opt/odysseus-wheelhouse"
+        in dockerfile
     )

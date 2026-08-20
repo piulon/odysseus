@@ -269,12 +269,10 @@ RUN PYTHON_MAGIC_WHEEL=/tmp/python_magic-0.4.27-py2.py3-none-any.whl \
     && python -m pip check \
     && rm -f "$PYTHON_MAGIC_WHEEL"
 
-# Keep the deterministic Python-3.14-compatible helper wheels plus the exact
-# upstream Real-ESRGAN wheel in an immutable image wheelhouse, but do NOT
-# install them into the base Python
-# environment. Installing them with --no-deps leaves their declared
-# torch/torchvision/OpenCV/SciPy/etc. requirements unsatisfied and makes
-# `pip check` fail before the user has even enabled Real-ESRGAN.
+# Keep the deterministic Python-3.14-compatible inference-only wheels in an
+# immutable image wheelhouse, but do NOT install them into the base Python
+# environment. Their torch/torchvision/OpenCV/etc. runtime dependencies remain
+# optional until the user explicitly enables the image inference stack.
 #
 # The Cookbook installer explicitly supplies these exact local wheels when the
 # user requests realesrgan/gfpgan. Their heavy dependencies are resolved only
