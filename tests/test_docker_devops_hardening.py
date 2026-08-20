@@ -498,6 +498,103 @@ def test_realesrgan_main_package_is_pinned_in_local_wheelhouse():
     )
 
 
+def test_gallery_gfpgan_uses_only_verified_local_checkpoint():
+    import ast
+
+    gallery = (
+        ROOT
+        / "routes"
+        / "gallery"
+        / "gallery_routes.py"
+    ).read_text(encoding="utf-8")
+
+    constants = (
+        ROOT
+        / "src"
+        / "constants.py"
+    ).read_text(encoding="utf-8")
+
+    models = (
+        ROOT
+        / "src"
+        / "realesrgan_models.py"
+    ).read_text(encoding="utf-8")
+
+    installer = (
+        ROOT
+        / "routes"
+        / "shell_routes.py"
+    ).read_text(encoding="utf-8")
+
+    tree = ast.parse(gallery)
+
+    calls = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+        else:
+            continue
+
+        if name == "GFPGANer":
+            calls.append(node)
+
+    assert len(calls) == 1
+
+    model_args = [
+        keyword
+        for keyword in calls[0].keywords
+        if keyword.arg == "model_path"
+    ]
+
+    assert len(model_args) == 1
+
+    expression = ast.get_source_segment(
+        gallery,
+        model_args[0].value,
+    )
+
+    assert expression
+    assert "http://" not in expression
+    assert "https://" not in expression
+
+    assert (
+        "TencentARC/GFPGAN/releases/download"
+        not in gallery
+    )
+
+    assert "verified_gfpgan_model" in gallery
+
+    assert (
+        'GFPGAN_MODELS_DIR = '
+        'os.path.join(DATA_DIR, "models", "gfpgan")'
+        in constants
+    )
+
+    # The production SHA-256 is split across adjacent Python string
+    # literals in the model spec, so source-text checks verify both halves.
+    # Runtime tests independently assert the exact concatenated digest.
+    assert (
+        "e2cd4703ab14f4d01fd1383a8a8b266f"
+        in models
+    )
+
+    assert (
+        "9a5833dacee8e6a79d3bf21a1b6be5ad"
+        in models
+    )
+
+    assert (
+        "provision_gfpgan_model"
+        in installer
+    )
+
+
 def test_cors_allow_methods_include_patch():
     methods = _cors_allow_methods()
     assert "PATCH" in methods

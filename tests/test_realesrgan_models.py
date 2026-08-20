@@ -246,3 +246,211 @@ def test_provision_rejects_wrong_download(
     assert not (
         tmp_path / spec.name
     ).exists()
+
+
+def test_gfpgan_production_spec_matches_audited_checkpoint():
+    spec = models.GFPGAN_MODEL_SPEC
+
+    assert spec.name == "GFPGANv1.4.pth"
+
+    assert spec.size == 348_632_874
+
+    assert spec.sha256 == (
+        "e2cd4703ab14f4d01fd1383a8a8b266f"
+        "9a5833dacee8e6a79d3bf21a1b6be5ad"
+    )
+
+    assert spec.url == (
+        "https://github.com/TencentARC/GFPGAN/"
+        "releases/download/v1.3.0/GFPGANv1.4.pth"
+    )
+
+
+def test_verified_gfpgan_model_accepts_exact_file(
+    tmp_path,
+    monkeypatch,
+):
+    payload = b"known-gfpgan-checkpoint"
+
+    spec = models.RealESRGANModelSpec(
+        name="GFPGANv1.4.pth",
+        url=(
+            "https://github.com/example/project/"
+            "releases/download/v1/GFPGANv1.4.pth"
+        ),
+        size=len(payload),
+        sha256=hashlib.sha256(
+            payload
+        ).hexdigest(),
+    )
+
+    monkeypatch.setattr(
+        models,
+        "GFPGAN_MODEL_SPEC",
+        spec,
+    )
+
+    path = tmp_path / spec.name
+
+    path.write_bytes(payload)
+
+    assert (
+        models.verified_gfpgan_model(
+            model_dir=tmp_path,
+        )
+        == path
+    )
+
+
+def test_verified_gfpgan_model_rejects_tampering(
+    tmp_path,
+    monkeypatch,
+):
+    payload = b"known-gfpgan-checkpoint"
+
+    spec = models.RealESRGANModelSpec(
+        name="GFPGANv1.4.pth",
+        url="https://example.invalid/GFPGANv1.4.pth",
+        size=len(payload),
+        sha256=hashlib.sha256(
+            payload
+        ).hexdigest(),
+    )
+
+    monkeypatch.setattr(
+        models,
+        "GFPGAN_MODEL_SPEC",
+        spec,
+    )
+
+    path = tmp_path / spec.name
+
+    tampered = bytearray(payload)
+    tampered[0] ^= 1
+
+    path.write_bytes(tampered)
+
+    with pytest.raises(
+        models.RealESRGANModelError,
+        match="checksum mismatch",
+    ):
+        models.verified_gfpgan_model(
+            model_dir=tmp_path,
+        )
+
+
+def test_provision_gfpgan_downloads_verifies_and_reuses(
+    tmp_path,
+    monkeypatch,
+):
+    payload = b"known-gfpgan-checkpoint"
+
+    spec = models.RealESRGANModelSpec(
+        name="GFPGANv1.4.pth",
+        url=(
+            "https://github.com/example/project/"
+            "releases/download/v1/GFPGANv1.4.pth"
+        ),
+        size=len(payload),
+        sha256=hashlib.sha256(
+            payload
+        ).hexdigest(),
+    )
+
+    monkeypatch.setattr(
+        models,
+        "GFPGAN_MODEL_SPEC",
+        spec,
+    )
+
+    seen = []
+
+    def opener(
+        request,
+        timeout,
+    ):
+        seen.append(
+            (
+                request.full_url,
+                timeout,
+            )
+        )
+
+        return _FakeResponse(
+            payload
+        )
+
+    first = models.provision_gfpgan_model(
+        model_dir=tmp_path,
+        opener=opener,
+    )
+
+    assert first == {
+        spec.name: "downloaded-verified"
+    }
+
+    assert seen == [
+        (
+            spec.url,
+            120,
+        )
+    ]
+
+    def forbidden(
+        request,
+        timeout,
+    ):
+        raise AssertionError(
+            "verified checkpoint was downloaded again"
+        )
+
+    second = models.provision_gfpgan_model(
+        model_dir=tmp_path,
+        opener=forbidden,
+    )
+
+    assert second == {
+        spec.name: "verified-existing"
+    }
+
+
+def test_provision_gfpgan_rejects_wrong_download(
+    tmp_path,
+    monkeypatch,
+):
+    payload = b"known-gfpgan-checkpoint"
+
+    spec = models.RealESRGANModelSpec(
+        name="GFPGANv1.4.pth",
+        url="https://example.invalid/GFPGANv1.4.pth",
+        size=len(payload),
+        sha256=hashlib.sha256(
+            payload
+        ).hexdigest(),
+    )
+
+    monkeypatch.setattr(
+        models,
+        "GFPGAN_MODEL_SPEC",
+        spec,
+    )
+
+    def opener(
+        request,
+        timeout,
+    ):
+        return _FakeResponse(
+            b"wrong-gfpgan-checkpoint"
+        )
+
+    with pytest.raises(
+        models.RealESRGANModelError,
+    ):
+        models.provision_gfpgan_model(
+            model_dir=tmp_path,
+            opener=opener,
+        )
+
+    assert not (
+        tmp_path / spec.name
+    ).exists()

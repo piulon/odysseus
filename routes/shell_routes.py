@@ -1741,6 +1741,32 @@ def setup_shell_routes() -> APIRouter:
                         ),
                     }
 
+            if pip_name == "gfpgan":
+                try:
+                    from src.realesrgan_models import (
+                        provision_gfpgan_model,
+                    )
+
+                    model_status = await asyncio.to_thread(
+                        provision_gfpgan_model
+                    )
+
+                    result["models"] = model_status
+
+                except Exception:
+                    logger.warning(
+                        "GFPGAN checkpoint provisioning failed",
+                        exc_info=True,
+                    )
+
+                    return {
+                        "ok": False,
+                        "error": (
+                            "gfpgan installed, but verified model "
+                            "provisioning failed"
+                        ),
+                    }
+
             return result
 
         return {"ok": False, "error": stderr.decode()[-300:]}

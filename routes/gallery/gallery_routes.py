@@ -22,6 +22,7 @@ from src.constants import GENERATED_IMAGES_DIR
 from src.optional_deps import patch_realesrgan_torchvision_compat
 from src.realesrgan_models import (
     RealESRGANModelError,
+    verified_gfpgan_model,
     verified_realesrgan_model,
 )
 
@@ -1744,7 +1745,9 @@ def setup_gallery_routes() -> APIRouter:
             os.makedirs(model_path, exist_ok=True)
 
             restorer = GFPGANer(
-                model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
+                model_path=str(
+                    verified_gfpgan_model()
+                ),
                 upscale=1,
                 arch="clean",
                 channel_multiplier=2,

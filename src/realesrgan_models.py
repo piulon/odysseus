@@ -16,7 +16,10 @@ import tempfile
 from typing import Callable
 import urllib.request
 
-from src.constants import REALESRGAN_MODELS_DIR
+from src.constants import (
+    GFPGAN_MODELS_DIR,
+    REALESRGAN_MODELS_DIR,
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,20 @@ class RealESRGANModelSpec:
     url: str
     size: int
     sha256: str
+
+
+GFPGAN_MODEL_SPEC = RealESRGANModelSpec(
+    name="GFPGANv1.4.pth",
+    url=(
+        "https://github.com/TencentARC/GFPGAN/releases/"
+        "download/v1.3.0/GFPGANv1.4.pth"
+    ),
+    size=348_632_874,
+    sha256=(
+        "e2cd4703ab14f4d01fd1383a8a8b266f"
+        "9a5833dacee8e6a79d3bf21a1b6be5ad"
+    ),
+)
 
 
 REALESRGAN_MODEL_SPECS = {
@@ -268,3 +285,150 @@ def provision_realesrgan_models(
                 pass
 
     return result
+
+def verified_gfpgan_model(
+    *,
+    model_dir: str | os.PathLike[str] | None = None,
+) -> Path:
+    """Return GFPGANv1.4 only after exact size + SHA-256 verification."""
+
+    root = Path(
+        model_dir
+        if model_dir is not None
+        else GFPGAN_MODELS_DIR
+    )
+
+    path = root / GFPGAN_MODEL_SPEC.name
+
+    _verify_path(
+        path,
+        GFPGAN_MODEL_SPEC,
+    )
+
+    return path
+
+
+def provision_gfpgan_model(
+    *,
+    model_dir: str | os.PathLike[str] | None = None,
+    opener: Callable[..., object] | None = None,
+) -> dict[str, str]:
+    """Explicitly provision the pinned GFPGAN checkpoint.
+
+    Gallery requests never call this function.
+    """
+
+    root = Path(
+        model_dir
+        if model_dir is not None
+        else GFPGAN_MODELS_DIR
+    )
+
+    root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    spec = GFPGAN_MODEL_SPEC
+    target = root / spec.name
+
+    try:
+        _verify_path(
+            target,
+            spec,
+        )
+    except RealESRGANModelError:
+        pass
+    else:
+        return {
+            spec.name: "verified-existing"
+        }
+
+    open_url = (
+        opener
+        if opener is not None
+        else urllib.request.urlopen
+    )
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{spec.name}.",
+        suffix=".tmp",
+        dir=root,
+    )
+
+    tmp_path = Path(tmp_name)
+
+    try:
+        total = 0
+
+        request = urllib.request.Request(
+            spec.url,
+            headers={
+                "User-Agent": (
+                    "Odysseus/"
+                    "GFPGAN-checkpoint-provisioner"
+                )
+            },
+        )
+
+        with os.fdopen(fd, "wb") as output:
+            with open_url(
+                request,
+                timeout=120,
+            ) as response:
+                while True:
+                    chunk = response.read(
+                        1024 * 1024
+                    )
+
+                    if not chunk:
+                        break
+
+                    total += len(chunk)
+
+                    if total > spec.size:
+                        raise RealESRGANModelError(
+                            "GFPGAN model exceeded "
+                            "expected size"
+                        )
+
+                    output.write(chunk)
+
+            output.flush()
+            os.fsync(output.fileno())
+
+        _verify_path(
+            tmp_path,
+            spec,
+        )
+
+        os.replace(
+            tmp_path,
+            target,
+        )
+
+        _verify_path(
+            target,
+            spec,
+        )
+
+        return {
+            spec.name: "downloaded-verified"
+        }
+
+    except Exception as exc:
+        if isinstance(
+            exc,
+            RealESRGANModelError,
+        ):
+            raise
+
+        raise RealESRGANModelError(
+            "Failed to provision GFPGAN model"
+        ) from exc
+
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
