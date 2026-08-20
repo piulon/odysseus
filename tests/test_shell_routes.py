@@ -544,6 +544,7 @@ def _make_realesrgan_test_wheelhouse(tmp_path):
         "basicsr-1.4.2-py3-none-any.whl",
         "facexlib-0.3.0-py3-none-any.whl",
         "gfpgan-1.3.8-py3-none-any.whl",
+        "realesrgan-0.3.0-py3-none-any.whl",
     )
 
     for name in names:
@@ -574,7 +575,6 @@ def test_pip_install_argv_uses_audited_realesrgan_wheels(tmp_path):
         "pip",
         "install",
         *wheels,
-        "realesrgan",
     ]
 
 
@@ -596,7 +596,7 @@ def test_pip_install_argv_uses_local_gfpgan_wheel(tmp_path):
         "-m",
         "pip",
         "install",
-        *wheels,
+        *wheels[:3],
     ]
 
 
@@ -622,7 +622,7 @@ def test_pip_install_argv_does_not_change_other_packages(tmp_path):
     ]
 
 
-def test_pip_install_argv_falls_back_when_wheelhouse_incomplete(tmp_path):
+def test_pip_install_argv_fails_closed_when_wheelhouse_incomplete(tmp_path):
     from routes.shell_routes import _pip_install_argv
 
     (
@@ -630,16 +630,12 @@ def test_pip_install_argv_falls_back_when_wheelhouse_incomplete(tmp_path):
         / "basicsr-1.4.2-py3-none-any.whl"
     ).touch()
 
-    argv = _pip_install_argv(
-        "/usr/local/bin/python",
-        "realesrgan",
-        wheelhouse=str(tmp_path),
-    )
-
-    assert argv == [
-        "/usr/local/bin/python",
-        "-m",
-        "pip",
-        "install",
-        "realesrgan",
-    ]
+    with pytest.raises(
+        RuntimeError,
+        match="audited local wheelhouse",
+    ):
+        _pip_install_argv(
+            "/usr/local/bin/python",
+            "realesrgan",
+            wheelhouse=str(tmp_path),
+        )

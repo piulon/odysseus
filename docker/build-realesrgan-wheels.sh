@@ -33,6 +33,10 @@ FACEXLIB_SHA256='7ae784a520eb52e05583e8bf9f68f77f45083239ac754d646d635017b49e776
 GFPGAN_URL='https://files.pythonhosted.org/packages/6b/e9/b2db24ed840f188792581d217229022ff85e0ae3055a708e9f28430b8083/gfpgan-1.3.8.tar.gz'
 GFPGAN_SHA256='21618b06ce8ea6230448cb526b012004f23a9ab956b55c833f69b9fc8a60c4f9'
 
+REALESRGAN_WHEEL_URL='https://files.pythonhosted.org/packages/b2/3e/e2f79917a04991b9237df264f7abab2b58cf94748e7acfb6677b55232ca1/realesrgan-0.3.0-py3-none-any.whl'
+REALESRGAN_WHEEL_SHA256='59336c16c30dd5130eff350dd27424acb9b7281d18a6810130e265606c9a6088'
+REALESRGAN_WHEEL_SIZE=26012
+
 SETUPTOOLS_URL='https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306daef1703549e8e83b4d43cfea356311bf722a043752/setuptools-83.0.0-py3-none-any.whl'
 SETUPTOOLS_SHA256='29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3'
 
@@ -52,6 +56,17 @@ src="$work/src"
 venv="$work/venv"
 
 mkdir -p "$input" "$src"
+
+echo ">> fetching pinned Real-ESRGAN 0.3.0 wheel"
+
+curl   --fail   --silent   --show-error   --location   --proto '=https'   --tlsv1.2   "$REALESRGAN_WHEEL_URL"   -o "$input/realesrgan-0.3.0-py3-none-any.whl"
+
+test "$(
+  stat     --printf='%s'     "$input/realesrgan-0.3.0-py3-none-any.whl"
+)" -eq "$REALESRGAN_WHEEL_SIZE"
+
+printf '%s  %s\n'   "$REALESRGAN_WHEEL_SHA256"   "$input/realesrgan-0.3.0-py3-none-any.whl"   | sha256sum -c -
+
 
 echo ">> downloading fixed source artifacts"
 
@@ -196,6 +211,10 @@ export PYTHONDONTWRITEBYTECODE=1
   ./facexlib-* \
   ./gfpgan-*
 
+echo ">> publishing verified Real-ESRGAN main wheel"
+
+install   -m 0644   "$input/realesrgan-0.3.0-py3-none-any.whl"   "$OUT/realesrgan-0.3.0-py3-none-any.whl"
+
 echo ">> verifying final wheel identities"
 
 (
@@ -205,6 +224,7 @@ cat > "$work/wheels.sha256" <<EOF_SHA
 ${BASICSR_WHEEL_SHA256}  basicsr-1.4.2-py3-none-any.whl
 ${FACEXLIB_WHEEL_SHA256}  facexlib-0.3.0-py3-none-any.whl
 ${GFPGAN_WHEEL_SHA256}  gfpgan-1.3.8-py3-none-any.whl
+${REALESRGAN_WHEEL_SHA256}  realesrgan-0.3.0-py3-none-any.whl
 EOF_SHA
 
 sha256sum -c "$work/wheels.sha256"

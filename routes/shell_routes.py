@@ -863,6 +863,10 @@ _REALESRGAN_PATCHED_WHEELS = (
     "gfpgan-1.3.8-py3-none-any.whl",
 )
 
+_REALESRGAN_MAIN_WHEEL = (
+    "realesrgan-0.3.0-py3-none-any.whl"
+)
+
 
 def _pip_install_argv(
     python_executable: str,
@@ -872,11 +876,13 @@ def _pip_install_argv(
 ) -> list[str]:
     """Build the argv for an allowlisted Cookbook pip install.
 
-    Real-ESRGAN's released basicsr/facexlib/gfpgan sdists fail to build on
-    Python 3.14. Docker images contain deterministic patched wheels for those
-    exact releases. Supply them explicitly when available instead of globally
-    installing incomplete distributions into the base runtime or globally
-    changing pip's package search path.
+    Real-ESRGAN's Python-3.14 compatibility helpers and the Real-ESRGAN main
+    package are supplied from the immutable audited image wheelhouse.  If any
+    required local wheel is missing, fail closed instead of silently resolving
+    that package identity from an external package index.
+
+    Transitive dependencies which are not part of this audited wheel set are
+    still resolved by pip during the explicit administrative installation.
     """
     import os as _os
 
@@ -887,31 +893,44 @@ def _pip_install_argv(
         "install",
     ]
 
-    if pip_name in {"realesrgan", "gfpgan"}:
+    if pip_name in {
+        "realesrgan",
+        "gfpgan",
+    }:
+        filenames = list(
+            _REALESRGAN_PATCHED_WHEELS
+        )
+
+        if pip_name == "realesrgan":
+            filenames.append(
+                _REALESRGAN_MAIN_WHEEL
+            )
+
         wheels = [
             _os.path.join(
                 wheelhouse,
                 filename,
             )
-            for filename
-            in _REALESRGAN_PATCHED_WHEELS
+            for filename in filenames
         ]
 
-        if all(
-            _os.path.isfile(wheel)
+        missing = [
+            wheel
             for wheel in wheels
-        ):
-            cmd.extend(wheels)
+            if not _os.path.isfile(wheel)
+        ]
 
-            # gfpgan itself is already one of the exact local wheels.
-            # RealESRGAN remains index-resolved, with its three problematic
-            # helper distributions pinned by the explicit local wheel args.
-            if pip_name == "realesrgan":
-                cmd.append(pip_name)
+        if missing:
+            raise RuntimeError(
+                "Required audited local wheelhouse is incomplete"
+            )
 
-            return cmd
+        cmd.extend(wheels)
+
+        return cmd
 
     cmd.append(pip_name)
+
     return cmd
 
 
@@ -1664,7 +1683,25 @@ def setup_shell_routes() -> APIRouter:
         }
         if pip_name not in known:
             return {"ok": False, "error": f"Unknown package: {pip_name}"}
-        cmd = _pip_install_argv(_sys.executable, pip_name)
+        try:
+            cmd = _pip_install_argv(
+                _sys.executable,
+                pip_name,
+            )
+        except RuntimeError:
+            logger.error(
+                "Cookbook install blocked: audited local "
+                "wheelhouse incomplete for %s",
+                pip_name,
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "Required audited local package "
+                    "wheelhouse is incomplete"
+                ),
+            }
+
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )

@@ -435,6 +435,69 @@ def test_gallery_realesrgan_uses_only_verified_local_checkpoints():
     assert "os.replace" in models
 
 
+def test_realesrgan_main_package_is_pinned_in_local_wheelhouse():
+    dockerfile = (
+        ROOT
+        / "Dockerfile"
+    ).read_text(encoding="utf-8")
+
+    builder = (
+        ROOT
+        / "docker"
+        / "build-realesrgan-wheels.sh"
+    ).read_text(encoding="utf-8")
+
+    shell = (
+        ROOT
+        / "routes"
+        / "shell_routes.py"
+    ).read_text(encoding="utf-8")
+
+    wheel = (
+        "realesrgan-0.3.0-py3-none-any.whl"
+    )
+
+    sha256 = (
+        "59336c16c30dd5130eff350dd27424ac"
+        "b9b7281d18a6810130e265606c9a6088"
+    )
+
+    assert wheel in builder
+    assert sha256 in builder
+
+    assert (
+        "https://files.pythonhosted.org/"
+        in builder
+    )
+
+    assert wheel in dockerfile
+    assert (
+        """-name '*.whl' | wc -l)" -eq 4"""
+        in dockerfile
+    )
+
+    assert wheel in shell
+
+    assert (
+        "RealESRGAN remains index-resolved"
+        not in shell
+    )
+
+    assert (
+        "Required audited local wheelhouse "
+        "is incomplete"
+        in shell
+    )
+
+    # `realesrgan` itself must never be appended by package name in the
+    # special Real-ESRGAN branch. Other ordinary allowlisted packages may
+    # still use the generic cmd.append(pip_name) path.
+    assert (
+        'if pip_name == "realesrgan":'
+        in shell
+    )
+
+
 def test_cors_allow_methods_include_patch():
     methods = _cors_allow_methods()
     assert "PATCH" in methods

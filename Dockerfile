@@ -269,8 +269,9 @@ RUN PYTHON_MAGIC_WHEEL=/tmp/python_magic-0.4.27-py2.py3-none-any.whl \
     && python -m pip check \
     && rm -f "$PYTHON_MAGIC_WHEEL"
 
-# Keep the deterministic Python-3.14-compatible Real-ESRGAN helper wheels in
-# an immutable image wheelhouse, but do NOT install them into the base Python
+# Keep the deterministic Python-3.14-compatible helper wheels plus the exact
+# upstream Real-ESRGAN wheel in an immutable image wheelhouse, but do NOT
+# install them into the base Python
 # environment. Installing them with --no-deps leaves their declared
 # torch/torchvision/OpenCV/SciPy/etc. requirements unsatisfied and makes
 # `pip check` fail before the user has even enabled Real-ESRGAN.
@@ -282,7 +283,8 @@ COPY --from=realesrgan-wheels /wheels/ /opt/odysseus-wheelhouse/
 RUN test -f /opt/odysseus-wheelhouse/basicsr-1.4.2-py3-none-any.whl \
     && test -f /opt/odysseus-wheelhouse/facexlib-0.3.0-py3-none-any.whl \
     && test -f /opt/odysseus-wheelhouse/gfpgan-1.3.8-py3-none-any.whl \
-    && test "$(find /opt/odysseus-wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 3 \
+    && test -f /opt/odysseus-wheelhouse/realesrgan-0.3.0-py3-none-any.whl \
+    && test "$(find /opt/odysseus-wheelhouse -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 4 \
     && chmod -R a+rX /opt/odysseus-wheelhouse \
     && python -m pip check
 
