@@ -1,0 +1,8 @@
+{
+  "name": "odysseus-playwright-audit",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@playwright/mcp": "0.0.78"
+  }
+}
