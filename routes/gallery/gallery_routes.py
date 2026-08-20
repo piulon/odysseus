@@ -20,6 +20,10 @@ from src.upload_limits import (
 )
 from src.constants import GENERATED_IMAGES_DIR
 from src.optional_deps import patch_realesrgan_torchvision_compat
+from src.realesrgan_models import (
+    RealESRGANModelError,
+    verified_realesrgan_model,
+)
 
 from routes.gallery.gallery_helpers import (
     GalleryPatch, _extract_exif, _image_to_dict, _owner_filter, _human_size,
@@ -1519,12 +1523,23 @@ def setup_gallery_routes() -> APIRouter:
             return {"error": "realesrgan not installed. Install it from Cookbook → Dependencies (search 'realesrgan')."}
         try:
             # General-purpose lightweight model with denoise control.
+            # Real-ESRGAN DNI requires both the normal and weak-denoise
+            # checkpoints. Runtime requests never download model files.
+            general_path = verified_realesrgan_model(
+                "realesr-general-x4v3.pth"
+            )
+            weak_path = verified_realesrgan_model(
+                "realesr-general-wdn-x4v3.pth"
+            )
             from realesrgan.archs.srvgg_arch import SRVGGNetCompact
             model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
                                     num_conv=32, upscale=4, act_type='prelu')
             upsampler = RealESRGANer(
                 scale=4,
-                model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth',
+                model_path=[
+                    str(general_path),
+                    str(weak_path),
+                ],
                 dni_weight=[strength, 1.0 - strength],
                 model=model,
                 tile=400, tile_pad=10, pre_pad=0, half=False,
@@ -1535,6 +1550,16 @@ def setup_gallery_routes() -> APIRouter:
             buf = io.BytesIO()
             out_img.save(buf, format="PNG")
             return {"image": base64.b64encode(buf.getvalue()).decode()}
+        except RealESRGANModelError:
+            logger.warning(
+                "Denoise blocked: Real-ESRGAN checkpoint missing or invalid"
+            )
+            return {
+                "error": (
+                    "Real-ESRGAN model files are missing or invalid. "
+                    "Reinstall realesrgan from Cookbook → Dependencies."
+                )
+            }
         except Exception:
             logger.warning("Denoise failed", exc_info=True)
             return {"error": "Denoise failed"}
@@ -1569,11 +1594,14 @@ def setup_gallery_routes() -> APIRouter:
         except ImportError:
             return {"error": "realesrgan not installed. Install it from Cookbook → Dependencies (search 'realesrgan')."}
         try:
+            model_path = verified_realesrgan_model(
+                "RealESRGAN_x4plus.pth"
+            )
             model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
                             num_block=23, num_grow_ch=32, scale=4)
             upsampler = RealESRGANer(
                 scale=4,
-                model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth',
+                model_path=str(model_path),
                 model=model,
                 tile=400, tile_pad=10, pre_pad=0, half=False,
             )
@@ -1583,6 +1611,16 @@ def setup_gallery_routes() -> APIRouter:
             buf = io.BytesIO()
             out_img.save(buf, format="PNG")
             return {"image": base64.b64encode(buf.getvalue()).decode()}
+        except RealESRGANModelError:
+            logger.warning(
+                "AI upscale blocked: Real-ESRGAN checkpoint missing or invalid"
+            )
+            return {
+                "error": (
+                    "Real-ESRGAN model files are missing or invalid. "
+                    "Reinstall realesrgan from Cookbook → Dependencies."
+                )
+            }
         except Exception:
             logger.warning("AI upscale failed", exc_info=True)
             return {"error": "AI upscale failed"}

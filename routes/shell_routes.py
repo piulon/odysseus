@@ -1670,7 +1670,42 @@ def setup_shell_routes() -> APIRouter:
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode == 0:
-            return {"ok": True, "output": stdout.decode()[-200:]}
+            result = {
+                "ok": True,
+                "output": stdout.decode()[-200:],
+            }
+
+            # Model downloads are explicit provisioning work attached to the
+            # admin-only Real-ESRGAN installation. Gallery requests themselves
+            # never download checkpoints.
+            if pip_name == "realesrgan":
+                try:
+                    from src.realesrgan_models import (
+                        provision_realesrgan_models,
+                    )
+
+                    model_status = await asyncio.to_thread(
+                        provision_realesrgan_models
+                    )
+
+                    result["models"] = model_status
+
+                except Exception:
+                    logger.warning(
+                        "Real-ESRGAN checkpoint provisioning failed",
+                        exc_info=True,
+                    )
+
+                    return {
+                        "ok": False,
+                        "error": (
+                            "realesrgan installed, but verified model "
+                            "provisioning failed"
+                        ),
+                    }
+
+            return result
+
         return {"ok": False, "error": stderr.decode()[-300:]}
 
     @router.post("/api/cookbook/install-system-deps")

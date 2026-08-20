@@ -1,0 +1,270 @@
+"""Pinned local Real-ESRGAN checkpoint management.
+
+Runtime inference never downloads checkpoints.  Models are provisioned only by
+an explicit administrative Cookbook installation and are verified again before
+they are handed to RealESRGANer.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import os
+from pathlib import Path
+import secrets
+import tempfile
+from typing import Callable
+import urllib.request
+
+from src.constants import REALESRGAN_MODELS_DIR
+
+
+@dataclass(frozen=True)
+class RealESRGANModelSpec:
+    name: str
+    url: str
+    size: int
+    sha256: str
+
+
+REALESRGAN_MODEL_SPECS = {
+    "RealESRGAN_x4plus.pth": RealESRGANModelSpec(
+        name="RealESRGAN_x4plus.pth",
+        url=(
+            "https://github.com/xinntao/Real-ESRGAN/releases/"
+            "download/v0.1.0/RealESRGAN_x4plus.pth"
+        ),
+        size=67_040_989,
+        sha256=(
+            "4fa0d38905f75ac06eb49a7951b4266"
+            "70021be3018265fd191d2125df9d682f1"
+        ),
+    ),
+    "realesr-general-x4v3.pth": RealESRGANModelSpec(
+        name="realesr-general-x4v3.pth",
+        url=(
+            "https://github.com/xinntao/Real-ESRGAN/releases/"
+            "download/v0.2.5.0/realesr-general-x4v3.pth"
+        ),
+        size=4_885_111,
+        sha256=(
+            "8dc7edb9ac80ccdc30c3a5dca6616509"
+            "367f05fbc184ad95b731f05bece96292"
+        ),
+    ),
+    "realesr-general-wdn-x4v3.pth": RealESRGANModelSpec(
+        name="realesr-general-wdn-x4v3.pth",
+        url=(
+            "https://github.com/xinntao/Real-ESRGAN/releases/"
+            "download/v0.2.5.0/realesr-general-wdn-x4v3.pth"
+        ),
+        size=4_885_111,
+        sha256=(
+            "1641f8c4464b9f097c9fdda558927371"
+            "3f67cf59f3d909e0bd688f0cee269dca"
+        ),
+    ),
+}
+
+
+class RealESRGANModelError(RuntimeError):
+    """A required checkpoint is missing, corrupt, or could not be provisioned."""
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+
+            if not chunk:
+                break
+
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def _verify_path(
+    path: Path,
+    spec: RealESRGANModelSpec,
+) -> None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError as exc:
+        raise RealESRGANModelError(
+            f"Required Real-ESRGAN model is missing: {spec.name}"
+        ) from exc
+
+    if not path.is_file():
+        raise RealESRGANModelError(
+            f"Real-ESRGAN model is not a regular file: {spec.name}"
+        )
+
+    if stat.st_size != spec.size:
+        raise RealESRGANModelError(
+            f"Real-ESRGAN model size mismatch: {spec.name}"
+        )
+
+    actual = _sha256_path(path)
+
+    if not secrets.compare_digest(
+        actual.lower(),
+        spec.sha256.lower(),
+    ):
+        raise RealESRGANModelError(
+            f"Real-ESRGAN model checksum mismatch: {spec.name}"
+        )
+
+
+def verified_realesrgan_model(
+    name: str,
+    *,
+    model_dir: str | os.PathLike[str] | None = None,
+) -> Path:
+    """Return a local model path only after exact size + SHA-256 verification."""
+
+    try:
+        spec = REALESRGAN_MODEL_SPECS[name]
+    except KeyError as exc:
+        raise RealESRGANModelError(
+            f"Unknown Real-ESRGAN model: {name}"
+        ) from exc
+
+    root = Path(
+        model_dir
+        if model_dir is not None
+        else REALESRGAN_MODELS_DIR
+    )
+
+    path = root / spec.name
+
+    _verify_path(path, spec)
+
+    return path
+
+
+def provision_realesrgan_models(
+    *,
+    model_dir: str | os.PathLike[str] | None = None,
+    opener: Callable[..., object] | None = None,
+) -> dict[str, str]:
+    """Download all pinned checkpoints atomically and verify before publication.
+
+    This is an explicit provisioning operation for the admin-only Cookbook
+    installer.  Runtime gallery requests must never call it.
+    """
+
+    root = Path(
+        model_dir
+        if model_dir is not None
+        else REALESRGAN_MODELS_DIR
+    )
+
+    root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    open_url = (
+        opener
+        if opener is not None
+        else urllib.request.urlopen
+    )
+
+    result: dict[str, str] = {}
+
+    for name, spec in REALESRGAN_MODEL_SPECS.items():
+        target = root / name
+
+        try:
+            _verify_path(target, spec)
+        except RealESRGANModelError:
+            pass
+        else:
+            result[name] = "verified-existing"
+            continue
+
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{name}.",
+            suffix=".tmp",
+            dir=root,
+        )
+
+        tmp_path = Path(tmp_name)
+
+        try:
+            total = 0
+
+            request = urllib.request.Request(
+                spec.url,
+                headers={
+                    "User-Agent": (
+                        "Odysseus/"
+                        "RealESRGAN-checkpoint-provisioner"
+                    )
+                },
+            )
+
+            with os.fdopen(fd, "wb") as output:
+                with open_url(
+                    request,
+                    timeout=120,
+                ) as response:
+                    while True:
+                        chunk = response.read(
+                            1024 * 1024
+                        )
+
+                        if not chunk:
+                            break
+
+                        total += len(chunk)
+
+                        if total > spec.size:
+                            raise RealESRGANModelError(
+                                "Real-ESRGAN model exceeded "
+                                f"expected size: {name}"
+                            )
+
+                        output.write(chunk)
+
+                output.flush()
+                os.fsync(output.fileno())
+
+            _verify_path(
+                tmp_path,
+                spec,
+            )
+
+            os.replace(
+                tmp_path,
+                target,
+            )
+
+            _verify_path(
+                target,
+                spec,
+            )
+
+            result[name] = "downloaded-verified"
+
+        except Exception as exc:
+            if isinstance(
+                exc,
+                RealESRGANModelError,
+            ):
+                raise
+
+            raise RealESRGANModelError(
+                f"Failed to provision Real-ESRGAN model: {name}"
+            ) from exc
+
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    return result

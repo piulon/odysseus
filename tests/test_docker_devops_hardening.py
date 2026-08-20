@@ -312,6 +312,129 @@ def test_gallery_background_removal_never_executes_remote_model_code():
     )
 
 
+def test_gallery_realesrgan_uses_only_verified_local_checkpoints():
+    gallery = (
+        ROOT
+        / "routes"
+        / "gallery"
+        / "gallery_routes.py"
+    ).read_text(encoding="utf-8")
+
+    installer = (
+        ROOT
+        / "routes"
+        / "shell_routes.py"
+    ).read_text(encoding="utf-8")
+
+    constants = (
+        ROOT
+        / "src"
+        / "constants.py"
+    ).read_text(encoding="utf-8")
+
+    models = (
+        ROOT
+        / "src"
+        / "realesrgan_models.py"
+    ).read_text(encoding="utf-8")
+
+    # No RealESRGANer call may receive an HTTP(S) model URL.
+    # Other image backends are audited independently.
+    import ast
+
+    assert "Real-ESRGAN/releases/download" not in gallery
+
+    tree = ast.parse(gallery)
+
+    realesrgan_calls = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        name = None
+
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+
+        if name == "RealESRGANer":
+            realesrgan_calls.append(node)
+
+    assert len(realesrgan_calls) == 2
+
+    for call in realesrgan_calls:
+        model_path_args = [
+            keyword
+            for keyword in call.keywords
+            if keyword.arg == "model_path"
+        ]
+
+        assert len(model_path_args) == 1
+
+        expression = ast.get_source_segment(
+            gallery,
+            model_path_args[0].value,
+        )
+
+        assert expression
+        assert "http://" not in expression
+        assert "https://" not in expression
+
+    assert (
+        'verified_realesrgan_model('
+        in gallery
+    )
+
+    assert (
+        '"RealESRGAN_x4plus.pth"'
+        in gallery
+    )
+
+    assert (
+        '"realesr-general-x4v3.pth"'
+        in gallery
+    )
+
+    assert (
+        '"realesr-general-wdn-x4v3.pth"'
+        in gallery
+    )
+
+    # DNI requires both local checkpoints.
+    assert "model_path=[" in gallery
+    assert "str(general_path)" in gallery
+    assert "str(weak_path)" in gallery
+    assert (
+        "dni_weight=[strength, 1.0 - strength]"
+        in gallery
+    )
+
+    # Checkpoints belong to the existing persistent DATA_DIR hierarchy.
+    assert (
+        'REALESRGAN_MODELS_DIR = '
+        'os.path.join(DATA_DIR, "models", "realesrgan")'
+        in constants
+    )
+
+    # Provisioning is explicit administrative installation work.
+    assert (
+        'if pip_name == "realesrgan":'
+        in installer
+    )
+
+    assert (
+        "provision_realesrgan_models"
+        in installer
+    )
+
+    # Integrity enforcement exists in the model store.
+    assert "sha256" in models
+    assert "compare_digest" in models
+    assert "os.replace" in models
+
+
 def test_cors_allow_methods_include_patch():
     methods = _cors_allow_methods()
     assert "PATCH" in methods
