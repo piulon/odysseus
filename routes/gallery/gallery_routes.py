@@ -1646,15 +1646,15 @@ def setup_gallery_routes() -> APIRouter:
             from rembg import remove
             cut = remove(crop)
         except ImportError:
-            try:
-                from transformers import pipeline
-                pipe = pipeline("image-segmentation", model="briaai/RMBG-1.4", trust_remote_code=True)
-                mask_img = pipe(crop, return_mask=True).convert("L")
-                tmp = crop.copy()
-                tmp.putalpha(mask_img)
-                cut = tmp
-            except Exception:
-                return {"error": "No background removal model available. Install rembg: pip install rembg"}
+            # Do not fall back to Hugging Face models with remote-code
+            # execution. Background removal is an explicit optional
+            # dependency: operators must install rembg deliberately.
+            return {
+                "error": (
+                    "No background removal model available. "
+                    "Install rembg from Cookbook → Dependencies."
+                )
+            }
 
         # Compose the cropped result back into a full-size transparent canvas.
         if bbox:

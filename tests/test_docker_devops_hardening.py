@@ -288,6 +288,30 @@ def test_manual_skill_audit_is_independent_of_nightly_gate():
     assert nightly_gate_calls == []
 
 
+def test_gallery_background_removal_never_executes_remote_model_code():
+    source = (
+        ROOT
+        / "routes"
+        / "gallery"
+        / "gallery_routes.py"
+    ).read_text(encoding="utf-8")
+
+    # Background removal may use the explicitly installed rembg
+    # dependency, but must never silently download/execute model
+    # repository code as a fallback.
+    assert "from rembg import remove" in source
+    assert "cut = remove(crop)" in source
+
+    assert "trust_remote_code" not in source
+    assert "briaai/RMBG-1.4" not in source
+    assert "from transformers import pipeline" not in source
+
+    assert (
+        "Install rembg from Cookbook"
+        in source
+    )
+
+
 def test_cors_allow_methods_include_patch():
     methods = _cors_allow_methods()
     assert "PATCH" in methods
