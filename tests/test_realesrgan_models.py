@@ -454,3 +454,230 @@ def test_provision_gfpgan_rejects_wrong_download(
     assert not (
         tmp_path / spec.name
     ).exists()
+
+def test_facexlib_production_specs_match_audited_checkpoints():
+    from src.realesrgan_models import (
+        FACEXLIB_MODEL_SPECS,
+    )
+
+    assert set(FACEXLIB_MODEL_SPECS) == {
+        "detection_Resnet50_Final.pth",
+        "parsing_parsenet.pth",
+    }
+
+    detection = FACEXLIB_MODEL_SPECS[
+        "detection_Resnet50_Final.pth"
+    ]
+
+    assert detection.size == 109_497_761
+    assert detection.sha256 == (
+        "6d1de9c2944f2ccddca5f5e010ea5ae6"
+        "4a39845a86311af6fdf30841b0a5a16d"
+    )
+
+    parsing = FACEXLIB_MODEL_SPECS[
+        "parsing_parsenet.pth"
+    ]
+
+    assert parsing.size == 85_331_193
+    assert parsing.sha256 == (
+        "3d558d8d0e42c20224f13cf5a29c79e"
+        "ba2d59913419f945545d8cf7b72920de2"
+    )
+
+
+def test_verified_facexlib_model_root_accepts_exact_files_and_rejects_tampering(
+    tmp_path,
+    monkeypatch,
+):
+    import hashlib
+    import pytest
+    import src.realesrgan_models as models
+
+    payloads = {
+        "det.pth": b"verified-detector",
+        "parse.pth": b"verified-parser",
+    }
+
+    specs = {
+        name: models.RealESRGANModelSpec(
+            name=name,
+            url=f"https://example.invalid/{name}",
+            size=len(payload),
+            sha256=hashlib.sha256(
+                payload
+            ).hexdigest(),
+        )
+        for name, payload in payloads.items()
+    }
+
+    monkeypatch.setattr(
+        models,
+        "FACEXLIB_MODEL_SPECS",
+        specs,
+    )
+
+    for name, payload in payloads.items():
+        (
+            tmp_path
+            / name
+        ).write_bytes(
+            payload
+        )
+
+    assert (
+        models.verified_facexlib_model_root(
+            model_dir=tmp_path
+        )
+        == tmp_path
+    )
+
+    (
+        tmp_path
+        / "parse.pth"
+    ).write_bytes(
+        b"tampered"
+    )
+
+    with pytest.raises(
+        models.RealESRGANModelError
+    ):
+        models.verified_facexlib_model_root(
+            model_dir=tmp_path
+        )
+
+
+def test_provision_facexlib_models_downloads_verifies_reuses_and_repairs(
+    tmp_path,
+    monkeypatch,
+):
+    import hashlib
+    import io
+    import src.realesrgan_models as models
+
+    payloads = {
+        "det.pth": b"detector-payload",
+        "parse.pth": b"parser-payload",
+    }
+
+    specs = {
+        name: models.RealESRGANModelSpec(
+            name=name,
+            url=f"https://example.invalid/{name}",
+            size=len(payload),
+            sha256=hashlib.sha256(
+                payload
+            ).hexdigest(),
+        )
+        for name, payload in payloads.items()
+    }
+
+    monkeypatch.setattr(
+        models,
+        "FACEXLIB_MODEL_SPECS",
+        specs,
+    )
+
+    calls = []
+
+    class Response:
+        def __init__(
+            self,
+            payload,
+        ):
+            self._stream = io.BytesIO(
+                payload
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(
+            self,
+            exc_type,
+            exc,
+            tb,
+        ):
+            return False
+
+        def read(
+            self,
+            size=-1,
+        ):
+            return self._stream.read(
+                size
+            )
+
+    def opener(
+        request,
+        timeout,
+    ):
+        name = request.full_url.rsplit(
+            "/",
+            1,
+        )[-1]
+
+        calls.append(
+            name
+        )
+
+        return Response(
+            payloads[name]
+        )
+
+    first = models.provision_facexlib_models(
+        model_dir=tmp_path,
+        opener=opener,
+    )
+
+    assert first == {
+        "det.pth": "downloaded-verified",
+        "parse.pth": "downloaded-verified",
+    }
+
+    assert calls == [
+        "det.pth",
+        "parse.pth",
+    ]
+
+    calls.clear()
+
+    second = models.provision_facexlib_models(
+        model_dir=tmp_path,
+        opener=opener,
+    )
+
+    assert second == {
+        "det.pth": "verified-existing",
+        "parse.pth": "verified-existing",
+    }
+
+    assert calls == []
+
+    (
+        tmp_path
+        / "parse.pth"
+    ).write_bytes(
+        b"tampered"
+    )
+
+    repaired = models.provision_facexlib_models(
+        model_dir=tmp_path,
+        opener=opener,
+    )
+
+    assert repaired == {
+        "det.pth": "verified-existing",
+        "parse.pth": "downloaded-verified",
+    }
+
+    assert calls == [
+        "parse.pth",
+    ]
+
+    assert (
+        tmp_path
+        / "parse.pth"
+    ).read_bytes() == payloads[
+        "parse.pth"
+    ]

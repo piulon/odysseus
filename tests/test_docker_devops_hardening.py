@@ -636,3 +636,111 @@ def test_testing_docs_use_project_venv_for_python_validation():
         text = path.read_text(encoding="utf-8")
         for stale in stale_patterns:
             assert stale not in text, f"{path.name} still contains {stale!r}"
+
+def test_facexlib_gfpgan_runtime_models_are_fail_closed():
+    repo = Path(
+        __file__
+    ).resolve().parents[1]
+
+    builder = (
+        repo
+        / "docker"
+        / "build-realesrgan-wheels.sh"
+    ).read_text()
+
+    assert (
+        "457a3b58869a488b78ae6c3eea852791"
+        "fd419950a9875e0544f8d80670f4cb0d"
+        in builder
+    )
+
+    assert (
+        "c8ef4b9aa0c6b82fffdfc464d99f1e48"
+        "cd086f75e9a09257e507eea31e78b89c"
+        in builder
+    )
+
+    assert (
+        "facexlib model is not provisioned locally"
+        in builder
+    )
+
+    assert (
+        "remote GFPGAN model paths are disabled"
+        in builder
+    )
+
+    assert (
+        "model_rootpath is required for verified local facexlib models"
+        in builder
+    )
+
+    constants = (
+        repo
+        / "src"
+        / "constants.py"
+    ).read_text()
+
+    assert (
+        'FACEXLIB_MODELS_DIR = os.path.join(DATA_DIR, "models", "facexlib")'
+        in constants
+    )
+
+    models = (
+        repo
+        / "src"
+        / "realesrgan_models.py"
+    ).read_text()
+
+    assert (
+        "detection_Resnet50_Final.pth"
+        in models
+    )
+
+    assert (
+        "parsing_parsenet.pth"
+        in models
+    )
+
+    assert (
+        "verified_facexlib_model_root"
+        in models
+    )
+
+    assert (
+        "provision_facexlib_models"
+        in models
+    )
+
+    gallery = (
+        repo
+        / "routes"
+        / "gallery"
+        / "gallery_routes.py"
+    ).read_text()
+
+    assert (
+        "verified_facexlib_model_root()"
+        in gallery
+    )
+
+    assert (
+        "model_rootpath=str("
+        in gallery
+    )
+
+    assert (
+        '"gfpgan_models"'
+        not in gallery
+    )
+
+    shell = (
+        repo
+        / "routes"
+        / "shell_routes.py"
+    ).read_text()
+
+    assert (
+        "provision_facexlib_models"
+        in shell
+    )

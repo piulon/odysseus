@@ -17,6 +17,7 @@ from typing import Callable
 import urllib.request
 
 from src.constants import (
+    FACEXLIB_MODELS_DIR,
     GFPGAN_MODELS_DIR,
     REALESRGAN_MODELS_DIR,
 )
@@ -42,6 +43,35 @@ GFPGAN_MODEL_SPEC = RealESRGANModelSpec(
         "9a5833dacee8e6a79d3bf21a1b6be5ad"
     ),
 )
+
+
+
+FACEXLIB_MODEL_SPECS = {
+    "detection_Resnet50_Final.pth": RealESRGANModelSpec(
+        name="detection_Resnet50_Final.pth",
+        url=(
+            "https://github.com/xinntao/facexlib/releases/"
+            "download/v0.1.0/detection_Resnet50_Final.pth"
+        ),
+        size=109_497_761,
+        sha256=(
+            "6d1de9c2944f2ccddca5f5e010ea5ae6"
+            "4a39845a86311af6fdf30841b0a5a16d"
+        ),
+    ),
+    "parsing_parsenet.pth": RealESRGANModelSpec(
+        name="parsing_parsenet.pth",
+        url=(
+            "https://github.com/xinntao/facexlib/releases/"
+            "download/v0.2.2/parsing_parsenet.pth"
+        ),
+        size=85_331_193,
+        sha256=(
+            "3d558d8d0e42c20224f13cf5a29c79e"
+            "ba2d59913419f945545d8cf7b72920de2"
+        ),
+    ),
+}
 
 
 REALESRGAN_MODEL_SPECS = {
@@ -432,3 +462,167 @@ def provision_gfpgan_model(
             tmp_path.unlink()
         except FileNotFoundError:
             pass
+
+def verified_facexlib_model_root(
+    *,
+    model_dir: str | os.PathLike[str] | None = None,
+) -> Path:
+    """Return the FaceXlib model root only after all required assets verify."""
+
+    root = Path(
+        model_dir
+        if model_dir is not None
+        else FACEXLIB_MODELS_DIR
+    )
+
+    for spec in FACEXLIB_MODEL_SPECS.values():
+        _verify_path(
+            root / spec.name,
+            spec,
+        )
+
+    return root
+
+
+def provision_facexlib_models(
+    *,
+    model_dir: str | os.PathLike[str] | None = None,
+    opener: Callable[..., object] | None = None,
+) -> dict[str, str]:
+    """Explicitly provision the FaceXlib models required by GFPGAN.
+
+    FaceXlib itself is patched to fail closed if an expected local model is
+    absent. Gallery requests never call this provisioner.
+    """
+
+    root = Path(
+        model_dir
+        if model_dir is not None
+        else FACEXLIB_MODELS_DIR
+    )
+
+    root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    open_url = (
+        opener
+        if opener is not None
+        else urllib.request.urlopen
+    )
+
+    result: dict[str, str] = {}
+
+    for name, spec in FACEXLIB_MODEL_SPECS.items():
+        target = root / name
+
+        try:
+            _verify_path(
+                target,
+                spec,
+            )
+        except RealESRGANModelError:
+            pass
+        else:
+            result[name] = "verified-existing"
+            continue
+
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{name}.",
+            suffix=".tmp",
+            dir=root,
+        )
+
+        tmp_path = Path(
+            tmp_name
+        )
+
+        try:
+            total = 0
+
+            request = urllib.request.Request(
+                spec.url,
+                headers={
+                    "User-Agent": (
+                        "Odysseus/"
+                        "FaceXlib-checkpoint-provisioner"
+                    )
+                },
+            )
+
+            with os.fdopen(
+                fd,
+                "wb",
+            ) as output:
+
+                with open_url(
+                    request,
+                    timeout=120,
+                ) as response:
+
+                    while True:
+                        chunk = response.read(
+                            1024 * 1024
+                        )
+
+                        if not chunk:
+                            break
+
+                        total += len(
+                            chunk
+                        )
+
+                        if total > spec.size:
+                            raise RealESRGANModelError(
+                                "FaceXlib model exceeded "
+                                f"expected size: {name}"
+                            )
+
+                        output.write(
+                            chunk
+                        )
+
+                output.flush()
+                os.fsync(
+                    output.fileno()
+                )
+
+            _verify_path(
+                tmp_path,
+                spec,
+            )
+
+            os.replace(
+                tmp_path,
+                target,
+            )
+
+            _verify_path(
+                target,
+                spec,
+            )
+
+            result[name] = (
+                "downloaded-verified"
+            )
+
+        except Exception as exc:
+            if isinstance(
+                exc,
+                RealESRGANModelError,
+            ):
+                raise
+
+            raise RealESRGANModelError(
+                "Failed to provision "
+                f"FaceXlib model: {name}"
+            ) from exc
+
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    return result

@@ -41,8 +41,8 @@ SETUPTOOLS_URL='https://files.pythonhosted.org/packages/5d/40/e1e72872c6354b306d
 SETUPTOOLS_SHA256='29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3'
 
 BASICSR_WHEEL_SHA256='148ebcf7ebd20c09dc94a639bdcb3b5a057509e8ac5d8a4d56b376d07c61d254'
-FACEXLIB_WHEEL_SHA256='755cb04ec22ab197fa88d84685e76433e899545d7dd01c81a398de06ef5f38eb'
-GFPGAN_WHEEL_SHA256='142952efd4586806dab2f75219976033824d8b2bea908ff62c6c0dc62f411b13'
+FACEXLIB_WHEEL_SHA256='457a3b58869a488b78ae6c3eea852791fd419950a9875e0544f8d80670f4cb0d'
+GFPGAN_WHEEL_SHA256='c8ef4b9aa0c6b82fffdfc464d99f1e48cd086f75e9a09257e507eea31e78b89c'
 
 # The output must contain only artifacts produced by this invocation.
 rm -rf -- "$OUT"
@@ -161,6 +161,181 @@ for setup in sorted(Path(".").glob("*/setup.py")):
         time_patches += 1
 
     setup.write_text(s)
+
+
+# Security patch: facexlib model initializers must never download a checkpoint
+# implicitly. Explicit provisioning is owned by Odysseus.
+facexlib_misc = Path(
+    "facexlib-0.3.0/facexlib/utils/misc.py"
+)
+
+facexlib_text = facexlib_misc.read_text()
+
+old_import = (
+    "from torch.hub import download_url_to_file, get_dir"
+)
+
+new_import = (
+    "from torch.hub import get_dir"
+)
+
+if facexlib_text.count(old_import) != 1:
+    raise SystemExit(
+        "expected facexlib torch.hub import exactly once"
+    )
+
+facexlib_text = facexlib_text.replace(
+    old_import,
+    new_import,
+    1,
+)
+
+old_download = """    if not os.path.exists(cached_file):
+        print(f'Downloading: "{url}" to {cached_file}\\n')
+        download_url_to_file(url, cached_file, hash_prefix=None, progress=progress)
+    return cached_file
+"""
+
+new_download = """    if not os.path.isfile(cached_file):
+        raise FileNotFoundError(
+            f'facexlib model is not provisioned locally: {cached_file}'
+        )
+    return cached_file
+"""
+
+if facexlib_text.count(old_download) != 1:
+    raise SystemExit(
+        "expected facexlib implicit download block exactly once"
+    )
+
+facexlib_text = facexlib_text.replace(
+    old_download,
+    new_download,
+    1,
+)
+
+facexlib_misc.write_text(
+    facexlib_text
+)
+
+# Security patch: GFPGANer receives the facexlib model store explicitly.
+# Remote main-model URLs are rejected rather than downloaded.
+gfpgan_utils = Path(
+    "gfpgan-1.3.8/gfpgan/utils.py"
+)
+
+gfpgan_text = gfpgan_utils.read_text()
+
+old_import = (
+    "from basicsr.utils.download_util "
+    "import load_file_from_url\n"
+)
+
+if gfpgan_text.count(old_import) != 1:
+    raise SystemExit(
+        "expected GFPGAN download helper import exactly once"
+    )
+
+gfpgan_text = gfpgan_text.replace(
+    old_import,
+    "",
+    1,
+)
+
+old_signature = (
+    "    def __init__(self, model_path, upscale=2, arch='clean', "
+    "channel_multiplier=2, bg_upsampler=None, device=None):"
+)
+
+new_signature = (
+    "    def __init__(self, model_path, upscale=2, arch='clean', "
+    "channel_multiplier=2, bg_upsampler=None, device=None, "
+    "model_rootpath=None):"
+)
+
+if gfpgan_text.count(old_signature) != 1:
+    raise SystemExit(
+        "expected GFPGANer signature exactly once"
+    )
+
+gfpgan_text = gfpgan_text.replace(
+    old_signature,
+    new_signature,
+    1,
+)
+
+old_helper = """        # initialize face helper
+        self.face_helper = FaceRestoreHelper(
+"""
+
+new_helper = """        # initialize face helper
+        if model_rootpath is None:
+            raise ValueError(
+                'model_rootpath is required for verified local facexlib models'
+            )
+
+        self.face_helper = FaceRestoreHelper(
+"""
+
+if gfpgan_text.count(old_helper) != 1:
+    raise SystemExit(
+        "expected GFPGAN FaceRestoreHelper anchor exactly once"
+    )
+
+gfpgan_text = gfpgan_text.replace(
+    old_helper,
+    new_helper,
+    1,
+)
+
+old_root = (
+    "            model_rootpath='gfpgan/weights')"
+)
+
+new_root = (
+    "            model_rootpath=model_rootpath)"
+)
+
+if gfpgan_text.count(old_root) != 1:
+    raise SystemExit(
+        "expected hard-coded GFPGAN model_rootpath exactly once"
+    )
+
+gfpgan_text = gfpgan_text.replace(
+    old_root,
+    new_root,
+    1,
+)
+
+old_remote = """        if model_path.startswith('https://'):
+            model_path = load_file_from_url(
+                url=model_path, model_dir=os.path.join(ROOT_DIR, 'gfpgan/weights'), progress=True, file_name=None)
+"""
+
+new_remote = """        if model_path.startswith(('http://', 'https://')):
+            raise ValueError(
+                'remote GFPGAN model paths are disabled'
+            )
+"""
+
+if gfpgan_text.count(old_remote) != 1:
+    raise SystemExit(
+        "expected GFPGAN remote model block exactly once"
+    )
+
+gfpgan_text = gfpgan_text.replace(
+    old_remote,
+    new_remote,
+    1,
+)
+
+gfpgan_utils.write_text(
+    gfpgan_text
+)
+
+print("facexlib_no_implicit_download_patch = 1")
+print("gfpgan_explicit_model_root_patch = 1")
+print("gfpgan_remote_model_rejection_patch = 1")
 
 print("version_patches =", version_patches)
 print("setup_requires_patches =", setup_requires_patches)

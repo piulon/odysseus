@@ -1744,14 +1744,22 @@ def setup_shell_routes() -> APIRouter:
             if pip_name == "gfpgan":
                 try:
                     from src.realesrgan_models import (
+                        provision_facexlib_models,
                         provision_gfpgan_model,
                     )
 
-                    model_status = await asyncio.to_thread(
+                    gfpgan_status = await asyncio.to_thread(
                         provision_gfpgan_model
                     )
 
-                    result["models"] = model_status
+                    facexlib_status = await asyncio.to_thread(
+                        provision_facexlib_models
+                    )
+
+                    result["models"] = {
+                        **gfpgan_status,
+                        **facexlib_status,
+                    }
 
                 except Exception:
                     logger.warning(

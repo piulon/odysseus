@@ -1739,10 +1739,12 @@ def setup_gallery_routes() -> APIRouter:
         # Try GFPGAN first (AI face restoration)
         try:
             from gfpgan import GFPGANer
+            from src.realesrgan_models import (
+                verified_facexlib_model_root,
+            )
             import cv2
 
-            model_path = os.path.join(tempfile.gettempdir(), "gfpgan_models")
-            os.makedirs(model_path, exist_ok=True)
+            facexlib_model_root = verified_facexlib_model_root()
 
             restorer = GFPGANer(
                 model_path=str(
@@ -1752,7 +1754,9 @@ def setup_gallery_routes() -> APIRouter:
                 arch="clean",
                 channel_multiplier=2,
                 bg_upsampler=None,
-                model_rootpath=model_path,
+                model_rootpath=str(
+                    facexlib_model_root
+                ),
             )
 
             img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
