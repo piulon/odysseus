@@ -68,19 +68,70 @@ def _spawn_bg(coro) -> asyncio.Task:
     return task
 
 
-def builtin_python_env(base_dir: str) -> dict[str, str]:
-    """Environment for built-in Python MCP subprocesses.
+_BUILTIN_MCP_ENV_ALLOWLIST = {
+    # Memory only needs its owner selector. It must not inherit provider,
+    # admin, homelab, or unrelated application credentials.
+    "memory": (
+        "ODYSSEUS_MCP_MEMORY_OWNER",
+        "ODYSSEUS_MEMORY_OWNER",
+    ),
 
-    The app root must be importable so mcp_servers can import local modules, but
-    replacing PYTHONPATH entirely hides site-packages in container/dev launches
-    that rely on PYTHONPATH for their active environment.
+    # Email may use legacy environment configuration in addition to the
+    # account database. Pass only the variables email_server.py consumes.
+    "email": (
+        "ODYSSEUS_MCP_EMAIL_OWNER",
+        "ODYSSEUS_EMAIL_OWNER",
+        "ODYSSEUS_DOCUMENT_OWNER",
+        "EMAIL_SOCKET_TIMEOUT",
+        "IMAP_HOST",
+        "IMAP_PORT",
+        "IMAP_USER",
+        "IMAP_PASSWORD",
+        "IMAP_SSL",
+        "IMAP_STARTTLS",
+        "SMTP_HOST",
+        "SMTP_PORT",
+        "SMTP_SECURITY",
+        "SMTP_USER",
+        "SMTP_PASSWORD",
+        "SMTP_STARTTLS",
+        "SMTP_SSL",
+        "EMAIL_FROM",
+        "ARCHIVE_FOLDER",
+        "TRASH_FOLDER",
+        "EMAIL_CACHE_DB",
+    ),
+
+    # Current implementations do not consume application environment
+    # credentials.
+    "rag": (),
+    "image_gen": (),
+}
+
+
+def builtin_python_env(base_dir: str, server_id: str) -> dict[str, str]:
+    """Return the explicitly allowed environment for one built-in MCP.
+
+    The MCP SDK supplies its own minimal base environment (HOME and PATH).
+    Odysseus adds only PYTHONPATH plus variables explicitly required by the
+    selected built-in server. Never copy the full parent environment here.
     """
     existing = os.environ.get("PYTHONPATH", "")
     parts = [base_dir]
+
     for item in existing.split(os.pathsep):
         if item and item not in parts:
             parts.append(item)
-    return {"PYTHONPATH": os.pathsep.join(parts)}
+
+    env = {
+        "PYTHONPATH": os.pathsep.join(parts),
+    }
+
+    for key in _BUILTIN_MCP_ENV_ALLOWLIST.get(server_id, ()):
+        if key in os.environ:
+            env[key] = os.environ[key]
+
+    return env
 
 
 async def register_builtin_servers(mcp_manager):
@@ -100,7 +151,7 @@ async def register_builtin_servers(mcp_manager):
                 transport="stdio",
                 command=python,
                 args=[script_path],
-                env=builtin_python_env(base_dir),
+                env=builtin_python_env(base_dir, server_id),
             )
             if ok:
                 logger.info(f"Built-in MCP server registered: {name}")

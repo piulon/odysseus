@@ -17,6 +17,18 @@ from src.runtime_paths import get_app_root
 
 logger = logging.getLogger(__name__)
 
+
+def _stdio_server_env(env: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """Return only explicitly authorised environment variables for an MCP.
+
+    The MCP SDK itself supplies its minimal default environment (HOME and PATH).
+    Never merge the Odysseus parent process environment here: doing so would
+    expose unrelated application, provider, admin, and infrastructure secrets
+    to MCP subprocesses.
+    """
+    return dict(env) if env else None
+
+
 def _format_mcp_connection_error(name: str, command: str = "", args: Optional[List[str]] = None, error: Exception = None) -> str:
     """Return a user-actionable MCP connection error message."""
     args = args or []
@@ -192,7 +204,7 @@ class McpManager:
             server_params = StdioServerParameters(
                 command=command,
                 args=args,
-                env={**os.environ, **env} if env else None,
+                env=_stdio_server_env(env),
             )
 
             stack = AsyncExitStack()
@@ -558,7 +570,7 @@ class McpManager:
                 transport="stdio",
                 command=sys.executable,
                 args=[script_path],
-                env=builtin_python_env(base_dir),
+                env=builtin_python_env(base_dir, server_id),
             )
             if ok:
                 logger.info(f"Reconnected builtin MCP server: {name}")
