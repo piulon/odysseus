@@ -122,6 +122,12 @@ def _build_fastembed_client():
 def _build_custom_client():
     from src.embeddings import EmbeddingClient, get_embedding_client
 
+    # No persisted or environment-configured HTTP endpoint means that the
+    # custom lane is intentionally disabled. FastEmbed remains available as
+    # its own lane, so this is not an error condition.
+    if not _load_custom_endpoint():
+        return None
+
     client = get_embedding_client()
     if isinstance(client, EmbeddingClient):
         return client

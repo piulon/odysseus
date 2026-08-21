@@ -242,7 +242,7 @@ def test_build_embedding_lanes_uses_fastembed_when_custom_unavailable(monkeypatc
     assert built[0].collection_name == "odysseus_tool_index_fastembed"
 
 
-def test_custom_lane_preserves_default_embedding_client_probe(monkeypatch):
+def test_custom_lane_is_disabled_when_no_http_endpoint_is_configured(monkeypatch):
     import src.embedding_lanes as lanes
     import src.embeddings as embeddings
 
@@ -251,18 +251,82 @@ def test_custom_lane_preserves_default_embedding_client_probe(monkeypatch):
 
     calls = []
 
-    class DefaultClient(FakeEmbedder):
+    class UnexpectedHttpClient(FakeEmbedder):
         def __init__(self, url=None, model=None, api_key=None):
             calls.append({"url": url, "model": model, "api_key": api_key})
-            super().__init__(768, model or "all-minilm:l6-v2", url or "http://localhost:11434/v1/embeddings")
+            super().__init__(
+                768,
+                model or "all-minilm:l6-v2",
+                url or "http://localhost:11434/v1/embeddings",
+            )
 
-    monkeypatch.setattr(embeddings, "EmbeddingClient", DefaultClient)
+    monkeypatch.setattr(
+        embeddings,
+        "EmbeddingClient",
+        UnexpectedHttpClient,
+    )
 
     client = lanes._build_custom_client()
 
-    assert calls == [{"url": None, "model": None, "api_key": None}]
-    assert client.url == "http://localhost:11434/v1/embeddings"
+    assert client is None
+    assert calls == []
     embeddings.reset_http_embed_state()
+
+
+def test_get_embedding_client_skips_http_when_url_is_empty(monkeypatch):
+    import src.embeddings as embeddings
+
+    embeddings.reset_http_embed_state()
+
+    monkeypatch.setenv("EMBEDDING_URL", "")
+    monkeypatch.setenv("EMBEDDING_MODEL", "")
+    monkeypatch.setattr(
+        embeddings,
+        "_load_persisted_endpoint",
+        lambda: {},
+    )
+
+    http_calls = []
+
+    class UnexpectedHttpClient:
+        def __init__(self, *args, **kwargs):
+            http_calls.append((args, kwargs))
+
+        def get_sentence_embedding_dimension(self):
+            raise AssertionError(
+                "HTTP client must not be probed without EMBEDDING_URL"
+            )
+
+    class LocalFastEmbed(FakeEmbedder):
+        def __init__(self):
+            super().__init__(
+                384,
+                "mini",
+                "local://fastembed",
+            )
+
+    monkeypatch.setattr(
+        embeddings,
+        "EmbeddingClient",
+        UnexpectedHttpClient,
+    )
+    monkeypatch.setattr(
+        embeddings,
+        "FastEmbedClient",
+        LocalFastEmbed,
+    )
+
+    try:
+        client = embeddings.get_embedding_client()
+
+        assert isinstance(
+            client,
+            LocalFastEmbed,
+        )
+        assert http_calls == []
+
+    finally:
+        embeddings.reset_http_embed_state()
 
 
 def test_custom_lane_uses_http_down_latch(monkeypatch):
@@ -270,6 +334,23 @@ def test_custom_lane_uses_http_down_latch(monkeypatch):
     import src.embeddings as embeddings
 
     embeddings.reset_http_embed_state()
+
+    # This test exercises the HTTP-down latch, so an HTTP embedding
+    # endpoint must be explicitly configured under the new opt-in contract.
+    monkeypatch.setenv(
+        "EMBEDDING_URL",
+        "http://embeddings.test/v1/embeddings",
+    )
+    monkeypatch.setenv(
+        "EMBEDDING_MODEL",
+        "embed-test",
+    )
+    monkeypatch.setattr(
+        embeddings,
+        "_load_persisted_endpoint",
+        lambda: {},
+    )
+
     calls = []
 
     class DownClient:

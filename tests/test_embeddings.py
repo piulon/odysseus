@@ -4,6 +4,19 @@ from src.embeddings import EmbeddingClient
 
 
 class TestEmbeddingClient:
+    def test_present_but_empty_env_uses_defaults(self, monkeypatch):
+        """Empty Docker-injected overrides behave like absent overrides."""
+        monkeypatch.setenv("EMBEDDING_URL", "")
+        monkeypatch.setenv("EMBEDDING_MODEL", "")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "")
+        monkeypatch.setenv("LLM_HOST", "ollama")
+
+        client = EmbeddingClient()
+
+        assert client.url == "http://ollama:11434/v1/embeddings"
+        assert client.model == "all-minilm:l6-v2"
+        assert client.api_key is None
+
     _MOCK_RESPONSE = {
         "data": [{"embedding": [0.1], "index": 0}],
     }
