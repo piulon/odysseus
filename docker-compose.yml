@@ -97,7 +97,7 @@ services:
     image: docker.io/binwiederhier/ntfy@sha256:081b53dbb20674fcfe05fdb4eb8af9036a2645ef979543d16f7f80803af467b1
     command: serve
     ports:
-      - "100.87.190.46:8091:80"
+      - "${ODYSSEUS_TAILSCALE_IP:?ODYSSEUS_TAILSCALE_IP is required}:8091:80"
     volumes:
       - ntfy-cache:/var/cache/ntfy
     environment:
