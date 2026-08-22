@@ -26,6 +26,7 @@ from src.llm_core import (
     stream_llm_with_fallback,
 )
 from src.chat_model_router import ChatRoute, RouteTarget, resolve_chat_route
+from src.adaptive_chat_router import resolve_adaptive_chat_route
 from src.chat_route_authorizer import (
     ChatRouteAuthorizationError,
     authorize_chat_route,
@@ -213,9 +214,31 @@ def _manual_fallback_route(route: ChatRoute, sess) -> ChatRoute | None:
     return _manual_chat_route(sess, reason="manual_fallback")
 
 
+_ADAPTIVE_ROUTING_ENABLED = False
+_ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS = 60.0
+
+
+def _resolve_effective_auto_route(sess, *, owner, agent_mode: bool) -> ChatRoute:
+    """Select legacy Auto routing unless Adaptive is explicitly enabled."""
+    if not _ADAPTIVE_ROUTING_ENABLED:
+        return resolve_chat_route(
+            sess,
+            owner=owner,
+            agent_mode=agent_mode,
+        )
+
+    return resolve_adaptive_chat_route(
+        sess,
+        owner=owner,
+        agent_mode=agent_mode,
+        enabled=True,
+        snapshot_ttl_seconds=_ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS,
+    )
+
+
 def _select_auto_stream_context_candidate(sess, *, owner, auth):
     """Select and hydrate the one candidate used to build streaming context."""
-    selected_primary = resolve_chat_route(sess, owner=owner, agent_mode=False)
+    selected_primary = _resolve_effective_auto_route(sess, owner=owner, agent_mode=False)
     requested_model = selected_primary.target.model
     manual_fallback = _manual_fallback_route(selected_primary, sess)
     context_route = selected_primary
@@ -240,7 +263,7 @@ def _select_auto_stream_context_candidate(sess, *, owner, auth):
 
 def _select_auto_agent_context_candidate(sess, *, owner, auth):
     """Select and hydrate the one candidate used for one-shot agent context."""
-    selected_primary = resolve_chat_route(sess, owner=owner, agent_mode=True)
+    selected_primary = _resolve_effective_auto_route(sess, owner=owner, agent_mode=True)
     requested_model = selected_primary.target.model
     manual_fallback = _manual_fallback_route(selected_primary, sess)
     context_route = selected_primary
@@ -800,7 +823,7 @@ def setup_chat_routes(
             return {"response": memory_response}
 
         selected_primary = (
-            resolve_chat_route(sess, owner=owner, agent_mode=False)
+            _resolve_effective_auto_route(sess, owner=owner, agent_mode=False)
             if auto_normal
             else _manual_chat_route(sess)
         )
