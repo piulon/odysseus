@@ -3,6 +3,12 @@ import threading
 import time
 
 from src import adaptive_routing_worker as worker
+from src.adaptive_routing import RoutingCandidate
+from src.adaptive_routing_snapshot import (
+    capture_adaptive_routing_snapshot_generation,
+    get_adaptive_routing_snapshot,
+    publish_adaptive_routing_snapshot,
+)
 
 
 def test_feature_gate_off_performs_no_owner_enumeration_or_refresh(monkeypatch):
@@ -149,5 +155,50 @@ def test_start_is_idempotent_and_stop_cancels_cleanly(monkeypatch):
 
         assert worker.adaptive_routing_worker_running() is False
         assert first.cancelled()
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_fences_refresh_thread_publication(monkeypatch):
+    monkeypatch.setenv("ODYSSEUS_ADAPTIVE_ROUTING_REFRESH", "1")
+    worker._worker_task = None
+    started = threading.Event()
+    released = threading.Event()
+    finished = threading.Event()
+    candidate = RoutingCandidate(
+        endpoint_id="endpoint",
+        endpoint_url="http://localhost/chat",
+        model="model",
+        node="node",
+        scope="local",
+    )
+
+    def blocked_refresh(owner, *, timeout):
+        generation = capture_adaptive_routing_snapshot_generation(owner)
+        started.set()
+        released.wait(2)
+        try:
+            return publish_adaptive_routing_snapshot(
+                owner,
+                (candidate,),
+                expected_generation=generation,
+            )
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(worker, "get_setting", lambda key, default=None: True)
+    monkeypatch.setattr(worker, "refresh_owner_adaptive_snapshot", blocked_refresh)
+
+    async def scenario():
+        worker.start_adaptive_routing_worker(lambda: ["alice"])
+        assert await asyncio.to_thread(started.wait, 1)
+
+        # stop() invalidates the snapshot generation before cancelling the
+        # asyncio task; the underlying refresh thread is deliberately released
+        # only afterward to reproduce the stale-publication race.
+        await worker.stop_adaptive_routing_worker()
+        released.set()
+        assert await asyncio.to_thread(finished.wait, 1)
+        assert get_adaptive_routing_snapshot("alice", max_age_seconds=60) is None
 
     asyncio.run(scenario())

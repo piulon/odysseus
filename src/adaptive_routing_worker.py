@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from src.adaptive_routing_refresh import refresh_owner_adaptive_snapshot
+from src.adaptive_routing_snapshot import clear_adaptive_routing_snapshot
 from src.settings import get_setting
 
 logger = logging.getLogger(__name__)
@@ -150,6 +151,11 @@ def start_adaptive_routing_worker(
 async def stop_adaptive_routing_worker() -> None:
     """Cancel and await the worker during application shutdown."""
     global _worker_task
+
+    # Invalidate before cancelling the asyncio task.  Cancellation cannot stop
+    # a refresh already running in asyncio.to_thread(); its captured snapshot
+    # generation will therefore reject any publication after shutdown begins.
+    clear_adaptive_routing_snapshot()
 
     task = _worker_task
     _worker_task = None

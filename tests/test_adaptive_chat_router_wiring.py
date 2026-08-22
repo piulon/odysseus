@@ -124,6 +124,38 @@ def test_effective_auto_route_opt_in_uses_adaptive(
     ]
 
 
+def test_specialized_non_stream_request_forces_legacy_even_when_adaptive_enabled(
+    monkeypatch,
+):
+    session = SimpleNamespace(auto_route=True)
+    legacy = _route("legacy_research")
+    adaptive_calls = []
+
+    monkeypatch.setattr(
+        settings_module,
+        "get_setting",
+        lambda key, default=None: True
+        if key == "adaptive_routing_enabled"
+        else 60,
+    )
+    monkeypatch.setattr(chat_routes, "resolve_chat_route", lambda *a, **k: legacy)
+    monkeypatch.setattr(
+        chat_routes,
+        "resolve_adaptive_chat_route",
+        lambda *a, **k: adaptive_calls.append((a, k)),
+    )
+
+    result = chat_routes._resolve_effective_auto_route_for_request(
+        session,
+        owner="alice",
+        agent_mode=False,
+        adaptive_eligible=False,
+    )
+
+    assert result is legacy
+    assert adaptive_calls == []
+
+
 def test_adaptive_runtime_settings_are_global_and_disabled_by_default():
     assert settings_module.DEFAULT_SETTINGS["adaptive_routing_enabled"] is False
     assert (

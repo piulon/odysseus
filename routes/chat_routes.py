@@ -275,9 +275,31 @@ def _resolve_effective_auto_route(sess, *, owner, agent_mode: bool) -> ChatRoute
     )
 
 
+def _resolve_effective_auto_route_for_request(
+    sess,
+    *,
+    owner,
+    agent_mode: bool,
+    adaptive_eligible: bool = True,
+) -> ChatRoute:
+    """Resolve one request route, keeping specialized requests on Legacy.
+
+    The eligibility decision is made by the caller once and the returned route
+    is then reused for context construction and dispatch. Adaptive disabled
+    behavior remains the exact legacy resolver path.
+    """
+    if not adaptive_eligible:
+        return resolve_chat_route(sess, owner=owner, agent_mode=agent_mode)
+    return _resolve_effective_auto_route(sess, owner=owner, agent_mode=agent_mode)
+
+
 def _select_auto_stream_context_candidate(sess, *, owner, auth):
     """Select and hydrate the one candidate used to build streaming context."""
-    selected_primary = _resolve_effective_auto_route(sess, owner=owner, agent_mode=False)
+    selected_primary = _resolve_effective_auto_route_for_request(
+        sess,
+        owner=owner,
+        agent_mode=False,
+    )
     requested_model = selected_primary.target.model
     manual_fallback = _manual_fallback_route(selected_primary, sess)
     context_route = selected_primary
@@ -302,7 +324,11 @@ def _select_auto_stream_context_candidate(sess, *, owner, auth):
 
 def _select_auto_agent_context_candidate(sess, *, owner, auth):
     """Select and hydrate the one candidate used for one-shot agent context."""
-    selected_primary = _resolve_effective_auto_route(sess, owner=owner, agent_mode=True)
+    selected_primary = _resolve_effective_auto_route_for_request(
+        sess,
+        owner=owner,
+        agent_mode=True,
+    )
     requested_model = selected_primary.target.model
     manual_fallback = _manual_fallback_route(selected_primary, sess)
     context_route = selected_primary
@@ -862,7 +888,12 @@ def setup_chat_routes(
             return {"response": memory_response}
 
         selected_primary = (
-            _resolve_effective_auto_route(sess, owner=owner, agent_mode=False)
+            _resolve_effective_auto_route_for_request(
+                sess,
+                owner=owner,
+                agent_mode=False,
+                adaptive_eligible=not bool(use_research),
+            )
             if auto_normal
             else _manual_chat_route(sess)
         )
