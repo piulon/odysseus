@@ -195,6 +195,90 @@ def test_load_endpoint_owner_visibility_and_filters(monkeypatch, owner, endpoint
     assert db.closed is True
 
 
+def test_load_endpoint_ollama_openai_compat_v1_uses_native_discovery(monkeypatch):
+    import core.database as database
+    import src.endpoint_resolver as endpoint_resolver
+
+    row = SimpleNamespace(
+        id="ep",
+        owner=None,
+        is_enabled=True,
+        model_type="llm",
+        base_url="http://ollama:11434/v1",
+        endpoint_kind="local",
+        api_key=None,
+        provider_auth_id=None,
+        hidden_models=None,
+    )
+    db = _DB(row)
+
+    monkeypatch.setattr(database, "ModelEndpoint", _ModelEndpoint)
+    monkeypatch.setattr(database, "SessionLocal", lambda: db)
+    monkeypatch.setattr(
+        endpoint_resolver,
+        "resolve_endpoint_runtime",
+        lambda endpoint, owner=None: (endpoint.base_url, None),
+    )
+    monkeypatch.setattr(
+        endpoint_resolver,
+        "build_headers",
+        lambda api_key, base: {},
+    )
+    monkeypatch.setattr(
+        endpoint_resolver,
+        "_endpoint_hidden_models",
+        lambda endpoint: set(),
+    )
+
+    loaded = refresh._load_ollama_endpoint("ep", None)
+
+    assert loaded is not None
+    assert loaded.base_url == "http://ollama:11434/v1"
+    assert loaded.chat_url == "http://ollama:11434/v1/chat/completions"
+    assert loaded.models_url == "http://ollama:11434/api/tags"
+    assert loaded.show_url == "http://ollama:11434/api/show"
+    assert db.closed is True
+
+
+def test_load_endpoint_does_not_treat_arbitrary_openai_v1_as_ollama(monkeypatch):
+    import core.database as database
+    import src.endpoint_resolver as endpoint_resolver
+
+    row = SimpleNamespace(
+        id="ep",
+        owner=None,
+        is_enabled=True,
+        model_type="llm",
+        base_url="http://example.test:1234/v1",
+        endpoint_kind="local",
+        api_key=None,
+        provider_auth_id=None,
+        hidden_models=None,
+    )
+    db = _DB(row)
+
+    monkeypatch.setattr(database, "ModelEndpoint", _ModelEndpoint)
+    monkeypatch.setattr(database, "SessionLocal", lambda: db)
+    monkeypatch.setattr(
+        endpoint_resolver,
+        "resolve_endpoint_runtime",
+        lambda endpoint, owner=None: (endpoint.base_url, None),
+    )
+    monkeypatch.setattr(
+        endpoint_resolver,
+        "build_headers",
+        lambda api_key, base: {},
+    )
+    monkeypatch.setattr(
+        endpoint_resolver,
+        "_endpoint_hidden_models",
+        lambda endpoint: set(),
+    )
+
+    assert refresh._load_ollama_endpoint("ep", None) is None
+    assert db.closed is True
+
+
 @pytest.mark.parametrize("url", [
     "file:///tmp/x",
     "ftp://host/x",

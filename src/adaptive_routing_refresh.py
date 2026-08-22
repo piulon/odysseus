@@ -17,7 +17,7 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from src.adaptive_routing_candidates import ollama_candidate_from_show_payload
 from src.adaptive_routing_snapshot import (
@@ -25,7 +25,11 @@ from src.adaptive_routing_snapshot import (
     publish_adaptive_routing_snapshot,
 )
 from src.endpoint_resolver import build_chat_url, resolve_endpoint_runtime
-from src.llm_core import _detect_provider, _ollama_api_root
+from src.llm_core import (
+    _detect_provider,
+    _is_ollama_openai_compat_url,
+    _ollama_api_root,
+)
 from src.model_capability_readers import ollama
 
 logger = logging.getLogger(__name__)
@@ -116,6 +120,31 @@ def _scope_for_endpoint(endpoint_kind: Any, base_url: str) -> str:
     return "cloud"
 
 
+def _ollama_discovery_api_root(runtime_base: str) -> str | None:
+    """Return the native Ollama /api root used only for capability discovery.
+
+    Odysseus deliberately keeps ``:11434/v1`` endpoints OpenAI-compatible for
+    normal chat execution. Adaptive discovery still needs Ollama's native
+    /api/tags and /api/show endpoints, so translate only that known compat form.
+    """
+    if _detect_provider(runtime_base) == "ollama":
+        return _safe_probe_url(_ollama_api_root(runtime_base).rstrip("/"))
+
+    if not _is_ollama_openai_compat_url(runtime_base):
+        return None
+
+    parsed = urlparse(runtime_base)
+    native_root = urlunparse(
+        parsed._replace(
+            path="/api",
+            params="",
+            query="",
+            fragment="",
+        )
+    )
+    return _safe_probe_url(native_root.rstrip("/"))
+
+
 @dataclass(frozen=True, repr=True)
 class _ProbeEndpoint:
     endpoint_id: str
@@ -159,13 +188,25 @@ def _load_ollama_endpoint(endpoint_id: str, owner: str | None) -> _ProbeEndpoint
             owner=owner_key or None,
         )
         runtime_base = _safe_probe_url(runtime_base)
-        if _detect_provider(runtime_base) != "ollama":
+
+        api_root = _ollama_discovery_api_root(runtime_base)
+        if api_root is None:
             return None
 
+        # Preserve the configured execution protocol. Native Ollama continues
+        # to use /api/chat, while :11434/v1 remains OpenAI-compatible.
         chat_url = _safe_probe_url(build_chat_url(runtime_base, resolve_host=False))
-        if not urlparse(chat_url).path.rstrip("/").endswith("/api/chat"):
+        chat_path = urlparse(chat_url).path.rstrip("/")
+
+        if _detect_provider(runtime_base) == "ollama":
+            if not chat_path.endswith("/api/chat"):
+                return None
+        elif _is_ollama_openai_compat_url(runtime_base):
+            if not chat_path.endswith("/v1/chat/completions"):
+                return None
+        else:
             return None
-        api_root = _safe_probe_url(_ollama_api_root(runtime_base).rstrip("/"))
+
         models_url = _safe_probe_url(api_root + "/tags")
         show_url = _safe_probe_url(api_root + "/show")
         # Validate configured provenance too; runtime credentials may change the base.
