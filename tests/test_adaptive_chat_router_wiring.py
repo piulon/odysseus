@@ -137,7 +137,22 @@ def test_adaptive_runtime_settings_are_global_and_disabled_by_default():
     )
 
 
-@pytest.mark.parametrize("raw_ttl", [None, "", "invalid", 0, -1])
+@pytest.mark.parametrize(
+    "raw_ttl",
+    [
+        None,
+        "",
+        "invalid",
+        0,
+        -1,
+        "nan",
+        "inf",
+        "-inf",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+)
 def test_adaptive_runtime_invalid_ttl_falls_back_safely(monkeypatch, raw_ttl):
     def get_setting(key, default=None):
         if key == "adaptive_routing_enabled":

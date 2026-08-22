@@ -221,6 +221,7 @@ _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT = 60.0
 def _adaptive_routing_runtime_config() -> tuple[bool, float]:
     """Read the global Adaptive feature gate with fail-safe defaults."""
     try:
+        from math import isfinite
         from src.settings import get_setting
 
         # Require an actual bool True. Malformed/string values cannot
@@ -242,7 +243,7 @@ def _adaptive_routing_runtime_config() -> tuple[bool, float]:
         except (TypeError, ValueError):
             ttl = _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT
 
-        if ttl <= 0:
+        if not isfinite(ttl) or ttl <= 0:
             ttl = _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT
 
         return enabled, ttl
