@@ -66,6 +66,14 @@ from src.tool_policy import (
     known_tool_names,
     web_search_enabled_for_turn,
 )
+from src.routing_observability import (
+    log_llm_dispatch,
+    log_manual_authorized,
+    log_routing_authorized,
+    log_routing_decision,
+    log_routing_fallback,
+    new_routing_trace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +116,7 @@ async def _stream_auto_chat_with_fallback(
     messages,
     stream_kwargs: Dict[str, Any],
     state: _AutoStreamState,
+    routing_trace: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Authorize and stream at most primary + manual fallback request-locally."""
     route = context_route
@@ -116,6 +125,7 @@ async def _stream_auto_chat_with_fallback(
     while True:
         try:
             candidate = authorize_chat_route(route, sess, auth=auth)
+            log_routing_authorized(routing_trace, candidate)
         except ChatRouteAuthorizationError as exc:
             if (
                 fallback_available
@@ -123,6 +133,12 @@ async def _stream_auto_chat_with_fallback(
             ):
                 route = manual_fallback
                 fallback_available = False
+                log_routing_fallback(
+                    routing_trace,
+                    from_model=getattr(context_route.target, "model", ""),
+                    to_model=getattr(route.target, "model", ""),
+                    reason="authorization_unavailable",
+                )
                 continue
             yield _authorization_stream_error(exc)
             return
@@ -132,6 +148,13 @@ async def _stream_auto_chat_with_fallback(
         actual_model = None
         failure: Optional[BaseException] = None
         try:
+            log_llm_dispatch(
+                routing_trace,
+                lane="chat",
+                endpoint_id=candidate.endpoint_id,
+                model=candidate.model,
+                endpoint_url=candidate.endpoint_url,
+            )
             async for chunk in stream_llm(
                 candidate.endpoint_url,
                 candidate.model,
@@ -187,6 +210,12 @@ async def _stream_auto_chat_with_fallback(
         )
         empty_completion = failure is None
         if fallback_available and (recoverable or empty_completion):
+            log_routing_fallback(
+                routing_trace,
+                from_model=candidate.model,
+                to_model=manual_fallback.model if manual_fallback else "",
+                reason="dispatch_failed_before_output" if recoverable else "empty_completion",
+            )
             route = manual_fallback
             fallback_available = False
             continue
@@ -293,7 +322,7 @@ def _resolve_effective_auto_route_for_request(
     return _resolve_effective_auto_route(sess, owner=owner, agent_mode=agent_mode)
 
 
-def _select_auto_stream_context_candidate(sess, *, owner, auth):
+def _select_auto_stream_context_candidate(sess, *, owner, auth, routing_trace=None):
     """Select and hydrate the one candidate used to build streaming context."""
     selected_primary = _resolve_effective_auto_route_for_request(
         sess,
@@ -301,6 +330,7 @@ def _select_auto_stream_context_candidate(sess, *, owner, auth):
         agent_mode=False,
     )
     requested_model = selected_primary.target.model
+    log_routing_decision(routing_trace, selected_primary)
     manual_fallback = _manual_fallback_route(selected_primary, sess)
     context_route = selected_primary
     try:
@@ -322,7 +352,7 @@ def _select_auto_stream_context_candidate(sess, *, owner, auth):
     )
 
 
-def _select_auto_agent_context_candidate(sess, *, owner, auth):
+def _select_auto_agent_context_candidate(sess, *, owner, auth, routing_trace=None):
     """Select and hydrate the one candidate used for one-shot agent context."""
     selected_primary = _resolve_effective_auto_route_for_request(
         sess,
@@ -330,6 +360,7 @@ def _select_auto_agent_context_candidate(sess, *, owner, auth):
         agent_mode=True,
     )
     requested_model = selected_primary.target.model
+    log_routing_decision(routing_trace, selected_primary)
     manual_fallback = _manual_fallback_route(selected_primary, sess)
     context_route = selected_primary
     try:
@@ -818,6 +849,7 @@ def setup_chat_routes(
     # ------------------------------------------------------------------ #
     @router.post("/api/chat", response_model=Dict[str, str])
     async def chat_endpoint(request: Request, chat_request: ChatRequest) -> Dict[str, str]:
+        routing_trace = new_routing_trace()
         _set_user_time_from_request(request)
 
         message = chat_request.message
@@ -899,6 +931,7 @@ def setup_chat_routes(
         )
         requested_model = selected_primary.target.model
         manual_fallback = _manual_fallback_route(selected_primary, sess)
+        log_routing_decision(routing_trace, selected_primary)
 
         # Hydrate once for context construction. This is required because
         # maybe_compact() may call an LLM; the candidate is rehydrated again
@@ -926,6 +959,7 @@ def setup_chat_routes(
                     raise _authorization_http_error(fallback_exc) from None
             else:
                 raise _authorization_http_error(exc) from None
+        log_routing_authorized(routing_trace, context_candidate)
 
         # Build shared context (preset, preprocess, preface, compact)
         context_overrides = {}
@@ -995,8 +1029,16 @@ def setup_chat_routes(
                     raise _authorization_http_error(fallback_exc) from None
             else:
                 raise _authorization_http_error(exc) from None
+        log_routing_authorized(routing_trace, dispatch_candidate)
 
         async def _dispatch(candidate):
+            log_llm_dispatch(
+                routing_trace,
+                lane="chat",
+                endpoint_id=candidate.endpoint_id,
+                model=candidate.model,
+                endpoint_url=candidate.endpoint_url,
+            )
             return await llm_call_async(
                 candidate.endpoint_url,
                 candidate.model,
@@ -1019,11 +1061,18 @@ def setup_chat_routes(
             ):
                 try:
                     dispatch_route = manual_fallback
+                    log_routing_fallback(
+                        routing_trace,
+                        from_model=dispatch_candidate.model,
+                        to_model=manual_fallback.target.model,
+                        reason="dispatch_failed_before_output",
+                    )
                     dispatch_candidate = authorize_chat_route(
                         dispatch_route,
                         sess,
                         auth=auth,
                     )
+                    log_routing_authorized(routing_trace, dispatch_candidate)
                     reply = await _dispatch(dispatch_candidate)
                 except ChatRouteAuthorizationError as fallback_exc:
                     raise _authorization_http_error(fallback_exc) from None
@@ -1062,6 +1111,7 @@ def setup_chat_routes(
     # ------------------------------------------------------------------ #
     @router.post("/api/chat_stream")
     async def chat_stream(request: Request) -> StreamingResponse:
+        routing_trace = new_routing_trace()
         body = None
         try:
             if request.headers.get("content-type", "").startswith("application/json"):
@@ -1342,6 +1392,7 @@ def setup_chat_routes(
                         sess,
                         owner=owner,
                         auth=stream_auth,
+                        routing_trace=routing_trace,
                     )
                 else:
                     (
@@ -1354,13 +1405,19 @@ def setup_chat_routes(
                         sess,
                         owner=owner,
                         auth=stream_auth,
+                        routing_trace=routing_trace,
                     )
             except ChatRouteAuthorizationError as exc:
                 raise _authorization_http_error(exc) from None
         else:
             _enforce_chat_privileges(request, sess)
+            log_routing_decision(routing_trace, _manual_chat_route(sess))
             # Legacy/manual hydration may mutate and persist session headers.
             resolve_session_auth(sess, session, owner=owner)
+            log_manual_authorized(routing_trace, getattr(sess, "model", ""))
+
+        if auto_stream_chat or auto_agent:
+            log_routing_authorized(routing_trace, context_candidate)
 
         no_memory = str(form_data.get("no_memory", "")).lower() == "true"
         pre_context_tool_policy = build_effective_tool_policy(
@@ -1895,6 +1952,7 @@ def setup_chat_routes(
                             messages=messages,
                             stream_kwargs=_stream_kwargs,
                             state=_auto_stream_state,
+                            routing_trace=routing_trace,
                         )
                     else:
                         _chat_candidates = [
@@ -1903,6 +1961,8 @@ def setup_chat_routes(
                         _chat_stream = stream_llm_with_fallback(
                             _chat_candidates,
                             messages,
+                            _routing_trace=routing_trace,
+                            _routing_lane="chat",
                             **_stream_kwargs,
                         )
                     async for chunk in _chat_stream:
@@ -2091,6 +2151,7 @@ def setup_chat_routes(
                             manual_fallback_route=manual_fallback,
                             active_route=context_route,
                             authorize_route=_authorize_agent_route,
+                            routing_trace=routing_trace,
                         )
 
                     _agent_endpoint = context_candidate.endpoint_url if auto_agent else sess.endpoint_url
@@ -2128,6 +2189,7 @@ def setup_chat_routes(
                         exclusive_tools=_exclusive_tools,
                         uploaded_files=ctx.uploaded_files,
                         route_state=_agent_route_state,
+                        routing_trace=routing_trace,
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:

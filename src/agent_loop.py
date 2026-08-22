@@ -29,6 +29,11 @@ from src.settings import get_setting
 from src.prompt_security import untrusted_context_message
 from src.tool_security import blocked_tools_for_owner, plan_mode_disabled_tools
 from src.tool_policy import GUIDE_ONLY_DIRECTIVE, WEB_TOOL_NAMES, ToolPolicy
+from src.routing_observability import (
+    log_llm_dispatch,
+    log_routing_authorized,
+    log_routing_fallback,
+)
 from src.tool_utils import _truncate, get_mcp_manager
 from src.agent_tools import (
     parse_tool_blocks,
@@ -64,6 +69,7 @@ class AgentRouteState:
     manual_fallback_route: Any = field(default=None, repr=False)
     active_route: Any = field(default=None, repr=False)
     authorize_route: Callable[[Any], Any] = field(default=None, repr=False)
+    routing_trace: Optional[str] = None
     winner_model: Optional[str] = None
     committed: bool = False
     commit_reason: Optional[str] = None
@@ -209,6 +215,7 @@ async def _stream_auto_agent_round(
     while True:
         try:
             candidate = state.authorize_route(state.active_route)
+            log_routing_authorized(state.routing_trace, candidate)
         except (asyncio.CancelledError, GeneratorExit):
             raise
         except ChatRouteAuthorizationError as exc:
@@ -218,6 +225,12 @@ async def _stream_auto_agent_round(
                 and exc.code in _AUTO_AGENT_CANDIDATE_UNAVAILABLE
                 and state.switch_to_manual_fallback()
             ):
+                log_routing_fallback(
+                    state.routing_trace,
+                    from_model=state.current_candidate_model or state.requested_model,
+                    to_model=state.active_route.target.model,
+                    reason="authorization_unavailable",
+                )
                 continue
             state.fail(403 if exc.code in {
                 "invalid_auth_context", "privileges_unavailable",
@@ -239,6 +252,13 @@ async def _stream_auto_agent_round(
         completed = False
         failure: Optional[Exception] = None
         try:
+            log_llm_dispatch(
+                state.routing_trace,
+                lane="agent",
+                endpoint_id=candidate.endpoint_id,
+                model=candidate.model,
+                endpoint_url=candidate.endpoint_url,
+            )
             async for chunk in stream_llm(
                 candidate.endpoint_url,
                 candidate.model,
@@ -306,6 +326,12 @@ async def _stream_auto_agent_round(
                 and is_recoverable_chat_dispatch_error(failure)
                 and state.switch_to_manual_fallback()
             ):
+                log_routing_fallback(
+                    state.routing_trace,
+                    from_model=candidate.model,
+                    to_model=state.active_route.target.model,
+                    reason="dispatch_failed_before_output",
+                )
                 continue
             status = failure.status_code if isinstance(failure, ChatDispatchError) else 500
             state.fail(status)
@@ -3069,6 +3095,7 @@ async def stream_agent_loop(
     workload: str = "foreground",
     _is_teacher_run: bool = False,
     route_state: Optional[AgentRouteState] = None,
+    routing_trace: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
 
@@ -5102,6 +5129,8 @@ async def stream_agent_loop(
             _round_stream = stream_llm_with_fallback(
                 _candidates,
                 messages,
+                _routing_trace=routing_trace,
+                _routing_lane="agent",
                 **_round_stream_kwargs,
             )
 

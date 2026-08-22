@@ -3101,6 +3101,11 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
 
     Yields the same SSE chunk protocol as stream_llm.
     """
+    routing_trace = kwargs.pop("_routing_trace", None)
+    routing_lane = kwargs.pop("_routing_lane", "chat")
+    routing_endpoint_id = kwargs.pop("_routing_endpoint_id", None)
+    from src.routing_observability import log_llm_dispatch, log_routing_fallback
+
     cands = _dedupe_candidates(candidates)
     if not cands:
         yield f'event: error\ndata: {json.dumps({"error": "No model endpoint configured", "status": 503})}\n\n'
@@ -3110,6 +3115,13 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
     last_error = None
     for i, (url, model, headers) in enumerate(cands):
         is_last = (i == len(cands) - 1)
+        log_llm_dispatch(
+            routing_trace,
+            lane=routing_lane,
+            endpoint_id=routing_endpoint_id if i == 0 else None,
+            model=model,
+            endpoint_url=url,
+        )
         emitted = False
         retried = False
         pending_metadata = []
@@ -3121,6 +3133,13 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                     last_error = chunk
                     retried = True
                     if i == 0:
+                        if len(cands) > 1:
+                            log_routing_fallback(
+                                routing_trace,
+                                from_model=model,
+                                to_model=cands[1][1],
+                                reason="primary_dispatch_failed_before_output",
+                            )
                         logger.warning(f"[fallback] primary {model} failed before output; trying fallback")
                     else:
                         logger.warning(f"[fallback] candidate {model} failed; trying next")
