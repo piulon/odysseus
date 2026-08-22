@@ -140,6 +140,10 @@ DEFAULT_SETTINGS = {
     "auto_chat_model": "",
     "auto_agent_endpoint_id": "",
     "auto_agent_model": "",
+    # Experimental process-local Adaptive router. This is an operator-level
+    # feature gate, deliberately not a per-user preference.
+    "adaptive_routing_enabled": False,
+    "adaptive_routing_snapshot_ttl_seconds": 60,
     # Optional prose style used only for normal document writing/editing.
     # Email replies use email_writing_style instead because greetings,
     # signatures, and mailbox identity rules are medium-specific.

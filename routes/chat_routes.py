@@ -214,13 +214,51 @@ def _manual_fallback_route(route: ChatRoute, sess) -> ChatRoute | None:
     return _manual_chat_route(sess, reason="manual_fallback")
 
 
-_ADAPTIVE_ROUTING_ENABLED = False
-_ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS = 60.0
+_ADAPTIVE_ROUTING_ENABLED_DEFAULT = False
+_ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT = 60.0
+
+
+def _adaptive_routing_runtime_config() -> tuple[bool, float]:
+    """Read the global Adaptive feature gate with fail-safe defaults."""
+    try:
+        from src.settings import get_setting
+
+        # Require an actual bool True. Malformed/string values cannot
+        # accidentally enable an experimental routing path.
+        enabled = (
+            get_setting(
+                "adaptive_routing_enabled",
+                _ADAPTIVE_ROUTING_ENABLED_DEFAULT,
+            )
+            is True
+        )
+
+        raw_ttl = get_setting(
+            "adaptive_routing_snapshot_ttl_seconds",
+            _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT,
+        )
+        try:
+            ttl = float(raw_ttl)
+        except (TypeError, ValueError):
+            ttl = _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT
+
+        if ttl <= 0:
+            ttl = _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT
+
+        return enabled, ttl
+    except Exception:
+        # Settings failures must preserve the exact legacy routing path.
+        return (
+            _ADAPTIVE_ROUTING_ENABLED_DEFAULT,
+            _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT,
+        )
 
 
 def _resolve_effective_auto_route(sess, *, owner, agent_mode: bool) -> ChatRoute:
-    """Select legacy Auto routing unless Adaptive is explicitly enabled."""
-    if not _ADAPTIVE_ROUTING_ENABLED:
+    """Select legacy Auto routing unless global Adaptive is explicitly enabled."""
+    adaptive_enabled, snapshot_ttl_seconds = _adaptive_routing_runtime_config()
+
+    if not adaptive_enabled:
         return resolve_chat_route(
             sess,
             owner=owner,
@@ -232,7 +270,7 @@ def _resolve_effective_auto_route(sess, *, owner, agent_mode: bool) -> ChatRoute
         owner=owner,
         agent_mode=agent_mode,
         enabled=True,
-        snapshot_ttl_seconds=_ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS,
+        snapshot_ttl_seconds=snapshot_ttl_seconds,
     )
 
 

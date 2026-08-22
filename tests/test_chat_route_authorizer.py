@@ -458,6 +458,7 @@ def test_adaptive_runtime_candidate_uses_authoritative_endpoint(
 ):
     from routes import chat_routes
     from src import adaptive_chat_router
+    from src import settings as settings_module
     from src.adaptive_routing import RoutingCandidate
     from src.adaptive_routing_snapshot import (
         clear_adaptive_routing_snapshot,
@@ -484,9 +485,12 @@ def test_adaptive_runtime_candidate_uses_authoritative_endpoint(
         lambda *a, **k: legacy,
     )
     monkeypatch.setattr(
-        chat_routes,
-        "_ADAPTIVE_ROUTING_ENABLED",
-        True,
+        settings_module,
+        "get_setting",
+        lambda key, default=None: {
+            "adaptive_routing_enabled": True,
+            "adaptive_routing_snapshot_ttl_seconds": 60,
+        }.get(key, default),
     )
 
     publish_adaptive_routing_snapshot(
@@ -563,6 +567,7 @@ def test_adaptive_foreign_endpoint_falls_back_without_leaking_owner_data(
 ):
     from routes import chat_routes
     from src import adaptive_chat_router
+    from src import settings as settings_module
     from src.adaptive_routing import RoutingCandidate
     from src.adaptive_routing_snapshot import (
         clear_adaptive_routing_snapshot,
@@ -597,9 +602,12 @@ def test_adaptive_foreign_endpoint_falls_back_without_leaking_owner_data(
         lambda *a, **k: legacy,
     )
     monkeypatch.setattr(
-        chat_routes,
-        "_ADAPTIVE_ROUTING_ENABLED",
-        True,
+        settings_module,
+        "get_setting",
+        lambda key, default=None: {
+            "adaptive_routing_enabled": True,
+            "adaptive_routing_snapshot_ttl_seconds": 60,
+        }.get(key, default),
     )
 
     publish_adaptive_routing_snapshot(
@@ -685,6 +693,7 @@ def test_adaptive_model_policy_denial_is_terminal(
 ):
     from routes import chat_routes
     from src import adaptive_chat_router
+    from src import settings as settings_module
     from src.adaptive_routing import RoutingCandidate
     from src.adaptive_routing_snapshot import (
         clear_adaptive_routing_snapshot,
@@ -718,9 +727,12 @@ def test_adaptive_model_policy_denial_is_terminal(
         lambda *a, **k: legacy,
     )
     monkeypatch.setattr(
-        chat_routes,
-        "_ADAPTIVE_ROUTING_ENABLED",
-        True,
+        settings_module,
+        "get_setting",
+        lambda key, default=None: {
+            "adaptive_routing_enabled": True,
+            "adaptive_routing_snapshot_ttl_seconds": 60,
+        }.get(key, default),
     )
 
     publish_adaptive_routing_snapshot(

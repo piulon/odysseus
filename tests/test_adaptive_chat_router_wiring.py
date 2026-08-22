@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from routes import chat_routes
+from src import settings as settings_module
 from src.chat_model_router import ChatRoute, RouteTarget
 
 
@@ -33,7 +34,14 @@ def test_effective_auto_route_defaults_to_legacy(monkeypatch):
         adaptive_calls.append((args, kwargs))
         pytest.fail("Adaptive resolver must not run while disabled")
 
-    monkeypatch.setattr(chat_routes, "_ADAPTIVE_ROUTING_ENABLED", False)
+    monkeypatch.setattr(
+        settings_module,
+        "get_setting",
+        lambda key, default=None: {
+            "adaptive_routing_enabled": False,
+            "adaptive_routing_snapshot_ttl_seconds": 60,
+        }.get(key, default),
+    )
     monkeypatch.setattr(chat_routes, "resolve_chat_route", resolve_legacy)
     monkeypatch.setattr(
         chat_routes,
@@ -83,11 +91,13 @@ def test_effective_auto_route_opt_in_uses_adaptive(
         )
         return adaptive
 
-    monkeypatch.setattr(chat_routes, "_ADAPTIVE_ROUTING_ENABLED", True)
     monkeypatch.setattr(
-        chat_routes,
-        "_ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS",
-        37.0,
+        settings_module,
+        "get_setting",
+        lambda key, default=None: {
+            "adaptive_routing_enabled": True,
+            "adaptive_routing_snapshot_ttl_seconds": 37,
+        }.get(key, default),
     )
     monkeypatch.setattr(chat_routes, "resolve_chat_route", resolve_legacy)
     monkeypatch.setattr(
@@ -114,5 +124,60 @@ def test_effective_auto_route_opt_in_uses_adaptive(
     ]
 
 
-def test_adaptive_runtime_flag_is_disabled_by_default():
-    assert chat_routes._ADAPTIVE_ROUTING_ENABLED is False
+def test_adaptive_runtime_settings_are_global_and_disabled_by_default():
+    assert settings_module.DEFAULT_SETTINGS["adaptive_routing_enabled"] is False
+    assert (
+        settings_module.DEFAULT_SETTINGS["adaptive_routing_snapshot_ttl_seconds"]
+        == 60
+    )
+    assert "adaptive_routing_enabled" not in settings_module._PER_USER_KEYS
+    assert (
+        "adaptive_routing_snapshot_ttl_seconds"
+        not in settings_module._PER_USER_KEYS
+    )
+
+
+@pytest.mark.parametrize("raw_ttl", [None, "", "invalid", 0, -1])
+def test_adaptive_runtime_invalid_ttl_falls_back_safely(monkeypatch, raw_ttl):
+    def get_setting(key, default=None):
+        if key == "adaptive_routing_enabled":
+            return True
+        if key == "adaptive_routing_snapshot_ttl_seconds":
+            return raw_ttl
+        return default
+
+    monkeypatch.setattr(settings_module, "get_setting", get_setting)
+
+    enabled, ttl = chat_routes._adaptive_routing_runtime_config()
+
+    assert enabled is True
+    assert ttl == chat_routes._ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT
+
+
+@pytest.mark.parametrize("malformed_enabled", ["true", "1", 1, {}, []])
+def test_adaptive_runtime_requires_literal_true(monkeypatch, malformed_enabled):
+    monkeypatch.setattr(
+        settings_module,
+        "get_setting",
+        lambda key, default=None: (
+            malformed_enabled
+            if key == "adaptive_routing_enabled"
+            else default
+        ),
+    )
+
+    enabled, _ttl = chat_routes._adaptive_routing_runtime_config()
+
+    assert enabled is False
+
+
+def test_adaptive_runtime_settings_failure_falls_back_to_disabled(monkeypatch):
+    def fail(*args, **kwargs):
+        raise RuntimeError("settings unavailable")
+
+    monkeypatch.setattr(settings_module, "get_setting", fail)
+
+    enabled, ttl = chat_routes._adaptive_routing_runtime_config()
+
+    assert enabled is False
+    assert ttl == chat_routes._ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT
