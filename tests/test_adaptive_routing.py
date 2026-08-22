@@ -63,7 +63,6 @@ def test_hard_vision_requirement_rejects_non_vision_model():
 
     assert decision.primary is not None
     assert decision.primary.model == "qwen3-vl:8b"
-    assert decision.fallbacks == ()
 
 
 def test_unreachable_candidate_is_removed():
@@ -88,7 +87,6 @@ def test_unreachable_candidate_is_removed():
 
     assert decision.primary is not None
     assert decision.primary.node == "msi"
-    assert decision.fallbacks == ()
 
 
 def test_local_only_excludes_cloud():
@@ -116,7 +114,6 @@ def test_local_only_excludes_cloud():
 
     assert decision.primary is not None
     assert decision.primary.model == "local-model"
-    assert decision.fallbacks == ()
 
 
 def test_local_preferred_adds_local_bias():
@@ -210,7 +207,10 @@ def test_equal_scores_have_deterministic_order():
 
     assert decision.primary is not None
     assert decision.primary.node == "msi"
-    assert [item.node for item in decision.fallbacks] == ["tower"]
+    assert [
+        item.candidate.node
+        for item in decision.scored
+    ] == ["msi", "tower"]
 
 
 def test_invalid_policy_is_rejected():

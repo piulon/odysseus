@@ -62,7 +62,6 @@ class ScoredCandidate:
 @dataclass(frozen=True)
 class RoutingDecision:
     primary: RoutingCandidate | None
-    fallbacks: tuple[RoutingCandidate, ...]
     scored: tuple[ScoredCandidate, ...]
     reason: str
 
@@ -185,7 +184,6 @@ def build_routing_decision(
     if not scored:
         return RoutingDecision(
             primary=None,
-            fallbacks=(),
             scored=(),
             reason=(
                 f"{profile.workload}:"
@@ -194,14 +192,9 @@ def build_routing_decision(
         )
 
     primary = scored[0].candidate
-    fallbacks = tuple(
-        item.candidate
-        for item in scored[1:]
-    )
 
     return RoutingDecision(
         primary=primary,
-        fallbacks=fallbacks,
         scored=tuple(scored),
         reason=(
             f"{profile.workload}:"

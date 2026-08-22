@@ -110,7 +110,7 @@ def test_tool_requirement_uses_provider_evidence_not_name():
 
     assert decision.primary is not None
     assert decision.primary.model == "small-model"
-    assert decision.fallbacks == ()
+    assert len(decision.scored) == 1
 
 
 def test_realistic_tower_vision_request_selects_vl_candidate():
@@ -178,7 +178,7 @@ def test_realistic_tower_vision_request_selects_vl_candidate():
 
     assert decision.primary is not None
     assert decision.primary.model == "qwen3-vl:8b"
-    assert decision.fallbacks == ()
+    assert len(decision.scored) == 1
 
 
 def test_record_adapter_preserves_reachability_and_preference():
@@ -253,4 +253,4 @@ def test_unreachable_tower_candidate_degrades_to_local_candidate():
 
     assert decision.primary is not None
     assert decision.primary.node == "msi"
-    assert decision.fallbacks == ()
+    assert len(decision.scored) == 1

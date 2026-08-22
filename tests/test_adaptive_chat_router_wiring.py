@@ -196,3 +196,58 @@ def test_adaptive_runtime_settings_failure_falls_back_to_disabled(monkeypatch):
 
     assert enabled is False
     assert ttl == chat_routes._ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT
+
+
+
+def test_adaptive_plain_scope_accepts_only_plain_chat_or_agent():
+    session = SimpleNamespace(auto_route=True)
+
+    common = {
+        "att_ids": [],
+        "image_bypass": False,
+        "do_research": False,
+        "compare_mode": False,
+    }
+
+    assert chat_routes._is_plain_auto_stream_chat(
+        session,
+        chat_mode="chat",
+        **common,
+    )
+    assert chat_routes._is_plain_auto_agent(
+        session,
+        chat_mode="agent",
+        **common,
+    )
+
+
+@pytest.mark.parametrize(
+    "special",
+    [
+        {"att_ids": ["attachment-1"]},
+        {"image_bypass": True},
+        {"do_research": True},
+        {"compare_mode": True},
+    ],
+)
+def test_adaptive_plain_scope_bypasses_specialized_requests(special):
+    session = SimpleNamespace(auto_route=True)
+
+    common = {
+        "att_ids": [],
+        "image_bypass": False,
+        "do_research": False,
+        "compare_mode": False,
+    }
+    common.update(special)
+
+    assert not chat_routes._is_plain_auto_stream_chat(
+        session,
+        chat_mode="chat",
+        **common,
+    )
+    assert not chat_routes._is_plain_auto_agent(
+        session,
+        chat_mode="agent",
+        **common,
+    )
