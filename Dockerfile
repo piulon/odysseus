@@ -21,6 +21,8 @@ RUN bash /usr/local/bin/build-realesrgan-wheels.sh /wheels
 # ---- builder: locked Browser MCP + verified browser artifacts ----
 FROM python:3.14.6-slim@sha256:7bec7ddcddeff7975d6ba9b4be7dd6f6b2f55e7491539145e2978f7f97ce9144 AS playwright-bundle
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # The audited Chrome-for-Testing and Playwright FFmpeg artifacts below are
 # linux64/x86_64 artifacts. Fail closed rather than silently producing an
 # invalid or architecture-mismatched runtime image.
@@ -107,6 +109,8 @@ RUN mkdir -p \
 # ---- final runtime ----
 FROM python:3.14.6-slim@sha256:7bec7ddcddeff7975d6ba9b4be7dd6f6b2f55e7491539145e2978f7f97ce9144
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 COPY docker/configure-debian-snapshot.sh /usr/local/bin/configure-debian-snapshot
 COPY docker/playwright/debian-deps.txt /tmp/playwright-debian-deps.txt
 
@@ -121,7 +125,7 @@ COPY docker/playwright/debian-deps.txt /tmp/playwright-debian-deps.txt
 RUN chmod 0755 /usr/local/bin/configure-debian-snapshot \
     && /usr/local/bin/configure-debian-snapshot \
     && apt-get update \
-    && PW_DEPS="$(tr '\n' ' ' < /tmp/playwright-debian-deps.txt)" \
+    && readarray -t PW_DEPS < /tmp/playwright-debian-deps.txt \
     && apt-get install -y --no-install-recommends \
        build-essential \
        ca-certificates \
@@ -136,7 +140,7 @@ RUN chmod 0755 /usr/local/bin/configure-debian-snapshot \
        libglib2.0-0t64 \
        libxcb1 \
        libmagic1t64 \
-       $PW_DEPS \
+       "${PW_DEPS[@]}" \
     && rm -f /tmp/playwright-debian-deps.txt \
     && rm -f /usr/bin/corepack \
     && rm -rf /usr/share/nodejs/corepack \
@@ -264,7 +268,8 @@ RUN PYTHON_MAGIC_WHEEL=/tmp/python_magic-0.4.27-py2.py3-none-any.whl \
        --no-cache-dir \
        --no-index \
        --no-deps \
-       "$PYTHON_MAGIC_WHEEL" \
+       --find-links /tmp \
+       python-magic==0.4.27 \
     && python -c "from importlib.metadata import version; import magic; assert version('python-magic') == '0.4.27'; assert magic.from_buffer(b'%PDF-1.4\\n%%EOF\\n', mime=True) == 'application/pdf'" \
     && python -m pip check \
     && rm -f "$PYTHON_MAGIC_WHEEL"
