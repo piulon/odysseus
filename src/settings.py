@@ -243,6 +243,30 @@ def load_settings() -> dict:
 def save_settings(settings: dict):
     """Persist settings to disk (atomic; see core.atomic_io)."""
     from core.atomic_io import atomic_write_json
+
+    # Adaptive snapshots are process-local discovery state. Any real gate
+    # transition must invalidate them so a later enable cannot consume
+    # candidates discovered under a previous enabled period.
+    old_enabled = (
+        load_settings().get(
+            "adaptive_routing_enabled",
+            DEFAULT_SETTINGS["adaptive_routing_enabled"],
+        )
+        is True
+    )
+    new_enabled = (
+        settings.get(
+            "adaptive_routing_enabled",
+            DEFAULT_SETTINGS["adaptive_routing_enabled"],
+        )
+        is True
+    )
+
+    if old_enabled != new_enabled:
+        from src.adaptive_routing_snapshot import clear_adaptive_routing_snapshot
+
+        clear_adaptive_routing_snapshot()
+
     atomic_write_json(SETTINGS_FILE, settings, indent=2)
     _invalidate_caches()
 
