@@ -341,6 +341,12 @@ def _select_auto_stream_context_candidate(sess, *, owner, auth, routing_trace=No
             or manual_fallback is None
         ):
             raise
+        log_routing_fallback(
+            routing_trace,
+            from_model=context_route.target.model,
+            to_model=manual_fallback.target.model,
+            reason="authorization_unavailable",
+        )
         context_route = manual_fallback
         context_candidate = authorize_chat_route(context_route, sess, auth=auth)
     return (
@@ -371,6 +377,12 @@ def _select_auto_agent_context_candidate(sess, *, owner, auth, routing_trace=Non
             or manual_fallback is None
         ):
             raise
+        log_routing_fallback(
+            routing_trace,
+            from_model=context_route.target.model,
+            to_model=manual_fallback.target.model,
+            reason="authorization_unavailable",
+        )
         context_route = manual_fallback
         context_candidate = authorize_chat_route(context_route, sess, auth=auth)
     return (
@@ -948,6 +960,12 @@ def setup_chat_routes(
                 exc.code in _AUTHORIZATION_CANDIDATE_UNAVAILABLE
                 and manual_fallback is not None
             ):
+                log_routing_fallback(
+                    routing_trace,
+                    from_model=context_route.target.model,
+                    to_model=manual_fallback.target.model,
+                    reason="authorization_unavailable",
+                )
                 context_route = manual_fallback
                 try:
                     context_candidate = authorize_chat_route(
@@ -1018,6 +1036,12 @@ def setup_chat_routes(
                 and exc.code in _AUTHORIZATION_CANDIDATE_UNAVAILABLE
                 and manual_fallback is not None
             ):
+                log_routing_fallback(
+                    routing_trace,
+                    from_model=dispatch_route.target.model,
+                    to_model=manual_fallback.target.model,
+                    reason="authorization_unavailable",
+                )
                 dispatch_route = manual_fallback
                 try:
                     dispatch_candidate = authorize_chat_route(

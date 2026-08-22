@@ -341,6 +341,12 @@ async def _stream_auto_agent_round(
         if state.committed or has_tool_proposal:
             return
         if completed and state.fallback_available and state.switch_to_manual_fallback():
+            log_routing_fallback(
+                state.routing_trace,
+                from_model=candidate.model,
+                to_model=state.active_route.target.model,
+                reason="empty_completion",
+            )
             continue
         state.fail(502)
         yield _sanitized_auto_agent_error(502)

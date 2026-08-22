@@ -7,10 +7,14 @@ import pytest
 
 from src import llm_core
 from src import adaptive_chat_router
+from routes import chat_routes
 from src.adaptive_routing import RoutingCandidate
 from src.adaptive_routing_snapshot import AdaptiveRoutingSnapshot
+from src.chat_model_router import ChatRoute, RouteTarget
+from src.chat_route_authorizer import ChatRouteAuthorizationError
 from src.routing_observability import (
     log_llm_dispatch,
+    log_manual_authorized,
     log_routing_authorized,
     log_routing_decision,
     new_routing_trace,
@@ -189,3 +193,65 @@ def test_legacy_route_reason_is_reported_without_adaptive(caplog):
     text = caplog.records[0].getMessage()
     assert "reason=auto_agent" in text
     assert "adaptive_agent" not in text
+
+
+@pytest.mark.parametrize("selector,reason", [
+    (chat_routes._select_auto_stream_context_candidate, "chat"),
+    (chat_routes._select_auto_agent_context_candidate, "agent"),
+])
+def test_context_authorization_fallback_logs_telemetry(monkeypatch, caplog, selector, reason):
+    primary = _route(reason=f"auto_{reason}", model="primary-model")
+    manual = ChatRoute(
+        auto=False,
+        lane="manual",
+        target=RouteTarget(model="manual-model", endpoint_url="https://manual.invalid"),
+        reason="manual_fallback",
+    )
+    candidate = _candidate(model="manual-model", endpoint_id="manual")
+    monkeypatch.setattr(
+        chat_routes,
+        "_resolve_effective_auto_route_for_request",
+        lambda *args, **kwargs: primary,
+    )
+    monkeypatch.setattr(chat_routes, "_manual_fallback_route", lambda *args, **kwargs: manual)
+
+    def authorize(route, sess, auth):
+        if route is primary:
+            raise ChatRouteAuthorizationError("endpoint_unavailable")
+        return candidate
+
+    monkeypatch.setattr(chat_routes, "authorize_chat_route", authorize)
+    with caplog.at_level("INFO", logger="src.routing_observability"):
+        selector(SimpleNamespace(model="manual-model"), owner="alice", auth=object(), routing_trace="trace")
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "event=routing_fallback routing_trace=trace" in text
+    assert "from_model=primary-model" in text
+    assert "to_model=manual-model" in text
+    assert "reason=authorization_unavailable" in text
+
+
+def test_agent_empty_completion_fallback_logs_telemetry(caplog):
+    with caplog.at_level("INFO", logger="src.routing_observability"):
+        from src.routing_observability import log_routing_fallback
+
+        log_routing_fallback(
+            "trace",
+            from_model="primary-model",
+            to_model="manual-model",
+            reason="empty_completion",
+        )
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "event=routing_fallback routing_trace=trace" in text
+    assert "from_model=primary-model" in text
+    assert "to_model=manual-model" in text
+    assert "reason=empty_completion" in text
+
+
+def test_routing_telemetry_helpers_are_noops_without_trace(caplog):
+    route = _route(reason="adaptive_chat", model="qwen3:14b")
+    candidate = _candidate()
+    with caplog.at_level("INFO", logger="src.routing_observability"):
+        log_routing_decision(None, route)
+        log_routing_authorized(None, candidate)
+        log_manual_authorized(None, "qwen3:4b-nothink")
+    assert not caplog.records

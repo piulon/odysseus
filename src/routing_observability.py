@@ -19,6 +19,8 @@ def new_routing_trace() -> str:
 
 
 def log_routing_decision(trace: str, route: Any) -> None:
+    if not trace:
+        return
     logger.info(
         "event=routing_decision routing_trace=%s lane=%s auto=%s reason=%s "
         "endpoint_id=%s selected_model=%s",
@@ -32,6 +34,8 @@ def log_routing_decision(trace: str, route: Any) -> None:
 
 
 def log_routing_authorized(trace: str, candidate: Any) -> None:
+    if not trace:
+        return
     logger.info(
         "event=routing_authorized routing_trace=%s endpoint_id=%s authorized_model=%s",
         trace,
@@ -42,6 +46,8 @@ def log_routing_authorized(trace: str, candidate: Any) -> None:
 
 def log_manual_authorized(trace: str, model: str) -> None:
     """Record legacy manual hydration when no registered endpoint ID exists."""
+    if not trace:
+        return
     logger.info(
         "event=routing_authorized routing_trace=%s endpoint_id=none authorized_model=%s",
         trace,
