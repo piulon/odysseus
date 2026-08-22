@@ -213,7 +213,7 @@ async def _stream_auto_chat_with_fallback(
             log_routing_fallback(
                 routing_trace,
                 from_model=candidate.model,
-                to_model=manual_fallback.model if manual_fallback else "",
+                to_model=manual_fallback.target.model if manual_fallback else "",
                 reason="dispatch_failed_before_output" if recoverable else "empty_completion",
             )
             route = manual_fallback
