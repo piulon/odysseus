@@ -503,6 +503,7 @@ def test_adaptive_runtime_candidate_uses_authoritative_endpoint(
                 node="tower",
                 scope="local",
                 reachable=True,
+                capabilities=("tool_call",) if agent_mode else (),
             )
         ],
     )
@@ -620,6 +621,7 @@ def test_adaptive_foreign_endpoint_falls_back_without_leaking_owner_data(
                 node="foreign-node",
                 scope="local",
                 reachable=True,
+                capabilities=("tool_call",) if agent_mode else (),
             )
         ],
     )
@@ -745,6 +747,7 @@ def test_adaptive_model_policy_denial_is_terminal(
                 node="tower",
                 scope="local",
                 reachable=True,
+                capabilities=("tool_call",) if agent_mode else (),
             )
         ],
     )

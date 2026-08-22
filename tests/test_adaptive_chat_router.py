@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from src import adaptive_chat_router
+from src import model_capabilities as mc
 from src.adaptive_routing import RoutingCandidate
 from src.chat_model_router import ChatRoute, RouteTarget
 
@@ -39,7 +40,14 @@ def _legacy(*, auto=True, lane="chat", reason=None, fallback=True):
     )
 
 
-def _candidate(*, endpoint_id="adaptive-endpoint", model="adaptive-model", url="http://adaptive/chat", preference=0):
+def _candidate(
+    *,
+    endpoint_id="adaptive-endpoint",
+    model="adaptive-model",
+    url="http://adaptive/chat",
+    preference=0,
+    capabilities=(),
+):
     return RoutingCandidate(
         endpoint_id=endpoint_id,
         endpoint_url=url,
@@ -47,6 +55,7 @@ def _candidate(*, endpoint_id="adaptive-endpoint", model="adaptive-model", url="
         node=endpoint_id,
         scope="local",
         preference=preference,
+        capabilities=tuple(capabilities),
     )
 
 
@@ -153,7 +162,9 @@ def test_request_profile_workload(monkeypatch, legacy, agent_mode, workload):
     )
     assert route.reason == f"adaptive_{workload}"
     assert captured["profile"].workload == workload
-    assert captured["profile"].required_capabilities == ()
+    assert captured["profile"].required_capabilities == (
+        (mc.CAP_TOOL_CALL,) if agent_mode else ()
+    )
     assert captured["profile"].preferred_capabilities == ()
 
 
@@ -221,3 +232,76 @@ def test_session_is_not_mutated(monkeypatch, legacy):
     publish(monkeypatch, candidates=[_candidate()])
     adaptive_chat_router.resolve_adaptive_chat_route(session, owner="alice", enabled=True)
     assert (session.auto_route, session.model, session.endpoint_url, dict(session.headers)) == before
+
+
+
+def test_agent_rejects_non_tool_candidate_even_with_higher_preference(
+    monkeypatch,
+):
+    legacy = _legacy(lane="agent")
+    monkeypatch.setattr(
+        adaptive_chat_router,
+        "resolve_chat_route",
+        lambda *a, **k: legacy,
+    )
+
+    publish(
+        monkeypatch,
+        candidates=[
+            _candidate(
+                endpoint_id="plain-endpoint",
+                model="plain-model",
+                preference=1000,
+                capabilities=(),
+            ),
+            _candidate(
+                endpoint_id="tool-endpoint",
+                model="tool-model",
+                preference=0,
+                capabilities=(mc.CAP_TOOL_CALL,),
+            ),
+        ],
+    )
+
+    route = adaptive_chat_router.resolve_adaptive_chat_route(
+        _session(),
+        owner="alice",
+        agent_mode=True,
+        enabled=True,
+    )
+
+    assert route.reason == "adaptive_agent"
+    assert route.target.endpoint_id == "tool-endpoint"
+    assert route.target.model == "tool-model"
+
+
+def test_agent_without_tool_capable_candidate_returns_exact_legacy_route(
+    monkeypatch,
+):
+    legacy = _legacy(lane="agent")
+    monkeypatch.setattr(
+        adaptive_chat_router,
+        "resolve_chat_route",
+        lambda *a, **k: legacy,
+    )
+
+    publish(
+        monkeypatch,
+        candidates=[
+            _candidate(
+                endpoint_id="plain-endpoint",
+                model="plain-model",
+                preference=1000,
+                capabilities=(),
+            )
+        ],
+    )
+
+    route = adaptive_chat_router.resolve_adaptive_chat_route(
+        _session(),
+        owner="alice",
+        agent_mode=True,
+        enabled=True,
+    )
+
+    assert route is legacy

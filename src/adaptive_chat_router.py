@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from src import model_capabilities as mc
 from src.adaptive_routing import (
     POLICY_LOCAL_PREFERRED,
     RequestProfile,
@@ -71,7 +72,11 @@ def resolve_adaptive_chat_route(
 
         profile = RequestProfile(
             workload="agent" if agent_mode else "chat",
-            required_capabilities=(),
+            required_capabilities=(
+                (mc.CAP_TOOL_CALL,)
+                if agent_mode
+                else ()
+            ),
             preferred_capabilities=(),
             target_preferences=_target_preference(legacy),
             policy=POLICY_LOCAL_PREFERRED,
