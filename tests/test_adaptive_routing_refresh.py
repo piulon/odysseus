@@ -121,6 +121,7 @@ class _Column:
 
 class _ModelEndpoint:
     id = _Column("id")
+    owner = _Column("owner")
     is_enabled = _Column("is_enabled")
 
 
@@ -155,6 +156,8 @@ class _DB:
         ("alice", "alice", True, "llm", True),
         ("alice", None, True, "llm", True),
         ("alice", "bob", True, "llm", False),
+        (None, None, True, "llm", True),
+        (None, "alice", True, "llm", False),
         ("alice", "alice", False, "llm", False),
         ("alice", "alice", True, "embedding", False),
     ],

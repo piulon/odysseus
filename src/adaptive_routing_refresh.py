@@ -142,6 +142,10 @@ def _load_ollama_endpoint(endpoint_id: str, owner: str | None) -> _ProbeEndpoint
         owner_key = _owner_key(owner)
         if owner_key:
             query = owner_filter(query, ModelEndpoint, owner_key)
+        else:
+            # Match legacy/strict routing: ownerless resolution may only
+            # inspect shared endpoints, never rows owned by another account.
+            query = query.filter(ModelEndpoint.owner == None)  # noqa: E711
         endpoint = query.first()
         if endpoint is None:
             return None
