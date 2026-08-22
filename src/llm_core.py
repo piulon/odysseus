@@ -509,6 +509,25 @@ def _is_ollama_openai_compat_url(url: str) -> bool:
     return local_ollama_host and (path == "/v1" or path.startswith("/v1/"))
 
 
+def _apply_ollama_openai_compat_reasoning_policy(
+    payload: Dict,
+    url: str,
+    model: str,
+) -> None:
+    """Disable reasoning on Ollama's OpenAI-compatible /v1 surface.
+
+    Native Ollama /api uses ``think``.  Its OpenAI-compatible /v1 API uses
+    ``reasoning_effort`` instead.  Keep this policy narrowly gated so no
+    Ollama-specific parameter leaks to unrelated OpenAI-compatible endpoints.
+    """
+    if (
+        _is_ollama_openai_compat_url(url)
+        and _supports_thinking(model)
+    ):
+        payload.pop("think", None)
+        payload["reasoning_effort"] = "none"
+
+
 def _ollama_api_root(url: str) -> str:
     """Return a native Ollama API root such as https://ollama.com/api."""
     url = (url or "").strip().rstrip("/")
@@ -1879,6 +1898,9 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+        _apply_ollama_openai_compat_reasoning_policy(
+            payload, url, model
+        )
         _apply_local_generation_stability(payload, target_url, model)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
@@ -2115,9 +2137,9 @@ async def llm_call_async(
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
-        # Suppress thinking for qwen3/gemma4 on Ollama /v1 — same as stream_llm.
-        if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
-            payload["think"] = False
+        _apply_ollama_openai_compat_reasoning_policy(
+            payload, url, model
+        )
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         _apply_local_cache_affinity(payload, url, session_id)
@@ -2403,11 +2425,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         # (high / medium / low / none); default "high".
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
-        # For Ollama's OpenAI-compat /v1 endpoint with thinking models (qwen3,
-        # gemma4, etc.), suppress thinking so tool calls aren't swallowed inside
-        # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
-        if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
-            payload["think"] = False
+        # Keep Ollama /v1 reasoning disabled using its OpenAI-compatible
+        # control rather than the native /api ``think`` parameter.
+        _apply_ollama_openai_compat_reasoning_policy(
+            payload, url, model
+        )
         _apply_local_cache_affinity(payload, url, session_id)
         _apply_local_generation_stability(payload, target_url, model)
         h = _provider_headers(provider, headers)
