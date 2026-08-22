@@ -45,11 +45,70 @@ def _run(monkeypatch, endpoint_ids=("ep",), endpoint=None, request=None, **kwarg
 
 def test_configured_ids_are_owner_scoped_and_deduplicated(monkeypatch):
     from src import settings
-    monkeypatch.setattr(settings, "load_settings", lambda: {"auto_chat_endpoint_id": "shared", "auto_agent_endpoint_id": "shared"})
+
     calls = []
-    monkeypatch.setattr(settings, "get_user_setting", lambda key, owner, default: calls.append((key, owner)) or "shared")
+
+    def get_user_setting(key, owner, default=None, *, inherit_global=True):
+        calls.append((key, owner, default, inherit_global))
+        return "shared"
+
+    monkeypatch.setattr(settings, "get_user_setting", get_user_setting)
+
     assert refresh._configured_endpoint_ids(" alice ") == ("shared",)
-    assert {owner for _, owner in calls} == {"alice"}
+    assert {owner for _, owner, _, _ in calls} == {"alice"}
+    assert {default for _, _, default, _ in calls} == {""}
+    assert {inherit for _, _, _, inherit in calls} == {False}
+
+
+def test_explicit_owner_does_not_inherit_global_auto_endpoints(monkeypatch):
+    from src import settings
+
+    globals_by_key = {
+        "auto_chat_endpoint_id": "global-chat",
+        "auto_agent_endpoint_id": "global-agent",
+    }
+    calls = []
+
+    def get_user_setting(key, owner, default=None, *, inherit_global=True):
+        calls.append((key, owner, inherit_global))
+        if owner and not inherit_global:
+            return default
+        return globals_by_key.get(key, default)
+
+    monkeypatch.setattr(settings, "get_user_setting", get_user_setting)
+
+    assert refresh._configured_endpoint_ids("alice") == ()
+    assert calls == [
+        ("auto_chat_endpoint_id", "alice", False),
+        ("auto_agent_endpoint_id", "alice", False),
+    ]
+
+
+def test_ownerless_refresh_can_use_global_auto_endpoints(monkeypatch):
+    from src import settings
+
+    globals_by_key = {
+        "auto_chat_endpoint_id": "global-chat",
+        "auto_agent_endpoint_id": "global-agent",
+    }
+    calls = []
+
+    def get_user_setting(key, owner, default=None, *, inherit_global=True):
+        calls.append((key, owner, inherit_global))
+        if not owner:
+            return globals_by_key.get(key, default)
+        return default
+
+    monkeypatch.setattr(settings, "get_user_setting", get_user_setting)
+
+    assert refresh._configured_endpoint_ids(None) == (
+        "global-chat",
+        "global-agent",
+    )
+    assert calls == [
+        ("auto_chat_endpoint_id", "", False),
+        ("auto_agent_endpoint_id", "", False),
+    ]
 
 
 class _Column:

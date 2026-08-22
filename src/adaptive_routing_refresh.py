@@ -48,15 +48,20 @@ def _owner_key(owner: Any) -> str:
 
 
 def _configured_endpoint_ids(owner: str | None) -> tuple[str, ...]:
-    from src.settings import get_user_setting, load_settings
+    from src.settings import get_user_setting
 
-    settings = load_settings()
     owner_key = _owner_key(owner)
     result: list[str] = []
     for prefix in ("auto_chat", "auto_agent"):
         key = f"{prefix}_endpoint_id"
         endpoint_id = str(
-            get_user_setting(key, owner_key, settings.get(key, "")) or ""
+            get_user_setting(
+                key,
+                owner_key,
+                "",
+                inherit_global=False,
+            )
+            or ""
         ).strip()
         if endpoint_id and endpoint_id not in result:
             result.append(endpoint_id)
