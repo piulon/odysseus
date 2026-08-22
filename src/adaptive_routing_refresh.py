@@ -22,6 +22,7 @@ from urllib.parse import urlparse, urlunparse
 from src.adaptive_routing_candidates import ollama_candidate_from_show_payload
 from src.adaptive_routing_snapshot import (
     AdaptiveRoutingSnapshot,
+    capture_adaptive_routing_snapshot_generation,
     publish_adaptive_routing_snapshot,
 )
 from src.endpoint_resolver import build_chat_url, resolve_endpoint_runtime
@@ -279,6 +280,7 @@ def refresh_owner_adaptive_snapshot(
     timeout: float = 3.0,
 ) -> AdaptiveRoutingSnapshot | None:
     owner_key = _owner_key(owner)
+    snapshot_generation = capture_adaptive_routing_snapshot_generation(owner_key)
     budget = _validate_refresh_timeout(timeout)
     deadline = time.monotonic() + budget
     fetch = request_json or _request_json
@@ -286,7 +288,12 @@ def refresh_owner_adaptive_snapshot(
     try:
         endpoint_ids = _configured_endpoint_ids(owner_key)
         if not endpoint_ids:
-            return publish_adaptive_routing_snapshot(owner_key, (), generated_at=generated_at)
+            return publish_adaptive_routing_snapshot(
+                owner_key,
+                (),
+                generated_at=generated_at,
+                expected_generation=snapshot_generation,
+            )
         endpoints: list[_ProbeEndpoint] = []
         for endpoint_id in endpoint_ids:
             try:
@@ -373,4 +380,5 @@ def refresh_owner_adaptive_snapshot(
         owner_key,
         candidates,
         generated_at=generated_at,
+        expected_generation=snapshot_generation,
     )

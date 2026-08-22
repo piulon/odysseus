@@ -1,6 +1,7 @@
 import json
 import urllib.request
 from types import SimpleNamespace
+import threading
 
 import pytest
 
@@ -520,3 +521,55 @@ def test_request_json_rejects_nonfinite_timeout():
     for value in (None, "abc", 0, -1, float("nan"), float("inf")):
         with pytest.raises((TypeError, ValueError)):
             refresh._request_json("http://host/api/tags", timeout=value)
+
+def test_inflight_refresh_cannot_republish_after_global_invalidation(monkeypatch):
+    endpoint = _endpoint()
+    entered_probe = threading.Event()
+    release_probe = threading.Event()
+    result = {}
+
+    monkeypatch.setattr(
+        refresh,
+        "_configured_endpoint_ids",
+        lambda owner: ("ep",),
+    )
+    monkeypatch.setattr(
+        refresh,
+        "_load_ollama_endpoint",
+        lambda endpoint_id, owner: endpoint,
+    )
+
+    def request(url, *, payload=None, headers=None, timeout=3):
+        assert url == endpoint.models_url
+        assert payload is None
+        entered_probe.set()
+        assert release_probe.wait(timeout=2)
+        return {"models": []}
+
+    def run_refresh():
+        result["snapshot"] = refresh.refresh_owner_adaptive_snapshot(
+            "alice",
+            request_json=request,
+            timeout=3,
+        )
+
+    thread = threading.Thread(target=run_refresh, daemon=True)
+    thread.start()
+
+    assert entered_probe.wait(timeout=2)
+
+    # Simulate a global Adaptive gate transition while discovery is in flight.
+    clear_adaptive_routing_snapshot()
+
+    release_probe.set()
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert result["snapshot"] is None
+    assert (
+        get_adaptive_routing_snapshot(
+            "alice",
+            max_age_seconds=60,
+        )
+        is None
+    )

@@ -24,10 +24,31 @@ class AdaptiveRoutingSnapshot:
 
 _lock = RLock()
 _snapshots: dict[str, AdaptiveRoutingSnapshot] = {}
+_global_generation = 0
+_owner_generations: dict[str, int] = {}
 
 
 def _owner_key(owner: str | None) -> str:
     return str(owner or "").strip()
+
+
+SnapshotGeneration = tuple[int, int]
+
+
+def capture_adaptive_routing_snapshot_generation(
+    owner: str | None,
+) -> SnapshotGeneration:
+    """Capture the invalidation generation for one owner.
+
+    Refresh code may use this opaque token to ensure work started before a
+    clear/invalidation cannot publish after that invalidation completes.
+    """
+    key = _owner_key(owner)
+    with _lock:
+        return (
+            _global_generation,
+            _owner_generations.get(key, 0),
+        )
 
 
 def publish_adaptive_routing_snapshot(
@@ -35,8 +56,9 @@ def publish_adaptive_routing_snapshot(
     candidates: Iterable[RoutingCandidate],
     *,
     generated_at: float | None = None,
-) -> AdaptiveRoutingSnapshot:
-    """Atomically replace the current snapshot for one owner."""
+    expected_generation: SnapshotGeneration | None = None,
+) -> AdaptiveRoutingSnapshot | None:
+    """Atomically replace one owner's snapshot if its generation is still valid."""
 
     key = _owner_key(owner)
     snapshot = AdaptiveRoutingSnapshot(
@@ -50,6 +72,14 @@ def publish_adaptive_routing_snapshot(
     )
 
     with _lock:
+        if expected_generation is not None:
+            current_generation = (
+                _global_generation,
+                _owner_generations.get(key, 0),
+            )
+            if current_generation != expected_generation:
+                return None
+
         _snapshots[key] = snapshot
 
     return snapshot
@@ -91,11 +121,17 @@ def get_adaptive_routing_snapshot(
 def clear_adaptive_routing_snapshot(
     owner: str | None = None,
 ) -> None:
-    """Clear one owner snapshot, or all snapshots when owner is omitted."""
+    """Invalidate and clear one owner, or every owner when omitted."""
+
+    global _global_generation
 
     with _lock:
         if owner is None:
+            _global_generation += 1
+            _owner_generations.clear()
             _snapshots.clear()
             return
 
-        _snapshots.pop(_owner_key(owner), None)
+        key = _owner_key(owner)
+        _owner_generations[key] = _owner_generations.get(key, 0) + 1
+        _snapshots.pop(key, None)

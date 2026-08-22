@@ -1,5 +1,6 @@
 from src.adaptive_routing import RoutingCandidate
 from src.adaptive_routing_snapshot import (
+    capture_adaptive_routing_snapshot_generation,
     clear_adaptive_routing_snapshot,
     get_adaptive_routing_snapshot,
     publish_adaptive_routing_snapshot,
@@ -152,3 +153,80 @@ def test_invalid_max_age_is_rejected():
         assert "max_age_seconds" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+def test_owner_generation_fence_rejects_publish_after_owner_clear():
+    generation = capture_adaptive_routing_snapshot_generation("alice")
+
+    clear_adaptive_routing_snapshot("alice")
+
+    rejected = publish_adaptive_routing_snapshot(
+        "alice",
+        [candidate()],
+        generated_at=100,
+        expected_generation=generation,
+    )
+
+    assert rejected is None
+    assert (
+        get_adaptive_routing_snapshot(
+            "alice",
+            max_age_seconds=30,
+            now=101,
+        )
+        is None
+    )
+
+
+def test_owner_clear_does_not_invalidate_other_owner_generation():
+    alice_generation = capture_adaptive_routing_snapshot_generation("alice")
+    bob_generation = capture_adaptive_routing_snapshot_generation("bob")
+
+    clear_adaptive_routing_snapshot("alice")
+
+    assert (
+        publish_adaptive_routing_snapshot(
+            "alice",
+            [candidate("alice-model")],
+            generated_at=100,
+            expected_generation=alice_generation,
+        )
+        is None
+    )
+
+    bob = publish_adaptive_routing_snapshot(
+        "bob",
+        [candidate("bob-model")],
+        generated_at=100,
+        expected_generation=bob_generation,
+    )
+
+    assert bob is not None
+    assert (
+        get_adaptive_routing_snapshot(
+            "bob",
+            max_age_seconds=30,
+            now=101,
+        )
+        == bob
+    )
+
+
+def test_global_clear_invalidates_all_captured_generations():
+    alice_generation = capture_adaptive_routing_snapshot_generation("alice")
+    bob_generation = capture_adaptive_routing_snapshot_generation("bob")
+
+    clear_adaptive_routing_snapshot()
+
+    for owner, generation in (
+        ("alice", alice_generation),
+        ("bob", bob_generation),
+    ):
+        assert (
+            publish_adaptive_routing_snapshot(
+                owner,
+                [candidate(owner)],
+                generated_at=100,
+                expected_generation=generation,
+            )
+            is None
+        )
