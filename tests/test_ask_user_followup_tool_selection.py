@@ -113,9 +113,11 @@ def test_ask_user_yes_survives_bad_tool_rag_and_sends_email_document_tools(monke
     )
 
     sent_tools = []
+    sent_messages = []
 
     async def fake_stream(_candidates, messages, **kwargs):
         sent_tools.append(kwargs.get("tools"))
+        sent_messages.append(messages)
         yield "data: " + json.dumps({"delta": "ok"}) + "\n\n"
         yield "data: [DONE]\n\n"
 
@@ -153,3 +155,98 @@ def test_ask_user_yes_survives_bad_tool_rag_and_sends_email_document_tools(monke
     assert "list_emails" in names
     assert "read_email" in names
     assert "create_document" in names
+
+    # The model must also be told that this is the answer to the pending
+    # ask_user interaction. Tool availability alone is insufficient: the
+    # production model otherwise treats "Sí" as standalone chat and echoes it.
+    assert sent_messages
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in sent_messages[0]
+        if message.get("role") == "system"
+    )
+    assert "answer to the immediately preceding `ask_user` interaction" in system_text
+    assert "continue the underlying task" in system_text
+    assert "Do not merely echo or acknowledge" in system_text
+
+
+def _capture_model_messages(monkeypatch, messages):
+    monkeypatch.setattr(
+        agent_loop,
+        "get_setting",
+        lambda key, default=None: default,
+        raising=False,
+    )
+    monkeypatch.setattr(agent_loop, "get_mcp_manager", lambda: None, raising=False)
+    monkeypatch.setattr(
+        agent_loop,
+        "estimate_tokens",
+        lambda *args, **kwargs: 10,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "blocked_tools_for_owner",
+        lambda owner: set(),
+        raising=False,
+    )
+
+    captured = []
+
+    async def fake_stream(_candidates, llm_messages, **kwargs):
+        captured.append(llm_messages)
+        yield "data: " + json.dumps({"delta": "ok"}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(
+        agent_loop,
+        "stream_llm_with_fallback",
+        fake_stream,
+        raising=False,
+    )
+
+    _collect(
+        agent_loop.stream_agent_loop(
+            "https://api.openai.com/v1",
+            "qwen3:14b",
+            messages,
+            max_rounds=1,
+            relevant_tools={"ask_user", "list_emails", "create_document"},
+            owner="admin",
+        )
+    )
+
+    assert captured
+    return "\n".join(
+        str(message.get("content") or "")
+        for message in captured[0]
+        if message.get("role") == "system"
+    )
+
+
+def test_ask_user_freeform_answer_gets_resume_directive(monkeypatch):
+    system_text = _capture_model_messages(
+        monkeypatch,
+        _messages("Només els del 2025"),
+    )
+
+    assert "answer to the immediately preceding `ask_user` interaction" in system_text
+    assert "continue the underlying task" in system_text
+
+
+def test_normal_turn_does_not_get_ask_user_resume_directive(monkeypatch):
+    system_text = _capture_model_messages(
+        monkeypatch,
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Busca els correus de "
+                    "odysseus-regression-fixture@gmail.com."
+                ),
+            }
+        ],
+    )
+
+    assert "answer to the immediately preceding `ask_user` interaction" not in system_text
+    assert "Do not merely echo or acknowledge" not in system_text
