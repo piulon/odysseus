@@ -32,6 +32,27 @@ def test_email_server_tools_match_builtin_set():
     )
 
 
+def test_native_email_schemas_match_email_server_tools():
+    """API models see built-in Email through bare native schemas.
+
+    McpManager deliberately omits schemas for built-in Python servers, so a
+    server tool missing here is advertised by retrieval but cannot be called.
+    """
+    from src.tool_schemas import FUNCTION_TOOL_SCHEMAS
+
+    native_names = {
+        schema.get("function", {}).get("name")
+        for schema in FUNCTION_TOOL_SCHEMAS
+    }
+    # Draft helpers are exposed through the email UI/fenced path, and
+    # download_attachment writes a file; none currently has a native schema.
+    non_native = {
+        "draft_email", "draft_email_reply", "ai_draft_email_reply",
+        "download_attachment",
+    }
+    assert native_names & BUILTIN_EMAIL_TOOLS == BUILTIN_EMAIL_TOOLS - non_native
+
+
 def test_fence_tags_cover_email_tools():
     from src.agent_tools import TOOL_TAGS
 
