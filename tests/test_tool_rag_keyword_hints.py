@@ -13,6 +13,7 @@ These hints are deterministic string matching — no embeddings — so we can te
 """
 
 from src.tool_index import ToolIndex, ALWAYS_AVAILABLE
+from src.agent_loop import _classify_agent_request
 
 _EMAIL_TOOLS = {
     "list_emails", "read_email", "send_email", "reply_to_email",
@@ -54,6 +55,24 @@ def test_genuine_email_query_still_gets_email_tools():
     ti = _index_without_embeddings()
     tools = ti.get_tools_for_query("reply to the unread email in my inbox")
     assert {"reply_to_email", "send_email", "read_email"} <= tools
+
+
+def test_mailbox_search_gets_search_emails_and_not_web_domain():
+    ti = _index_without_embeddings()
+    tools = ti.get_tools_for_query("search my emails from Alice about invoices")
+    assert "search_emails" in tools
+    domains = _classify_agent_request(
+        [{"role": "user", "content": "search my emails from Alice about invoices"}],
+        "search my emails from Alice about invoices",
+    )["domains"]
+    assert "email" in domains
+    assert "web" not in domains
+
+
+def test_explicit_email_and_web_request_keeps_both_domains():
+    text = "search my emails about OpenAI and then check the web for the latest OpenAI news"
+    domains = _classify_agent_request([{"role": "user", "content": text}], text)["domains"]
+    assert {"email", "web"} <= domains
 
 
 def test_plain_tell_request_stays_minimal():

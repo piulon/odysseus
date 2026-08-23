@@ -274,6 +274,7 @@ _DOMAIN_RULES = {
     "email": """\
 ## Email rules
 - Email UIDs are the values after `UID:` in tool output, never list row numbers.
+- To find/search messages in the user's mailbox by sender, person, subject, topic, or content, use `search_emails` (not `web_search`).
 - For latest/newest email, list with `max_results: 1`, `unread_only: false`, then read the returned UID if needed.
 - For named mailboxes/accounts, call `list_email_accounts` if needed and pass the exact `account` value.
 - Bulk email actions use `bulk_email` once with explicit UIDs; do not loop one message at a time.
@@ -323,7 +324,7 @@ _DOMAIN_RULES = {
 _DOMAIN_TOOL_MAP = {
     "web": set(WEB_TOOL_NAMES),
     "documents": {"create_document", "edit_document", "update_document", "suggest_document", "manage_documents"},
-    "email": {"list_email_accounts", "list_emails", "read_email", "send_email", "reply_to_email", "bulk_email", "archive_email", "delete_email", "mark_email_read", "resolve_contact", "manage_contact"},
+    "email": {"list_email_accounts", "list_emails", "read_email", "search_emails", "send_email", "reply_to_email", "bulk_email", "archive_email", "delete_email", "mark_email_read", "resolve_contact", "manage_contact"},
     "cookbook": {"download_model", "serve_model", "serve_preset", "list_serve_presets", "list_served_models", "stop_served_model", "tail_serve_output", "list_downloads", "cancel_download", "search_hf_models", "list_cached_models", "list_cookbook_servers", "adopt_served_model"},
     "notes_calendar_tasks": {"manage_notes", "manage_calendar", "manage_tasks"},
     "ui": {"ui_control"},
@@ -1087,12 +1088,12 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     if "notes_calendar_tasks" not in domains and has(r"\bwrite\b"):
         domains.add("documents")
     if has(
-        r"\b(search|web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b",
+        r"\b(web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b",
         r"\b(noticias|actualidad)\b",
         r"\b(?:buscar|busca|busque)\b.*\b(?:internet|web|online|noticias|actualidad|informaci[oó]n\s+actual|últimas?|ultimas?|últimos?|ultimos?)\b",
         r"\b(notícies|noticies|actualitat)\b",
         r"\b(?:cercar|cerca|buscar|busca)\b.*\b(?:internet|web|online|notícies|noticies|actualitat|informació\s+actual|últimes?|ultimes?|darreres?)\b",
-    ):
+    ) or ("email" not in domains and has(r"\bsearch\b")):
         domains.add("web")
     if has(
         r"\b(wyszukaj|wyszukać|wyszukac)\b.*\b(internet|internecie|online|web)\b",
@@ -1900,12 +1901,13 @@ def _build_system_prompt(
     # or ui_control open_email_reply after the first tool round.
     _inject_style = False
     _EMAIL_TOOL_HINTS = {
-        "list_email_accounts", "send_email", "reply_to_email", "list_emails", "read_email",
+        "list_email_accounts", "send_email", "reply_to_email", "list_emails", "read_email", "search_emails",
         "bulk_email", "archive_email", "delete_email", "mark_email_read",
         "resolve_contact", "ui_control",
         "mcp__email__list_email_accounts",
         "mcp__email__send_email", "mcp__email__reply_to_email",
         "mcp__email__list_emails", "mcp__email__read_email",
+        "mcp__email__search_emails",
         "mcp__email__bulk_email", "mcp__email__archive_email",
         "mcp__email__delete_email", "mcp__email__mark_email_read",
     }
@@ -2899,8 +2901,9 @@ async def stream_agent_loop(
     _active_email_draft_relevant = _active_document_relevant and _is_email_document_obj(active_document)
     if _active_email_draft_relevant:
         disabled_tools.update({
-            "list_email_accounts", "list_emails", "read_email",
+            "list_email_accounts", "list_emails", "read_email", "search_emails",
             "mcp__email__list_emails", "mcp__email__read_email",
+            "mcp__email__search_emails",
         })
     _prompt_active_document = active_document if _active_document_relevant else None
     _direct_low_signal = (
@@ -4294,8 +4297,9 @@ async def stream_agent_loop(
             # the same email again through IMAP/MCP is slow, token-heavy, and
             # can hang. Keep draft editing tools, drop email fetch tools.
             _email_fetch_tools = {
-                "list_email_accounts", "list_emails", "read_email",
+                "list_email_accounts", "list_emails", "read_email", "search_emails",
                 "mcp__email__list_emails", "mcp__email__read_email",
+                "mcp__email__search_emails",
             }
             removed = sorted(_relevant_tools & _email_fetch_tools)
             if removed:
@@ -4359,7 +4363,18 @@ async def stream_agent_loop(
         except Exception as _e:
             logger.debug(f"[tool-rag] skill-aware tool include skipped: {_e}")
 
+    # Mailbox-only turns must not expose web tools that arrived through RAG or
+    # forced_tools. Keep genuine combined email+web requests unchanged.
     _intent_domains = set(_intent.get("domains") or set())
+    if (
+        not guide_only
+        and _relevant_tools is not None
+        and "email" in _intent_domains
+        and "web" not in _intent_domains
+    ):
+        _relevant_tools.difference_update(WEB_TOOL_NAMES)
+        logger.info("[agent-intent] mailbox-only turn removed web tools")
+
     _ody_doc_finetune_mode = (
         _ody_qwen_finetune_model
         and (
