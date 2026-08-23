@@ -5060,6 +5060,7 @@ async def stream_agent_loop(
     # that *can't* call the tool from looping forever.
     _intent_nudge_count = 0
     _MAX_INTENT_NUDGES = 2
+    _ask_user_resume_retry_done = False
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -5674,6 +5675,47 @@ async def stream_agent_loop(
                     # never re-verify an unchanged state in a loop.
                     _effectful_used = False
                     continue
+            # ── Structured ask_user resume retry ──────────────────────
+            # The relationship to ask_user is structured state, so do not depend
+            # on language-specific promise detection here. If the first model
+            # attempt after the user's answer emits no tool call, give it exactly
+            # one chance to reconsider the answer against the pending question.
+            #
+            # This deliberately does NOT force a tool: a rejection/cancellation
+            # must remain a valid no-tool outcome on the retry.
+            if (
+                _ask_user_followup_turn
+                and not guide_only
+                and not _force_answer
+                and not _ask_user_resume_retry_done
+            ):
+                _ask_user_resume_retry_done = True
+                logger.info(
+                    "[agent] ask_user followup produced no tool call on round %d; "
+                    "retrying once with structural resume guidance",
+                    round_num,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "This turn is resuming immediately after an `ask_user` "
+                        "interaction, and your previous attempt ended without making "
+                        "a tool call. Re-evaluate the user's latest answer against the "
+                        "pending `ask_user` question and the underlying task. "
+                        "If the answer authorizes the action or supplies the missing "
+                        "information, execute the appropriate available tool now "
+                        "instead of merely promising or acknowledging. "
+                        "If the answer rejects, cancels, narrows, or says not to "
+                        "proceed, do not call action tools; give the brief final "
+                        "response that respects that answer. Do not ask the same "
+                        "question again."
+                    ),
+                })
+                yield (
+                    f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                )
+                continue
+
             # ── Intent-without-action supervisor ─────────────────────
             # Catch "Let me tail the output" / "I'll check the logs" /
             # "Let me investigate" patterns where the model announces an

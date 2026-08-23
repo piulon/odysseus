@@ -250,3 +250,172 @@ def test_normal_turn_does_not_get_ask_user_resume_directive(monkeypatch):
 
     assert "answer to the immediately preceding `ask_user` interaction" not in system_text
     assert "Do not merely echo or acknowledge" not in system_text
+
+
+
+def _patch_basic_agent_dependencies(monkeypatch):
+    monkeypatch.setattr(
+        agent_loop,
+        "get_setting",
+        lambda key, default=None: default,
+        raising=False,
+    )
+    monkeypatch.setattr(agent_loop, "get_mcp_manager", lambda: None, raising=False)
+    monkeypatch.setattr(
+        agent_loop,
+        "estimate_tokens",
+        lambda *args, **kwargs: 10,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "blocked_tools_for_owner",
+        lambda owner: set(),
+        raising=False,
+    )
+
+
+def test_ask_user_text_only_attempt_gets_one_structural_retry_and_then_tools(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+
+    model_calls = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_calls.append([
+            dict(message)
+            for message in messages
+        ])
+
+        if len(model_calls) == 1:
+            # Reproduce production exactly: Catalan promise, no tool call.
+            yield "data: " + json.dumps({
+                "delta": (
+                    "Sí. Buscaré els correus de "
+                    "odysseus-regression-fixture@gmail.com i crearé "
+                    "un document Word ordenat per data."
+                )
+            }) + "\n\n"
+        else:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [
+                    {
+                        "name": "list_emails",
+                        "arguments": "{}",
+                    }
+                ],
+            }) + "\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return (
+            block.tool_type,
+            {
+                "output": "[]",
+                "exit_code": 0,
+            },
+        )
+
+    monkeypatch.setattr(
+        agent_loop,
+        "stream_llm_with_fallback",
+        fake_stream,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "execute_tool_block",
+        fake_execute,
+        raising=False,
+    )
+
+    _collect(
+        agent_loop.stream_agent_loop(
+            "https://api.openai.com/v1",
+            "gpt-4o",
+            _messages("Sí"),
+            max_rounds=2,
+            relevant_tools={"ask_user", "list_emails", "create_document"},
+            owner="admin",
+            _is_teacher_run=True,
+        )
+    )
+
+    assert len(model_calls) == 2
+    retry_system = "\n".join(
+        str(message.get("content") or "")
+        for message in model_calls[1]
+        if message.get("role") == "system"
+    )
+    assert "previous attempt ended without making a tool call" in retry_system
+    assert "execute the appropriate available tool now" in retry_system
+    assert "If the answer rejects, cancels" in retry_system
+    # Native email calls are converted to their executable MCP tool name
+    # before execute_tool_block receives them.
+    assert executed == ["mcp__email__list_emails"]
+
+
+def test_ask_user_rejection_retry_does_not_force_action_tool(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+
+    model_calls = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_calls.append([
+            dict(message)
+            for message in messages
+        ])
+
+        if len(model_calls) == 1:
+            yield "data: " + json.dumps({
+                "delta": "No, no continuïs."
+            }) + "\n\n"
+        else:
+            yield "data: " + json.dumps({
+                "delta": "Entesos. No continuaré amb aquesta acció."
+            }) + "\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return (
+            block.tool_type,
+            {
+                "output": "unexpected",
+                "exit_code": 0,
+            },
+        )
+
+    monkeypatch.setattr(
+        agent_loop,
+        "stream_llm_with_fallback",
+        fake_stream,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "execute_tool_block",
+        fake_execute,
+        raising=False,
+    )
+
+    _collect(
+        agent_loop.stream_agent_loop(
+            "https://api.openai.com/v1",
+            "gpt-4o",
+            _messages("No"),
+            max_rounds=3,
+            relevant_tools={"ask_user", "list_emails", "create_document"},
+            owner="admin",
+            _is_teacher_run=True,
+        )
+    )
+
+    # Exactly one structural reconsideration, then the rejection is accepted.
+    assert len(model_calls) == 2
+    assert executed == []
