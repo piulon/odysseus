@@ -606,7 +606,7 @@ _DOMAIN_TOOL_MAP = {
     "notes_calendar_tasks": {"manage_notes", "manage_calendar", "manage_tasks"},
     "ui": {"ui_control"},
     "sessions": {"create_session", "list_sessions", "manage_session", "send_to_session", "search_chats"},
-    "files": {"bash", "python", "read_file", "write_file", "edit_file", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs"},
+    "files": {"bash", "python", "read_file", "write_file", "edit_file", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs", "homelab"},
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
     "contacts": {"resolve_contact", "manage_contact"},
     "integrations": {"api_call"},
@@ -1262,21 +1262,77 @@ def _assistant_requested_followup(messages: List[Dict]) -> bool:
     return False
 
 
+def _is_ask_user_followup(messages: List[Dict]) -> bool:
+    """True when the latest user turn directly answers a persisted ask_user.
+
+    ``ask_user`` ends the agent turn and stores its structured payload in the
+    preceding assistant message's ``metadata.tool_events``. The next user
+    message is therefore a continuation by construction, regardless of its
+    language or wording.
+
+    Ignore non-conversational context messages between the latest user turn and
+    the preceding assistant turn, but never cross an older user turn.
+    """
+    seen_latest_user = False
+
+    for msg in reversed(messages):
+        role = msg.get("role")
+
+        if not seen_latest_user:
+            if role == "user":
+                seen_latest_user = True
+            continue
+
+        if role == "user":
+            return False
+
+        if role != "assistant":
+            continue
+
+        metadata = msg.get("metadata") or {}
+        tool_events = metadata.get("tool_events") or []
+
+        return any(
+            isinstance(event, dict)
+            and event.get("tool") == "ask_user"
+            and isinstance(event.get("ask_user"), dict)
+            for event in tool_events
+        )
+
+    return False
+
+
 def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, object]:
     """Classify only whether this turn deserves domain tool retrieval.
 
     Normal chat should not inherit old Cookbook/email/document context. Recent
-    context is used only for explicit continuations ("yes", "do it", "1").
+    context is used for explicit continuations ("yes", "do it", "1") and for
+    replies to a structured ``ask_user`` interaction.
     This function does not inject tools directly; selected tools later decide
     which domain rule packs get appended to the system prompt.
     """
     text = str(last_user or "").strip()
+    ask_user_followup = _is_ask_user_followup(messages)
     retry_continuation = _is_contextual_retry_continuation(messages, text)
-    continuation = _is_explicit_continuation(text) or _assistant_requested_followup(messages) or retry_continuation
+    continuation = (
+        ask_user_followup
+        or _is_explicit_continuation(text)
+        or _assistant_requested_followup(messages)
+        or retry_continuation
+    )
     retrieval_query = _recent_context_for_retrieval(messages) if continuation else text
     q = retrieval_query.lower()
 
-    if not text or bool(_LOW_SIGNAL_RE.match(text)) or _is_casual_low_signal(text):
+    if (
+        not text
+        or (
+            not ask_user_followup
+            and (
+                bool(_LOW_SIGNAL_RE.match(text))
+                or _is_casual_low_signal(text)
+            )
+        )
+    ):
         return {
             "low_signal": True,
             "continuation": False,
@@ -1308,7 +1364,13 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         domains.add("documents")
     if "notes_calendar_tasks" not in domains and has(r"\bwrite\b"):
         domains.add("documents")
-    if has(r"\b(search|web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b"):
+    if has(
+        r"\b(search|web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b",
+        r"\b(noticias|actualidad)\b",
+        r"\b(?:buscar|busca|busque)\b.*\b(?:internet|web|online|noticias|actualidad|informaci[oó]n\s+actual|últimas?|ultimas?|últimos?|ultimos?)\b",
+        r"\b(notícies|noticies|actualitat)\b",
+        r"\b(?:cercar|cerca|buscar|busca)\b.*\b(?:internet|web|online|notícies|noticies|actualitat|informació\s+actual|últimes?|ultimes?|darreres?)\b",
+    ):
         domains.add("web")
     if has(
         r"\b(wyszukaj|wyszukać|wyszukac)\b.*\b(internet|internecie|online|web)\b",
@@ -1354,6 +1416,21 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     if has(r"\bapi[ _]call\b", r"\bintegrations?\b",
            r"\b(?:home ?assistant|miniflux|gitea|linkding|jellyfin)\b"):
         domains.add("integrations")
+
+    # Deterministic read-only homelab inspection intent.
+    # Keep this narrower than generic Docker/GPU discussion: both a homelab
+    # subject and an inspection/status expression must be present.
+    _homelab_subject = has(
+        r"\b(homelab|home\s*lab|docker|containers?|contenedores?|gpu|vram|"
+        r"palworld|services?|servicios?)\b"
+    )
+    _homelab_inspection = has(
+        r"\b(status|state|health|check|inspect|running|active|usage|temperature|"
+        r"how many|estado|estat|com\\s+est[aà]|comprueba|comprobar|revisa|revisar|funcionando|"
+        r"activos?|uso|temperatura|cu[aá]ntos?)\b"
+    )
+    if _homelab_subject and _homelab_inspection:
+        domains.add("homelab")
 
     low_signal = not continuation and not domains
     return {
@@ -2816,6 +2893,210 @@ def _detect_runaway_call(call_freq, threshold=15):
     return sig.split(":", 1)[0] if sig else None
 
 
+def _homelab_doctor_response(
+    output: str,
+    user_text: str,
+) -> str | None:
+    """Render authoritative whole-homelab doctor JSON without an LLM."""
+    raw = str(output or "").strip()
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    required = {
+        "ok",
+        "errors",
+        "warnings",
+        "issues",
+        "checked_services",
+        "observed_containers",
+    }
+    if not required.issubset(data):
+        return None
+
+    try:
+        errors = int(data.get("errors") or 0)
+        warnings = int(data.get("warnings") or 0)
+        checked = int(data.get("checked_services") or 0)
+        observed = int(data.get("observed_containers") or 0)
+    except (TypeError, ValueError):
+        return None
+
+    issues = data.get("issues") or []
+    if not isinstance(issues, list):
+        return None
+
+    latest = str(user_text or "").casefold()
+
+    if any(x in latest for x in ("diagnòst", "meu homelab", "fes un")):
+        title = "## Diagnòstic del homelab"
+        state = "**correcte**" if data.get("ok") else "**amb incidències**"
+        labels = ("Estat", "Errors", "Avisos", "Serveis comprovats", "Contenidors observats")
+        issues_title = "### Incidències"
+        no_issues = "No s'han detectat incidències."
+        warning_word = "AVÍS"
+    elif any(x in latest for x in ("diagnose", "diagnostic", "my homelab")):
+        title = "## Homelab diagnostic"
+        state = "**healthy**" if data.get("ok") else "**issues detected**"
+        labels = ("Status", "Errors", "Warnings", "Services checked", "Containers observed")
+        issues_title = "### Issues"
+        no_issues = "No issues were detected."
+        warning_word = "WARNING"
+    else:
+        title = "## Diagnóstico del homelab"
+        state = "**correcto**" if data.get("ok") else "**con incidencias**"
+        labels = ("Estado", "Errores", "Avisos", "Servicios comprobados", "Contenedores observados")
+        issues_title = "### Incidencias"
+        no_issues = "No se han detectado incidencias."
+        warning_word = "AVISO"
+
+    lines = [
+        title,
+        "",
+        f"- {labels[0]}: {state}",
+        f"- {labels[1]}: **{errors}**",
+        f"- {labels[2]}: **{warnings}**",
+        f"- {labels[3]}: **{checked}**",
+        f"- {labels[4]}: **{observed}**",
+    ]
+
+    if not issues:
+        return "\n".join(lines + ["", no_issues])
+
+    lines += ["", issues_title]
+
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+
+        severity = str(issue.get("severity") or "issue").lower()
+        label = warning_word if severity == "warning" else severity.upper()
+        service = str(issue.get("service") or "homelab")
+        code = str(issue.get("code") or "unknown")
+        message = str(issue.get("message") or "").strip()
+
+        line = f"- [{label}] **{service}** · `{code}`"
+        if message:
+            line += f": {message}"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def _healthy_homelab_diagnostic_response(
+    output: str,
+    user_text: str,
+) -> str | None:
+    """Return a factual terminal reply for an unequivocally healthy service."""
+    rendered = str(output or "").strip()
+
+    if not rendered:
+        return None
+
+    folded = rendered.casefold()
+
+    if (
+        "- estado: **ok**" not in folded
+        or "- runtime: `running`" not in folded
+    ):
+        return None
+
+    match = re.search(
+        r"(?mi)^##\s+estado de\s+(.+?)\s*$",
+        rendered,
+    )
+
+    service = (
+        match.group(1).strip()
+        if match
+        else "El servicio"
+    )
+
+    health_unavailable = bool(
+        re.search(
+            r"(?mi)^-\s*salud:\s*`?n/d`?\s*$",
+            rendered,
+        )
+    )
+
+    latest = str(user_text or "").casefold()
+
+    is_catalan = any(
+        token in latest
+        for token in (
+            "per què",
+            "per que",
+            "caigut",
+            "caiguda",
+            "estat de",
+            "està caigut",
+            "esta caigut",
+        )
+    )
+
+    is_english = bool(
+        re.search(
+            r"\bwhy\b|\bdown\b|\bstatus\b",
+            latest,
+        )
+    )
+
+    if is_catalan:
+        response = (
+            f"{service} no està caigut: "
+            "l'operador informa d'un estat **OK** "
+            "i el contenidor està en execució "
+            "(`running`)."
+        )
+
+        if health_unavailable:
+            response += (
+                " `Salut: n/d` significa que no hi "
+                "ha dades de healthcheck disponibles; "
+                "no indica una fallada."
+            )
+
+        return response
+
+    if is_english:
+        response = (
+            f"{service} is not down: the operator "
+            "reports **OK** and the container is "
+            "running (`running`)."
+        )
+
+        if health_unavailable:
+            response += (
+                " `Health: n/a` means no health-check "
+                "data is available; it is not evidence "
+                "of a failure."
+            )
+
+        return response
+
+    response = (
+        f"{service} no está caído: el operador "
+        "informa de un estado **OK** y el "
+        "contenedor está en ejecución (`running`)."
+    )
+
+    if health_unavailable:
+        response += (
+            " `Salud: n/d` significa que no hay "
+            "datos de healthcheck disponibles; "
+            "no indica un fallo."
+        )
+
+    return response
+
+
 async def stream_agent_loop(
     endpoint_url: str,
     model: str,
@@ -2839,6 +3120,7 @@ async def stream_agent_loop(
     tool_policy: Optional[ToolPolicy] = None,
     workspace: Optional[str] = None,
     forced_tools: Optional[Set[str]] = None,
+    exclusive_tools: Optional[Set[str]] = None,
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
     _is_teacher_run: bool = False,
@@ -2931,6 +3213,1148 @@ async def stream_agent_loop(
             _last_user[:80],
         )
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
+
+    # Explicit Palworld start and confirmed stop requests are deterministic.
+    # Start is immediate for administrators. Stop requires a short-lived
+    # owner/session authorization and always creates a verified backup first.
+    try:
+        from src.services.homelab.palworld_lifecycle import (
+            classify_palworld_lifecycle_turn
+            as _classify_palworld_lifecycle_turn,
+        )
+
+        _palworld_lifecycle_turn = (
+            _classify_palworld_lifecycle_turn(
+                _last_user,
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+    except Exception as _lifecycle_classify_error:
+        logger.warning(
+            "[agent-action] Palworld lifecycle "
+            "classification failed: %s",
+            _lifecycle_classify_error,
+        )
+        _palworld_lifecycle_turn = None
+
+    _palworld_lifecycle_plain_context = (
+        _palworld_lifecycle_turn is not None
+        and not guide_only
+        and not plan_mode
+        and not approved_plan
+        and not workspace
+        and not active_email
+        and not uploaded_files
+        and not _active_document_relevant
+        and (
+            not forced_tools
+            or set(forced_tools).issubset({
+                "homelab",
+                "web_fetch",
+                "web_search",
+            })
+        )
+        and (
+            not relevant_tools
+            or set(relevant_tools) == {"homelab"}
+        )
+        and (
+            not exclusive_tools
+            or set(exclusive_tools) == {"homelab"}
+        )
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    )
+
+    if _palworld_lifecycle_plain_context:
+        from src.tool_security import (
+            owner_is_admin_or_single_user
+            as _owner_can_control_palworld,
+        )
+
+        _lifecycle_started = time.time()
+
+        _lifecycle_action = str(
+            _palworld_lifecycle_turn.get(
+                "action"
+            )
+            or ""
+        )
+
+        _lifecycle_kind = str(
+            _palworld_lifecycle_turn.get(
+                "kind"
+            )
+            or ""
+        )
+
+        _lifecycle_effectful = (
+            _lifecycle_action == "start"
+            or (
+                _lifecycle_action == "stop"
+                and _lifecycle_kind
+                == "confirmation"
+            )
+        )
+
+        _lifecycle_command_action = (
+            "palworld_start"
+            if _lifecycle_action == "start"
+            else "palworld_stop_confirmed"
+        )
+
+        _lifecycle_command = json.dumps(
+            {
+                "action":
+                    _lifecycle_command_action,
+            },
+            ensure_ascii=False,
+        )
+
+        if _lifecycle_effectful:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_start",
+                    "tool": "homelab",
+                    "command": _lifecycle_command,
+                    "full_command":
+                        _lifecycle_command,
+                    "round": 0,
+                })
+                + "\n\n"
+            )
+
+        _lifecycle_confirmation_required = False
+
+        try:
+            if not _owner_can_control_palworld(
+                owner
+            ):
+                raise PermissionError(
+                    "Esta acción requiere una "
+                    "sesión de administrador"
+                )
+
+            if (
+                _lifecycle_action == "stop"
+                and not str(
+                    session_id or ""
+                ).strip()
+            ):
+                raise PermissionError(
+                    "La parada requiere una "
+                    "sesión persistente"
+                )
+
+            if _lifecycle_action == "start":
+                from src.services.homelab.palworld_lifecycle import (
+                    format_start_result
+                    as _format_start_result,
+                    start_palworld_verified
+                    as _start_palworld_verified,
+                )
+
+                _lifecycle_result = (
+                    await asyncio.to_thread(
+                        _start_palworld_verified
+                    )
+                )
+
+                _lifecycle_text = (
+                    _format_start_result(
+                        _lifecycle_result,
+                        _last_user,
+                    )
+                )
+
+            elif (
+                _lifecycle_action == "stop"
+                and _lifecycle_kind == "request"
+            ):
+                from src.services.homelab.palworld_lifecycle import (
+                    format_stop_confirmation
+                    as _format_stop_confirmation,
+                    prepare_palworld_stop_confirmation
+                    as _prepare_palworld_stop_confirmation,
+                )
+
+                _lifecycle_result = (
+                    await asyncio.to_thread(
+                        _prepare_palworld_stop_confirmation,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                    )
+                )
+
+                _lifecycle_text = (
+                    _format_stop_confirmation(
+                        _lifecycle_result,
+                        _last_user,
+                    )
+                )
+
+                _lifecycle_confirmation_required = True
+
+            elif (
+                _lifecycle_action == "stop"
+                and _lifecycle_kind
+                == "confirmation"
+            ):
+                from src.services.homelab.palworld_lifecycle import (
+                    execute_confirmed_palworld_stop
+                    as _execute_confirmed_palworld_stop,
+                    format_stop_result
+                    as _format_stop_result,
+                )
+
+                _lifecycle_result = (
+                    await asyncio.to_thread(
+                        _execute_confirmed_palworld_stop,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                        code=str(
+                            _palworld_lifecycle_turn.get(
+                                "code"
+                            )
+                            or ""
+                        ),
+                    )
+                )
+
+                _lifecycle_text = (
+                    _format_stop_result(
+                        _lifecycle_result,
+                        _last_user,
+                    )
+                )
+
+            else:
+                raise RuntimeError(
+                    "Acción de ciclo de vida "
+                    "no permitida"
+                )
+
+            _lifecycle_exit_code = 0
+
+        except Exception as _lifecycle_error:
+            _safe_lifecycle_error = (
+                str(_lifecycle_error)
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .strip()[:400]
+            )
+
+            _lifecycle_text = (
+                "No se pudo completar la "
+                "solicitud sobre Palworld"
+                + (
+                    f": {_safe_lifecycle_error}"
+                    if _safe_lifecycle_error
+                    else "."
+                )
+            )
+
+            _lifecycle_exit_code = 1
+
+            logger.warning(
+                "[agent-action] Palworld lifecycle "
+                "failed closed action=%s kind=%s: %s",
+                _lifecycle_action,
+                _lifecycle_kind,
+                _safe_lifecycle_error,
+            )
+
+        _lifecycle_duration = (
+            time.time() - _lifecycle_started
+        )
+
+        if _lifecycle_effectful:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_output",
+                    "tool": "homelab",
+                    "command": _lifecycle_command,
+                    "output": _lifecycle_text,
+                    "exit_code":
+                        _lifecycle_exit_code,
+                })
+                + "\n\n"
+            )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "delta": _lifecycle_text,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "metrics",
+                "data": {
+                    "model": model,
+                    "requested_model": model,
+                    "input_tokens": estimate_tokens([{
+                        "role": "user",
+                        "content": _last_user,
+                    }]),
+                    "output_tokens": max(
+                        len(_lifecycle_text) // 4,
+                        1,
+                    ),
+                    "total_time": round(
+                        _lifecycle_duration,
+                        3,
+                    ),
+                    "response_time": round(
+                        _lifecycle_duration,
+                        3,
+                    ),
+                    "agent_rounds": 0,
+                    "tool_calls": (
+                        1
+                        if _lifecycle_effectful
+                        else 0
+                    ),
+                    "direct_palworld_lifecycle": True,
+                    "lifecycle_action":
+                        _lifecycle_action,
+                    "confirmation_required":
+                        _lifecycle_confirmation_required,
+                    "action_succeeded": (
+                        _lifecycle_effectful
+                        and _lifecycle_exit_code == 0
+                    ),
+                },
+            })
+            + "\n\n"
+        )
+
+        logger.info(
+            "[agent-action] Palworld lifecycle "
+            "completed action=%s kind=%s "
+            "exit=%s duration=%.3fs",
+            _lifecycle_action,
+            _lifecycle_kind,
+            _lifecycle_exit_code,
+            _lifecycle_duration,
+        )
+
+        yield "data: [DONE]\n\n"
+        return
+
+    # Explicit confirmed Palworld restart requests are deterministic and session-bound.
+    # The first turn only creates a short-lived authorization. The second turn
+    # must provide its exact code from the same owner and session.
+    try:
+        from src.services.homelab.palworld_restart import (
+            classify_palworld_restart_turn
+            as _classify_palworld_restart_turn,
+        )
+
+        _palworld_restart_turn = (
+            _classify_palworld_restart_turn(
+                _last_user,
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+    except Exception as _restart_classify_error:
+        logger.warning(
+            "[agent-action] Palworld restart "
+            "classification failed: %s",
+            _restart_classify_error,
+        )
+        _palworld_restart_turn = None
+
+    _palworld_restart_plain_context = (
+        _palworld_restart_turn is not None
+        and not guide_only
+        and not plan_mode
+        and not approved_plan
+        and not workspace
+        and not active_email
+        and not uploaded_files
+        and not _active_document_relevant
+        and (
+            not forced_tools
+            or set(forced_tools).issubset({
+                "homelab",
+                "web_fetch",
+                "web_search",
+            })
+        )
+        and (
+            not relevant_tools
+            or set(relevant_tools) == {"homelab"}
+        )
+        and (
+            not exclusive_tools
+            or set(exclusive_tools) == {"homelab"}
+        )
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    )
+
+    if _palworld_restart_plain_context:
+        from src.tool_security import (
+            owner_is_admin_or_single_user
+            as _owner_can_restart_palworld,
+        )
+
+        _restart_started = time.time()
+
+        _restart_kind = str(
+            _palworld_restart_turn.get("kind")
+            or ""
+        )
+
+        _restart_action_attempted = (
+            _restart_kind == "confirmation"
+        )
+
+        _restart_command = json.dumps(
+            {
+                "action":
+                    "palworld_restart_confirmed",
+            },
+            ensure_ascii=False,
+        )
+
+        if _restart_action_attempted:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_start",
+                    "tool": "homelab",
+                    "command": _restart_command,
+                    "full_command": _restart_command,
+                    "round": 0,
+                })
+                + "\n\n"
+            )
+
+        _restart_confirmation_required = False
+
+        try:
+            if not _owner_can_restart_palworld(
+                owner
+            ):
+                raise PermissionError(
+                    "Esta acción requiere una "
+                    "sesión de administrador"
+                )
+
+            if not str(session_id or "").strip():
+                raise PermissionError(
+                    "El reinicio requiere una "
+                    "sesión persistente"
+                )
+
+            if _restart_kind == "request":
+                from src.services.homelab.palworld_restart import (
+                    format_restart_confirmation
+                    as _format_restart_confirmation,
+                    prepare_palworld_restart_confirmation
+                    as _prepare_palworld_restart_confirmation,
+                )
+
+                _restart_result = (
+                    await asyncio.to_thread(
+                        _prepare_palworld_restart_confirmation,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                    )
+                )
+
+                _restart_text = (
+                    _format_restart_confirmation(
+                        _restart_result,
+                        _last_user,
+                    )
+                )
+
+                _restart_confirmation_required = True
+
+            elif _restart_kind == "confirmation":
+                from src.services.homelab.palworld_restart import (
+                    execute_confirmed_palworld_restart
+                    as _execute_confirmed_palworld_restart,
+                    format_verified_palworld_restart
+                    as _format_verified_palworld_restart,
+                )
+
+                _restart_result = (
+                    await asyncio.to_thread(
+                        _execute_confirmed_palworld_restart,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                        code=str(
+                            _palworld_restart_turn.get(
+                                "code"
+                            )
+                            or ""
+                        ),
+                    )
+                )
+
+                _restart_text = (
+                    _format_verified_palworld_restart(
+                        _restart_result,
+                        _last_user,
+                    )
+                )
+
+            else:
+                raise RuntimeError(
+                    "Tipo de reinicio no permitido"
+                )
+
+            _restart_exit_code = 0
+
+        except Exception as _restart_error:
+            _safe_restart_error = (
+                str(_restart_error)
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .strip()[:400]
+            )
+
+            _restart_text = (
+                "No se pudo completar la "
+                "solicitud de reinicio de Palworld"
+                + (
+                    f": {_safe_restart_error}"
+                    if _safe_restart_error
+                    else "."
+                )
+            )
+
+            _restart_exit_code = 1
+
+            logger.warning(
+                "[agent-action] Palworld restart "
+                "failed closed kind=%s: %s",
+                _restart_kind,
+                _safe_restart_error,
+            )
+
+        _restart_duration = (
+            time.time() - _restart_started
+        )
+
+        if _restart_action_attempted:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_output",
+                    "tool": "homelab",
+                    "command": _restart_command,
+                    "output": _restart_text,
+                    "exit_code":
+                        _restart_exit_code,
+                })
+                + "\n\n"
+            )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "delta": _restart_text,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "metrics",
+                "data": {
+                    "model": model,
+                    "requested_model": model,
+                    "input_tokens": estimate_tokens([{
+                        "role": "user",
+                        "content": _last_user,
+                    }]),
+                    "output_tokens": max(
+                        len(_restart_text) // 4,
+                        1,
+                    ),
+                    "total_time": round(
+                        _restart_duration,
+                        3,
+                    ),
+                    "response_time": round(
+                        _restart_duration,
+                        3,
+                    ),
+                    "agent_rounds": 0,
+                    "tool_calls": (
+                        1
+                        if _restart_action_attempted
+                        else 0
+                    ),
+                    "direct_palworld_restart": True,
+                    "confirmation_required":
+                        _restart_confirmation_required,
+                    "confirmed_restart_attempt":
+                        _restart_action_attempted,
+                    "action_succeeded": (
+                        _restart_action_attempted
+                        and _restart_exit_code == 0
+                    ),
+                },
+            })
+            + "\n\n"
+        )
+
+        logger.info(
+            "[agent-action] Palworld restart "
+            "turn completed kind=%s exit=%s "
+            "duration=%.3fs",
+            _restart_kind,
+            _restart_exit_code,
+            _restart_duration,
+        )
+
+        yield "data: [DONE]\n\n"
+        return
+
+    # Explicit Palworld backup actions are deterministic and fail closed.
+    # They are not exposed in the LLM tool schema: only a complete command in
+    # the current user turn can reach the restricted action client.
+    try:
+        from src.services.homelab.palworld_backup import (
+            classify_explicit_palworld_backup_request
+            as _classify_explicit_palworld_backup_request,
+        )
+
+        _explicit_palworld_backup = (
+            _classify_explicit_palworld_backup_request(
+                _last_user,
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+    except Exception as _backup_classify_error:
+        logger.warning(
+            "[agent-action] Palworld backup "
+            "classification failed: %s",
+            _backup_classify_error,
+        )
+        _explicit_palworld_backup = False
+
+    _palworld_backup_plain_context = (
+        _explicit_palworld_backup
+        and not guide_only
+        and not plan_mode
+        and not approved_plan
+        and not workspace
+        and not active_email
+        and not uploaded_files
+        and not _active_document_relevant
+        and (
+            not forced_tools
+            or set(forced_tools).issubset({
+                "homelab",
+                "web_fetch",
+                "web_search",
+            })
+        )
+        and (
+            not relevant_tools
+            or set(relevant_tools) == {"homelab"}
+        )
+        and (
+            not exclusive_tools
+            or set(exclusive_tools) == {"homelab"}
+        )
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    )
+
+    if _palworld_backup_plain_context:
+        from src.tool_security import (
+            owner_is_admin_or_single_user
+            as _owner_can_run_homelab_action,
+        )
+
+        if not _owner_can_run_homelab_action(owner):
+            _denied_text = (
+                "Esta acción requiere una sesión "
+                "de administrador."
+            )
+
+            yield (
+                "data: "
+                + json.dumps({
+                    "delta": _denied_text,
+                })
+                + "\n\n"
+            )
+
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "metrics",
+                    "data": {
+                        "model": model,
+                        "requested_model": model,
+                        "input_tokens": estimate_tokens([{
+                            "role": "user",
+                            "content": _last_user,
+                        }]),
+                        "output_tokens": max(
+                            len(_denied_text) // 4,
+                            1,
+                        ),
+                        "agent_rounds": 0,
+                        "tool_calls": 0,
+                        "direct_palworld_backup": True,
+                        "action_authorized": False,
+                    },
+                })
+                + "\n\n"
+            )
+
+            logger.warning(
+                "[agent-action] denied Palworld "
+                "backup owner=%r",
+                owner,
+            )
+
+            yield "data: [DONE]\n\n"
+            return
+
+        _backup_started = time.time()
+
+        _backup_command = json.dumps(
+            {
+                "action":
+                    "palworld_backup_create",
+            },
+            ensure_ascii=False,
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "tool_start",
+                "tool": "homelab",
+                "command": _backup_command,
+                "full_command": _backup_command,
+                "round": 0,
+            })
+            + "\n\n"
+        )
+
+        try:
+            from src.services.homelab.palworld_backup import (
+                create_verified_palworld_backup
+                as _create_verified_palworld_backup,
+                format_verified_palworld_backup
+                as _format_verified_palworld_backup,
+            )
+
+            _verified_backup = await asyncio.to_thread(
+                _create_verified_palworld_backup
+            )
+
+            _backup_text = (
+                _format_verified_palworld_backup(
+                    _verified_backup,
+                    _last_user,
+                )
+            )
+
+            _backup_exit_code = 0
+
+        except Exception as _backup_error:
+            _safe_backup_error = (
+                str(_backup_error)
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .strip()[:400]
+            )
+
+            _backup_text = (
+                "No se pudo completar el backup "
+                "de Palworld"
+                + (
+                    f": {_safe_backup_error}"
+                    if _safe_backup_error
+                    else "."
+                )
+            )
+
+            _backup_exit_code = 1
+
+            logger.warning(
+                "[agent-action] Palworld backup "
+                "failed closed: %s",
+                _safe_backup_error,
+            )
+
+        _backup_duration = (
+            time.time() - _backup_started
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "tool_output",
+                "tool": "homelab",
+                "command": _backup_command,
+                "output": _backup_text,
+                "exit_code": _backup_exit_code,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "delta": _backup_text,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "metrics",
+                "data": {
+                    "model": model,
+                    "requested_model": model,
+                    "input_tokens": estimate_tokens([{
+                        "role": "user",
+                        "content": _last_user,
+                    }]),
+                    "output_tokens": max(
+                        len(_backup_text) // 4,
+                        1,
+                    ),
+                    "total_time": round(
+                        _backup_duration,
+                        3,
+                    ),
+                    "response_time": round(
+                        _backup_duration,
+                        3,
+                    ),
+                    "agent_rounds": 0,
+                    "tool_calls": 1,
+                    "direct_palworld_backup": True,
+                    "action_authorized": True,
+                    "action_succeeded":
+                        _backup_exit_code == 0,
+                },
+            })
+            + "\n\n"
+        )
+
+        logger.info(
+            "[agent-action] Palworld backup "
+            "completed exit=%s duration=%.3fs",
+            _backup_exit_code,
+            _backup_duration,
+        )
+
+        yield "data: [DONE]\n\n"
+        return
+
+    # Deterministic homelab read-only requests do not need an LLM round.
+    # The classifier returns the canonical tool command; this loop contains
+    # no service-specific linguistic routing rules.
+    try:
+        from src.agent_tools.homelab_tools import (
+            HomelabTool as _FastHomelabTool,
+            classify_direct_homelab_request
+            as _classify_direct_homelab_request,
+            should_include_homelab_tool
+            as _should_include_homelab_tool,
+        )
+
+        _fast_command_args = (
+            _classify_direct_homelab_request(
+                _last_user,
+                _intent.get("domains") or set(),
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+        _homelab_agent_tool_required = (
+            _should_include_homelab_tool(
+                _last_user,
+                _intent.get("domains") or set(),
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+        if _fast_command_args is not None:
+            _intent["domains"] = {"homelab"}
+            _low_signal_turn = False
+            _direct_low_signal = False
+
+        _direct_homelab_request = (
+            _fast_command_args is not None
+            and not guide_only
+            and not plan_mode
+            and not approved_plan
+            and (
+                not forced_tools
+                or set(forced_tools).issubset(
+                    {
+                        "homelab",
+                        "web_fetch",
+                        "web_search",
+                    }
+                )
+            )
+            and (
+                not relevant_tools
+                or set(relevant_tools) == {"homelab"}
+            )
+            and not uploaded_files
+            and not _active_document_relevant
+            and "homelab" not in disabled_tools
+            and (
+                not exclusive_tools
+                or set(exclusive_tools) == {"homelab"}
+            )
+            and not (
+                tool_policy
+                and tool_policy.blocks("homelab")
+            )
+        )
+
+    except Exception as _fast_classify_err:
+        logger.warning(
+            "[agent-fastpath] classification failed: %s",
+            _fast_classify_err,
+        )
+
+        _fast_command_args = None
+        _direct_homelab_request = False
+        _homelab_agent_tool_required = False
+
+    if (
+        _fast_command_args is not None
+        or set(
+            _intent.get("domains") or set()
+        ) == {"homelab"}
+    ):
+        logger.info(
+            "[agent-fastpath] eligibility=%s "
+            "action=%s service=%s "
+            "workspace=%s active_email=%s "
+            "forced=%s relevant=%s uploads=%s "
+            "active_doc=%s guide_only=%s "
+            "plan_mode=%s",
+            _direct_homelab_request,
+            (
+                _fast_command_args.get("action")
+                if _fast_command_args
+                else None
+            ),
+            (
+                _fast_command_args.get("service")
+                if _fast_command_args
+                else None
+            ),
+            bool(workspace),
+            bool(active_email),
+            sorted(forced_tools or []),
+            sorted(relevant_tools or []),
+            bool(uploaded_files),
+            bool(_active_document_relevant),
+            guide_only,
+            plan_mode,
+        )
+
+    if _direct_homelab_request:
+        _fast_start = time.time()
+
+        _fast_command = json.dumps(
+            _fast_command_args,
+            ensure_ascii=False,
+        )
+
+        _fast_action = str(
+            _fast_command_args.get("action")
+            or ""
+        )
+
+        try:
+            _fast_result = await _FastHomelabTool().execute(
+                _fast_command,
+                {},
+            )
+
+            _fast_text = str(
+                _fast_result.get("direct_response")
+                or _fast_result.get("output")
+                or ""
+            ).strip()
+
+            if (
+                _fast_action == "doctor"
+                and _fast_text
+            ):
+                _fast_doctor_reply = (
+                    _homelab_doctor_response(
+                        _fast_text,
+                        _last_user,
+                    )
+                )
+                if _fast_doctor_reply:
+                    _fast_text = _fast_doctor_reply
+
+            if (
+                _fast_result.get("error")
+                or _fast_result.get("exit_code") != 0
+                or (
+                    _fast_action != "doctor"
+                    and not _fast_result.get(
+                        "terminal_response"
+                    )
+                )
+                or not _fast_text
+            ):
+                raise RuntimeError(
+                    _fast_result.get("error")
+                    or (
+                        "invalid deterministic "
+                        "homelab result"
+                    )
+                )
+
+        except Exception as _fast_exec_err:
+            logger.warning(
+                "[agent-fastpath] homelab request failed; "
+                "continuing through normal agent path: %s",
+                _fast_exec_err,
+            )
+
+        else:
+            _fast_duration = (
+                time.time() - _fast_start
+            )
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "tool_start",
+                        "tool": "homelab",
+                        "command": _fast_command,
+                        "full_command": _fast_command,
+                        "round": 0,
+                    }
+                )
+                + "\n\n"
+            )
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "tool_output",
+                        "tool": "homelab",
+                        "command": _fast_command,
+                        "output": _fast_text,
+                        "exit_code": 0,
+                    }
+                )
+                + "\n\n"
+            )
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {"delta": _fast_text}
+                )
+                + "\n\n"
+            )
+
+            _fast_metrics = {
+                "model": model,
+                "requested_model": model,
+                "input_tokens": estimate_tokens(
+                    [
+                        {
+                            "role": "user",
+                            "content": _last_user,
+                        }
+                    ]
+                ),
+                "output_tokens": max(
+                    len(_fast_text) // 4,
+                    1,
+                ),
+                "total_time": round(
+                    _fast_duration,
+                    3,
+                ),
+                "response_time": round(
+                    _fast_duration,
+                    3,
+                ),
+                "agent_rounds": 0,
+                "tool_calls": 1,
+                "direct_homelab_request": True,
+                "direct_homelab_status": (
+                    _fast_action == "status"
+                ),
+                "direct_homelab_action": _fast_action,
+            }
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "metrics",
+                        "data": _fast_metrics,
+                    }
+                )
+                + "\n\n"
+            )
+
+            logger.info(
+                "[agent-fastpath] homelab request "
+                "completed without LLM "
+                "action=%s in %.3fs",
+                _fast_action,
+                _fast_duration,
+            )
+
+            yield "data: [DONE]\n\n"
+            return
+
     if _direct_low_signal:
         logger.info("[agent] direct low-signal reply path for latest=%r", _last_user[:80])
         direct_messages = (
@@ -3274,6 +4698,58 @@ async def stream_agent_loop(
                 _removed_doc_file_tools,
             )
 
+    # Read-only homelab investigations must start with real operator data.
+    # Clamp the first-round schema to homelab so smaller local models cannot
+    # substitute ask_teacher, web search, or unrelated administration tools.
+    if (
+        _homelab_agent_tool_required
+        and not guide_only
+        and not exclusive_tools
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    ):
+        exclusive_tools = {"homelab"}
+
+        logger.info(
+            "[agent-intent] forced read-only "
+            "homelab diagnostic tool=%s",
+            sorted(exclusive_tools),
+        )
+
+    # A deterministic, read-only homelab status request has one unambiguous
+    # implementation. Clamp it before generic/admin tool expansion so smaller
+    # local models cannot substitute Cookbook or server-management tools.
+    if (
+        not guide_only
+        and not exclusive_tools
+        and set(_intent.get("domains") or set()) == {"homelab"}
+    ):
+        exclusive_tools = {"homelab"}
+        logger.info(
+            "[agent-intent] deterministic homelab exclusive=%s",
+            sorted(exclusive_tools),
+        )
+
+    # Explicit per-request exclusive tools override retrieval and all
+    # automatic tool expansions. Disabled tools remain unavailable.
+    if not guide_only and exclusive_tools:
+        _exclusive_set = {
+            t for t in exclusive_tools
+            if t not in disabled_tools
+        }
+        _relevant_tools = _exclusive_set
+        logger.info(
+            "[agent-intent] exclusive tool clamp=%s",
+            sorted(_relevant_tools),
+        )
+
+    # Exclusive requests must remain exclusive in both prompt construction
+    # and schema construction, even if generic admin intent also matched.
+    _effective_needs_admin = _needs_admin and not bool(exclusive_tools)
+
     if _relevant_tools is not None:
         logger.info("[agent-intent] selected_tools=%s", sorted(_relevant_tools)[:50])
 
@@ -3353,7 +4829,7 @@ async def stream_agent_loop(
     _compact_agent_prompt = _is_api_model or _is_ollama_native or _ollama_openai_compat
     messages, mcp_schemas = _build_system_prompt(
         messages, model, _prompt_active_document, mcp_mgr, disabled_tools,
-        needs_admin=_needs_admin, relevant_tools=_relevant_tools,
+        needs_admin=_effective_needs_admin, relevant_tools=_relevant_tools,
         mcp_disabled_map=_mcp_disabled_map,
         compact=_compact_agent_prompt,
         owner=owner,
@@ -3509,6 +4985,7 @@ async def stream_agent_loop(
     actual_model = model
     total_tool_calls = 0  # for budget enforcement
     _ody_notes_tool_completed = False
+    _ody_homelab_status_completed = False
 
     # Loop-breaker state. Small models (e.g. deepseek-v4-flash) can get
     # stuck firing the same tool call over and over with no text — burns
@@ -3580,7 +5057,9 @@ async def stream_agent_loop(
             # calling tools. Send NO tools this round so it's forced to
             # write the answer instead of flailing further.
             all_tool_schemas = []
-        elif _is_api_model:
+        elif _is_api_model or _is_ollama_native or _ollama_openai_compat:
+            # Send native function schemas to API models and Ollama.
+            # Ollama's /api/chat supports structured tool calling.
             # Filter schemas by RAG-selected tools (if available)
             if _relevant_tools:
                 # _build_base_prompt unions _ADMIN_TOOLS into the prompt
@@ -3589,7 +5068,7 @@ async def stream_agent_loop(
                 # tools it cannot call and substitutes the nearest schema
                 # it does have (e.g. manage_memory for manage_skills).
                 _schema_names = set(_relevant_tools)
-                if _needs_admin:
+                if _effective_needs_admin:
                     _schema_names |= _ADMIN_TOOLS
                 base_schemas = [
                     s for s in FUNCTION_TOOL_SCHEMAS
@@ -3601,7 +5080,7 @@ async def stream_agent_loop(
                 ]
                 all_tool_schemas = base_schemas + _mcp_filtered
             else:
-                base_schemas = FUNCTION_TOOL_SCHEMAS if _needs_admin else [
+                base_schemas = FUNCTION_TOOL_SCHEMAS if _effective_needs_admin else [
                     s for s in FUNCTION_TOOL_SCHEMAS
                     if s.get("function", {}).get("name") not in _ADMIN_SCHEMA_NAMES
                 ]
@@ -3622,7 +5101,7 @@ async def stream_agent_loop(
         agent_stream_timeout = int(get_setting("agent_stream_timeout_seconds", 300) or 300)
 
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
-        logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent[:15]} relevant_tools={sorted(_relevant_tools)[:15] if _relevant_tools else 'ALL'}")
+        logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent} relevant_tools={sorted(_relevant_tools) if _relevant_tools else 'ALL'}")
 
         # Legacy rebuilds its configured fallback chain per round. Auto uses a
         # request-global route state instead: one JIT-authorized candidate at a
@@ -3646,16 +5125,29 @@ async def stream_agent_loop(
             bool(all_tool_schemas),
             agent_stream_timeout,
         )
+        # Force an explicitly exclusive single tool only on the first round.
+        # Later rounds must remain automatic so the model can turn the tool
+        # result into a final response instead of repeatedly calling the tool.
+        _forced_tool_name = (
+            _tool_names_sent[0]
+            if round_num == 1
+            and exclusive_tools
+            and len(_tool_names_sent) == 1
+            else None
+        )
+
         _round_stream_kwargs = {
             "temperature": temperature,
             "max_tokens": max_tokens,
             "prompt_type": prompt_type if round_num == 1 else None,
             "tools": all_tool_schemas if all_tool_schemas else None,
             "tool_choice_none": _ody_doc_finetune_mode,
+            "tool_choice_name": _forced_tool_name,
             "timeout": agent_stream_timeout,
             "session_id": session_id,
             "workload": workload,
         }
+
         if route_state is not None:
             _round_stream = _stream_auto_agent_round(
                 route_state,
@@ -3668,6 +5160,7 @@ async def stream_agent_loop(
                 messages,
                 **_round_stream_kwargs,
             )
+
         async for chunk in _round_stream:
             if not _round_first_event_logged:
                 _round_first_event_logged = True
@@ -4609,6 +6102,48 @@ async def stream_agent_loop(
                 tool_output_data["diff"] = result["diff"]
             yield f'data: {json.dumps(tool_output_data)}\n\n'
 
+            if (
+                block.tool_type == "homelab"
+                and result.get("terminal_response")
+                and not result.get("error")
+                and not _homelab_agent_tool_required
+            ):
+                _homelab_text = str(
+                    result.get("direct_response")
+                    or result.get("output")
+                    or ""
+                ).strip()
+
+                if _homelab_text:
+                    if not _ody_homelab_status_completed:
+                        _clean_current = strip_tool_blocks(
+                            full_response
+                        ).strip()
+
+                        _prefix = (
+                            "\n\n"
+                            if _clean_current
+                            else ""
+                        )
+
+                        full_response = (
+                            _clean_current
+                            + _prefix
+                            + _homelab_text
+                        ).strip()
+
+                        yield (
+                            "data: "
+                            + json.dumps({
+                                "delta":
+                                    _prefix
+                                    + _homelab_text
+                            })
+                            + "\n\n"
+                        )
+
+                    _ody_homelab_status_completed = True
+
             if block.tool_type == "manage_notes":
                 _notes_action = ""
                 try:
@@ -4733,6 +6268,51 @@ async def stream_agent_loop(
             ):
                 _ody_doc_tool_completed = True
 
+        # Healthy diagnostic results are factual and need no probabilistic
+        # second-round synthesis. This also prevents unsupported remediation
+        # advice when the operator reports that the service is running.
+        if _homelab_agent_tool_required:
+            _healthy_homelab_output = ""
+
+            for _event in reversed(tool_events):
+                if (
+                    _event.get("tool") == "homelab"
+                    and _event.get("exit_code") == 0
+                ):
+                    _healthy_homelab_output = str(
+                        _event.get("output") or ""
+                    )
+                    break
+
+            _healthy_homelab_reply = (
+                _healthy_homelab_diagnostic_response(
+                    _healthy_homelab_output,
+                    _last_user,
+                )
+            )
+
+            if _healthy_homelab_reply:
+                full_response = (
+                    _healthy_homelab_reply
+                )
+
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "delta":
+                            _healthy_homelab_reply
+                    })
+                    + "\n\n"
+                )
+
+                _ody_homelab_status_completed = True
+
+                logger.info(
+                    "[agent] healthy homelab "
+                    "diagnostic completed from "
+                    "authoritative operator state"
+                )
+
         # If budget was hit, stop the loop
         if budget_hit:
             break
@@ -4742,6 +6322,13 @@ async def stream_agent_loop(
         # arrives as the next message and the agent resumes from there. The
         # question text is already in the streamed response, so it persists.
         if _awaiting_user:
+            break
+
+        if _ody_homelab_status_completed:
+            logger.info(
+                "[agent] homelab status completed "
+                "from deterministic tool output"
+            )
             break
 
         if _doc_stream_create_completed:
@@ -4771,6 +6358,35 @@ async def stream_agent_loop(
         _append_tool_results(messages, round_response, converted_calls,
                              tool_results, tool_result_texts, used_native, round_num,
                              round_reasoning=round_reasoning)
+
+        if (
+            _homelab_agent_tool_required
+            and any(
+                event.get("tool") == "homelab"
+                and event.get("exit_code") == 0
+                for event in tool_events
+            )
+        ):
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Treat the Homelab Operator result "
+                    "as authoritative. Synthesize it "
+                    "conservatively and in the user's "
+                    "language. If Estado is OK and Runtime "
+                    "is running, the first sentence must "
+                    "explicitly state that the service is "
+                    "not down. Salud n/d means that no "
+                    "health-check data is available; it is "
+                    "not evidence of failure. Do not invent "
+                    "possible causes or recommend restart, "
+                    "configuration changes, network fixes, "
+                    "or log inspection unless the tool "
+                    "result contains evidence of a problem "
+                    "or the user explicitly requested that "
+                    "next step. Keep the answer concise."
+                ),
+            })
 
         # Emit agent_step event
         yield (

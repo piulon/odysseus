@@ -2,8 +2,9 @@
 
 Covers:
 - _is_ollama_openai_compat_url: URL classification (local host + /v1 path)
-- think: false is injected into the payload for Ollama /v1 thinking models
-- think: false is NOT injected for non-thinking models or non-Ollama /v1 endpoints
+- reasoning_effort: none is injected for Ollama /v1 thinking models
+- Ollama-native think:false does not leak into the /v1 payload
+- reasoning controls are not injected for unrelated endpoints/models
 """
 import asyncio
 import json
@@ -127,39 +128,197 @@ class TestIsOllamaOpenAICompatUrl:
 
 
 # ---------------------------------------------------------------------------
-# Payload injection — think: false only when both conditions hold
+# Payload injection — correct OpenAI-compatible reasoning control
 # ---------------------------------------------------------------------------
 
 class TestThinkSuppression:
-    """Assert think:false is present/absent in the outgoing HTTP payload."""
+    """Assert Ollama /v1 receives reasoning_effort:none, never think:false."""
 
-    def test_think_false_for_ollama_v1_thinking_model(self, monkeypatch):
-        """think:false must be set for qwen3 on Ollama /v1."""
+    def test_reasoning_none_for_ollama_v1_thinking_model(self, monkeypatch):
         payload = _capture_payload(
-            monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "qwen3:14b"
+            monkeypatch,
+            "http://127.0.0.1:11434/v1/chat/completions",
+            "qwen3:14b",
         )
-        assert payload.get("think") is False
-
-    def test_no_think_for_ollama_v1_non_thinking_model(self, monkeypatch):
-        """think must NOT be set for a plain (non-thinking) model on Ollama /v1."""
-        payload = _capture_payload(
-            monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "llama3.2:3b"
-        )
+        assert payload.get("reasoning_effort") == "none"
         assert "think" not in payload
 
-    def test_no_think_for_openai_endpoint_with_thinking_model_name(self, monkeypatch):
-        """think must NOT leak to a real OpenAI endpoint even if the model name
-        matches a thinking pattern — the URL guard is what matters."""
+    def test_no_reasoning_control_for_ollama_v1_non_thinking_model(
+        self, monkeypatch
+    ):
         payload = _capture_payload(
-            monkeypatch, "https://api.openai.com/v1/chat/completions", "qwen3:14b"
+            monkeypatch,
+            "http://127.0.0.1:11434/v1/chat/completions",
+            "llama3.2:3b",
         )
+        assert "reasoning_effort" not in payload
         assert "think" not in payload
 
-    def test_think_false_for_non_default_port_thinking_model(self, monkeypatch):
-        """Custom-port localhost Ollama (e.g. OLLAMA_HOST=0.0.0.0:11435) must
-        also receive think:false — this is the regression guarded by the
-        host-set check added in this fix."""
+    def test_no_ollama_reasoning_control_for_real_openai(
+        self, monkeypatch
+    ):
         payload = _capture_payload(
-            monkeypatch, "http://127.0.0.1:11435/v1/chat/completions", "qwen3:14b"
+            monkeypatch,
+            "https://api.openai.com/v1/chat/completions",
+            "qwen3:14b",
         )
-        assert payload.get("think") is False
+        assert "reasoning_effort" not in payload
+        assert "think" not in payload
+
+    def test_reasoning_none_for_non_default_port_thinking_model(
+        self, monkeypatch
+    ):
+        payload = _capture_payload(
+            monkeypatch,
+            "http://127.0.0.1:11435/v1/chat/completions",
+            "qwen3:14b",
+        )
+        assert payload.get("reasoning_effort") == "none"
+        assert "think" not in payload
+
+
+def test_shared_reasoning_policy_is_narrow():
+    payload = {"think": False}
+    llm_core._apply_ollama_openai_compat_reasoning_policy(
+        payload,
+        "http://127.0.0.1:11434/v1/chat/completions",
+        "qwen3:14b",
+    )
+    assert payload == {"reasoning_effort": "none"}
+
+    unrelated = {}
+    llm_core._apply_ollama_openai_compat_reasoning_policy(
+        unrelated,
+        "https://api.openai.com/v1/chat/completions",
+        "qwen3:14b",
+    )
+    assert unrelated == {}
+
+    non_thinking = {}
+    llm_core._apply_ollama_openai_compat_reasoning_policy(
+        non_thinking,
+        "http://127.0.0.1:11434/v1/chat/completions",
+        "llama3.2:3b",
+    )
+    assert non_thinking == {}
+
+
+
+# ---------------------------------------------------------------------------
+# Sync / async / native-path regression coverage
+# ---------------------------------------------------------------------------
+
+class _NonStreamResp:
+    status_code = 200
+    is_success = True
+    text = ""
+
+    def json(self):
+        return {
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }]
+        }
+
+
+def test_sync_path_uses_openai_compat_reasoning_control(monkeypatch):
+    captured = {}
+
+    def fake_post(*args, **kwargs):
+        captured.update(kwargs.get("json") or {})
+        return _NonStreamResp()
+
+    monkeypatch.setattr(
+        llm_core,
+        "httpx_post_kimi_aware",
+        fake_post,
+    )
+    monkeypatch.setattr(
+        llm_core,
+        "note_model_activity",
+        lambda *a, **k: None,
+    )
+
+    result = llm_core.llm_call(
+        "http://127.0.0.1:11434/v1/chat/completions",
+        "qwen3:14b",
+        [{"role": "user", "content": "sync payload regression"}],
+        max_tokens=64,
+    )
+
+    assert result == "ok"
+    assert captured.get("reasoning_effort") == "none"
+    assert "think" not in captured
+
+
+def test_async_path_uses_openai_compat_reasoning_control(monkeypatch):
+    captured = {}
+
+    async def fake_post(*args, **kwargs):
+        captured.update(kwargs.get("json") or {})
+        return _NonStreamResp()
+
+    monkeypatch.setattr(
+        llm_core,
+        "_get_http_client",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        llm_core,
+        "httpx_post_kimi_aware_async",
+        fake_post,
+    )
+    monkeypatch.setattr(
+        llm_core,
+        "_is_host_dead",
+        lambda *a, **k: False,
+    )
+    monkeypatch.setattr(
+        llm_core,
+        "note_model_activity",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        llm_core,
+        "_clear_host_dead",
+        lambda *a, **k: None,
+    )
+
+    async def run():
+        return await llm_core.llm_call_async(
+            "http://127.0.0.1:11434/v1/chat/completions",
+            "qwen3:14b",
+            [{"role": "user", "content": "async payload regression"}],
+            max_tokens=64,
+        )
+
+    result = asyncio.run(run())
+
+    assert result == "ok"
+    assert captured.get("reasoning_effort") == "none"
+    assert "think" not in captured
+
+
+def test_native_ollama_tool_payload_keeps_native_think_control():
+    payload = llm_core._build_ollama_payload(
+        "qwen3:14b",
+        [{"role": "user", "content": "use a tool"}],
+        temperature=0,
+        max_tokens=64,
+        stream=False,
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        }],
+    )
+
+    assert payload.get("think") is False
+    assert "reasoning_effort" not in payload

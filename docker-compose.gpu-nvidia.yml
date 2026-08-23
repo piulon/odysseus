@@ -13,7 +13,8 @@ services:
   odysseus:
     build: .
     ports:
-      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000"
+      - "127.0.0.1:${APP_PORT:-7000}:7000"
+      - "${ODYSSEUS_TAILSCALE_IP:?ODYSSEUS_TAILSCALE_IP is required}:${APP_PORT:-7000}:7000"
     volumes:
       - ${APP_DATA_DIR:-./data}:/app/data:z
       - ${APP_LOGS_DIR:-./logs}:/app/logs:z
@@ -36,6 +37,9 @@ services:
       - LLM_HOSTS=${LLM_HOSTS:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - HOMELAB_OPERATOR_URL=http://homelab-operator:8765
+      - HOMELAB_OPERATOR_READ_TOKEN=${HOMELAB_OPERATOR_READ_TOKEN}
+      - HOMELAB_OPERATOR_ACTION_TOKEN=${HOMELAB_OPERATOR_ACTION_TOKEN:-}
       - RESEARCH_LLM_ENDPOINT=${RESEARCH_LLM_ENDPOINT:-}
       - HF_TOKEN=${HF_TOKEN:-}
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
@@ -53,7 +57,7 @@ services:
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
       - FASTEMBED_MODEL=${FASTEMBED_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
-      - FASTEMBED_CACHE_PATH=${FASTEMBED_CACHE_PATH:-}
+      - FASTEMBED_CACHE_PATH=/app/data/fastembed_cache
       - CLEANUP_INTERVAL_HOURS=${CLEANUP_INTERVAL_HOURS:-24}
       - ODYSSEUS_INPROCESS_POLLERS=${ODYSSEUS_INPROCESS_POLLERS:-1}
       - ODYSSEUS_INPROCESS_TASKS=${ODYSSEUS_INPROCESS_TASKS:-1}
@@ -88,10 +92,11 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     depends_on:
-      searxng:
-        condition: service_healthy
       chromadb:
         condition: service_started
+    networks:
+      - default
+      - ai_net
     restart: unless-stopped
     # NVIDIA overlay (from docker/gpu.nvidia.yml).
     deploy:
@@ -103,70 +108,18 @@ services:
               capabilities: [gpu]
 
   chromadb:
-    image: docker.io/chromadb/chroma:latest
-    ports:
-      - "${CHROMADB_BIND:-127.0.0.1}:8100:8000"
+    image: docker.io/chromadb/chroma@sha256:1e0b73a187a28757c572acba508c46f48c9e8b0acaf5c20e6d95cdedce1acdf6
     volumes:
-      - chromadb-data:/chroma/chroma
+      - chromadb-data:/data
     environment:
       - ANONYMIZED_TELEMETRY=FALSE
     restart: unless-stopped
 
-  searxng:
-    # Pinned, not :latest — odysseus waits on searxng's healthcheck
-    # (depends_on: condition: service_healthy), so a broken upstream `latest`
-    # tag blocks the whole app from starting. 2026.6.2 crashes on boot with
-    # `KeyError: 'default_doi_resolver'`, failing the healthcheck (issue #1414).
-    # Bump this deliberately after verifying a newer tag boots clean.
-    image: docker.io/searxng/searxng:2026.5.31-7159b8aed
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        set -eu
-        if [ ! -s /etc/searxng/settings.yml ] || grep -q 'odysseus-local-searxng-json-2026-05-30\|__SEARXNG_SECRET__' /etc/searxng/settings.yml; then
-          secret="$${SEARXNG_SECRET:-}"
-          if [ -z "$$secret" ]; then
-            secret="$$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
-          fi
-          sed "s|__SEARXNG_SECRET__|$$secret|g" /tmp/searxng-settings.yml.template > /etc/searxng/settings.yml
-        fi
-        exec /usr/local/searxng/entrypoint.sh
-    ports:
-      - "127.0.0.1:8080:8080"
-    volumes:
-      - searxng-data:/etc/searxng
-      - ./config/searxng/settings.yml:/tmp/searxng-settings.yml.template:ro,z
-    environment:
-      - SEARXNG_BASE_URL=http://localhost:8080/
-      - SEARXNG_SECRET=${SEARXNG_SECRET:-}
-    # The official searxng image runs as the non-root `searxng` user, but its
-    # entrypoint still needs to chown /etc/searxng on first boot, drop privs via
-    # su-exec, and (with our wrapper above) write settings.yml into the named
-    # volume. Without these capabilities the wrapper aborts at the redirection
-    # with EACCES and the container fails its healthcheck with permission
-    # errors during setup. Mirrors the cap set recommended by the upstream
-    # searxng-docker compose file. See issue #721.
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-      - DAC_OVERRIDE
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/', timeout=5).read(1)\""]
-      interval: 5s
-      timeout: 6s
-      retries: 20
-      start_period: 10s
-    restart: unless-stopped
-
   ntfy:
-    image: docker.io/binwiederhier/ntfy
+    image: docker.io/binwiederhier/ntfy@sha256:081b53dbb20674fcfe05fdb4eb8af9036a2645ef979543d16f7f80803af467b1
     command: serve
     ports:
-      - "${NTFY_BIND:-127.0.0.1}:8091:80"
+      - "${ODYSSEUS_TAILSCALE_IP:?ODYSSEUS_TAILSCALE_IP is required}:8091:80"
     volumes:
       - ntfy-cache:/var/cache/ntfy
     environment:
@@ -174,6 +127,9 @@ services:
     restart: unless-stopped
 
 volumes:
-  searxng-data:
   chromadb-data:
   ntfy-cache:
+
+networks:
+  ai_net:
+    external: true

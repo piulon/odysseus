@@ -29,6 +29,13 @@ fi
 ODY_USER="$(getent passwd "$PUID" | cut -d: -f1)"
 [ -z "$ODY_USER" ] && ODY_USER=odysseus
 
+# gosu changes UID/GID but intentionally preserves the caller environment.
+# Make the application user's HOME explicit so libraries never inherit
+# root's /root (or /) after the privilege drop.
+ODY_HOME="$(getent passwd "$PUID" | cut -d: -f6)"
+[ -z "$ODY_HOME" ] && ODY_HOME=/app
+export HOME="$ODY_HOME"
+
 # Docker-socket group plumbing for the explicit host-Docker overlay. When
 # opted in, the socket is owned by root:<host docker gid>. Add the app user
 # to that group and later call gosu by username so supplementary groups are
@@ -100,6 +107,11 @@ for dir in /app/data /app/logs /app/.ssh /app/.cache/huggingface /app/.local; do
     repair_bind_mount_ownership "$dir"
 done
 
+# HOME is /app for the standard container user. Ensure its cache root itself
+# is writable without recursively changing ownership of any mounted cache.
+mkdir -p "$HOME/.cache"
+chown "$PUID:$PGID" "$HOME/.cache" 2>/dev/null || true
+
 # Cookbook installs vllm/etc. via `pip install --user`, which pulls
 # nvidia-cuda-* wheels into /app/.local but does not set CUDA_HOME or
 # symlink /usr/local/cuda. vllm 0.22+ then crashes during engine init
@@ -136,9 +148,17 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 export PATH="/app/.local/bin:$PATH"
 
 # Run first-time setup as the app user so data/ files get the right ownership.
-# setup.py is idempotent — skips auth.json / .env if they already exist.
-# || true so a setup failure never prevents the container from starting.
-"$GOSU_BIN" "$ODY_USER" "$PYTHON_BIN" /app/setup.py || true
+# setup.py is idempotent — existing auth.json installations continue normally.
+# First-time unattended bootstrap is security-critical, so setup failure must
+# prevent the application from starting.
+if ! "$GOSU_BIN" "$ODY_USER" "$PYTHON_BIN" /app/setup.py; then
+    echo "Odysseus setup failed; refusing to start the application." >&2
+    exit 1
+fi
+
+# The bootstrap credential is no longer needed once auth.json exists. Do not
+# expose it to the long-running application or any subprocess it launches.
+unset ODYSSEUS_ADMIN_PASSWORD
 
 # Drop root and run the actual app. `gosu` is preferred over `su` /
 # `sudo` because it cleans up the process tree (no extra shell layer)

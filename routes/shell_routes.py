@@ -855,6 +855,85 @@ async def _generate_win_detached(cmd: str, request: Request):
             pass
 
 
+_REALESRGAN_WHEELHOUSE = "/opt/odysseus-wheelhouse"
+
+_REALESRGAN_PATCHED_WHEELS = (
+    "basicsr-1.4.2-py3-none-any.whl",
+    "facexlib-0.3.0-py3-none-any.whl",
+    "gfpgan-1.3.8-py3-none-any.whl",
+)
+
+_REALESRGAN_MAIN_WHEEL = (
+    "realesrgan-0.3.0-py3-none-any.whl"
+)
+
+
+def _pip_install_argv(
+    python_executable: str,
+    pip_name: str,
+    *,
+    wheelhouse: str = _REALESRGAN_WHEELHOUSE,
+) -> list[str]:
+    """Build the argv for an allowlisted Cookbook pip install.
+
+    Real-ESRGAN's Python-3.14 compatibility helpers and the Real-ESRGAN main
+    package are supplied from the immutable audited image wheelhouse.  If any
+    required local wheel is missing, fail closed instead of silently resolving
+    that package identity from an external package index.
+
+    Transitive dependencies which are not part of this audited wheel set are
+    still resolved by pip during the explicit administrative installation.
+    """
+    import os as _os
+
+    cmd = [
+        python_executable,
+        "-m",
+        "pip",
+        "install",
+    ]
+
+    if pip_name in {
+        "realesrgan",
+        "gfpgan",
+    }:
+        filenames = list(
+            _REALESRGAN_PATCHED_WHEELS
+        )
+
+        if pip_name == "realesrgan":
+            filenames.append(
+                _REALESRGAN_MAIN_WHEEL
+            )
+
+        wheels = [
+            _os.path.join(
+                wheelhouse,
+                filename,
+            )
+            for filename in filenames
+        ]
+
+        missing = [
+            wheel
+            for wheel in wheels
+            if not _os.path.isfile(wheel)
+        ]
+
+        if missing:
+            raise RuntimeError(
+                "Required audited local wheelhouse is incomplete"
+            )
+
+        cmd.extend(wheels)
+
+        return cmd
+
+    cmd.append(pip_name)
+
+    return cmd
+
+
 def setup_shell_routes() -> APIRouter:
     router = APIRouter(tags=["shell"])
 
@@ -1604,13 +1683,100 @@ def setup_shell_routes() -> APIRouter:
         }
         if pip_name not in known:
             return {"ok": False, "error": f"Unknown package: {pip_name}"}
-        cmd = [_sys.executable, "-m", "pip", "install", pip_name]
+        try:
+            cmd = _pip_install_argv(
+                _sys.executable,
+                pip_name,
+            )
+        except RuntimeError:
+            logger.error(
+                "Cookbook install blocked: audited local "
+                "wheelhouse incomplete for %s",
+                pip_name,
+            )
+            return {
+                "ok": False,
+                "error": (
+                    "Required audited local package "
+                    "wheelhouse is incomplete"
+                ),
+            }
+
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode == 0:
-            return {"ok": True, "output": stdout.decode()[-200:]}
+            result = {
+                "ok": True,
+                "output": stdout.decode()[-200:],
+            }
+
+            # Model downloads are explicit provisioning work attached to the
+            # admin-only Real-ESRGAN installation. Gallery requests themselves
+            # never download checkpoints.
+            if pip_name == "realesrgan":
+                try:
+                    from src.realesrgan_models import (
+                        provision_realesrgan_models,
+                    )
+
+                    model_status = await asyncio.to_thread(
+                        provision_realesrgan_models
+                    )
+
+                    result["models"] = model_status
+
+                except Exception:
+                    logger.warning(
+                        "Real-ESRGAN checkpoint provisioning failed",
+                        exc_info=True,
+                    )
+
+                    return {
+                        "ok": False,
+                        "error": (
+                            "realesrgan installed, but verified model "
+                            "provisioning failed"
+                        ),
+                    }
+
+            if pip_name == "gfpgan":
+                try:
+                    from src.realesrgan_models import (
+                        provision_facexlib_models,
+                        provision_gfpgan_model,
+                    )
+
+                    gfpgan_status = await asyncio.to_thread(
+                        provision_gfpgan_model
+                    )
+
+                    facexlib_status = await asyncio.to_thread(
+                        provision_facexlib_models
+                    )
+
+                    result["models"] = {
+                        **gfpgan_status,
+                        **facexlib_status,
+                    }
+
+                except Exception:
+                    logger.warning(
+                        "GFPGAN checkpoint provisioning failed",
+                        exc_info=True,
+                    )
+
+                    return {
+                        "ok": False,
+                        "error": (
+                            "gfpgan installed, but verified model "
+                            "provisioning failed"
+                        ),
+                    }
+
+            return result
+
         return {"ok": False, "error": stderr.decode()[-300:]}
 
     @router.post("/api/cookbook/install-system-deps")

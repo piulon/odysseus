@@ -52,3 +52,41 @@ timetree*.png
 .gitignore
 .env.save
 .env.prod
+
+# P0 security: exclude local and secret data
+.env.*
+*.backup-*
+*.bak
+*.bak-*
+data/
+logs/
+
+# Recursive generated/intermediate files.
+# Dockerignore matching is made explicit with ** so nested Python caches
+# and local backup files can never reach COPY . .
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.bak
+**/*.bak-*
+**/*.backup-*
+**/*.swp
+**/*.swo
+**/*~
+
+# Host/development material: these files may remain in the repository or
+# working tree, but they are never application runtime inputs.
+#
+# Docker Compose reads compose files on the host before the build context is
+# sent, so excluding them here does not prevent `docker compose build`.
+/docker-compose*.yml
+/compose.expandido.yml
+
+# Local experiments / abandoned runtime candidates.
+/api02.py
+/src/main.py
+
+# Local historical/patch material; never bake into the application image.
+/legacy/
+/local-patches/
+/requirements.broken.txt

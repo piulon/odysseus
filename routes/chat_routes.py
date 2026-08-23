@@ -26,6 +26,7 @@ from src.llm_core import (
     stream_llm_with_fallback,
 )
 from src.chat_model_router import ChatRoute, RouteTarget, resolve_chat_route
+from src.adaptive_chat_router import resolve_adaptive_chat_route
 from src.chat_route_authorizer import (
     ChatRouteAuthorizationError,
     authorize_chat_route,
@@ -62,6 +63,7 @@ from src.tool_policy import (
     WEB_TOOL_NAMES,
     build_effective_tool_policy,
     is_web_search_explicitly_denied,
+    known_tool_names,
     web_search_enabled_for_turn,
 )
 
@@ -212,9 +214,92 @@ def _manual_fallback_route(route: ChatRoute, sess) -> ChatRoute | None:
     return _manual_chat_route(sess, reason="manual_fallback")
 
 
+_ADAPTIVE_ROUTING_ENABLED_DEFAULT = False
+_ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT = 60.0
+
+
+def _adaptive_routing_runtime_config() -> tuple[bool, float]:
+    """Read the global Adaptive feature gate with fail-safe defaults."""
+    try:
+        from math import isfinite
+        from src.settings import get_setting
+
+        # Require an actual bool True. Malformed/string values cannot
+        # accidentally enable an experimental routing path.
+        enabled = (
+            get_setting(
+                "adaptive_routing_enabled",
+                _ADAPTIVE_ROUTING_ENABLED_DEFAULT,
+            )
+            is True
+        )
+
+        raw_ttl = get_setting(
+            "adaptive_routing_snapshot_ttl_seconds",
+            _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT,
+        )
+        try:
+            ttl = float(raw_ttl)
+        except (TypeError, ValueError):
+            ttl = _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT
+
+        if not isfinite(ttl) or ttl <= 0:
+            ttl = _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT
+
+        return enabled, ttl
+    except Exception:
+        # Settings failures must preserve the exact legacy routing path.
+        return (
+            _ADAPTIVE_ROUTING_ENABLED_DEFAULT,
+            _ADAPTIVE_ROUTING_SNAPSHOT_TTL_SECONDS_DEFAULT,
+        )
+
+
+def _resolve_effective_auto_route(sess, *, owner, agent_mode: bool) -> ChatRoute:
+    """Select legacy Auto routing unless global Adaptive is explicitly enabled."""
+    adaptive_enabled, snapshot_ttl_seconds = _adaptive_routing_runtime_config()
+
+    if not adaptive_enabled:
+        return resolve_chat_route(
+            sess,
+            owner=owner,
+            agent_mode=agent_mode,
+        )
+
+    return resolve_adaptive_chat_route(
+        sess,
+        owner=owner,
+        agent_mode=agent_mode,
+        enabled=True,
+        snapshot_ttl_seconds=snapshot_ttl_seconds,
+    )
+
+
+def _resolve_effective_auto_route_for_request(
+    sess,
+    *,
+    owner,
+    agent_mode: bool,
+    adaptive_eligible: bool = True,
+) -> ChatRoute:
+    """Resolve one request route, keeping specialized requests on Legacy.
+
+    The eligibility decision is made by the caller once and the returned route
+    is then reused for context construction and dispatch. Adaptive disabled
+    behavior remains the exact legacy resolver path.
+    """
+    if not adaptive_eligible:
+        return resolve_chat_route(sess, owner=owner, agent_mode=agent_mode)
+    return _resolve_effective_auto_route(sess, owner=owner, agent_mode=agent_mode)
+
+
 def _select_auto_stream_context_candidate(sess, *, owner, auth):
     """Select and hydrate the one candidate used to build streaming context."""
-    selected_primary = resolve_chat_route(sess, owner=owner, agent_mode=False)
+    selected_primary = _resolve_effective_auto_route_for_request(
+        sess,
+        owner=owner,
+        agent_mode=False,
+    )
     requested_model = selected_primary.target.model
     manual_fallback = _manual_fallback_route(selected_primary, sess)
     context_route = selected_primary
@@ -239,7 +324,11 @@ def _select_auto_stream_context_candidate(sess, *, owner, auth):
 
 def _select_auto_agent_context_candidate(sess, *, owner, auth):
     """Select and hydrate the one candidate used for one-shot agent context."""
-    selected_primary = resolve_chat_route(sess, owner=owner, agent_mode=True)
+    selected_primary = _resolve_effective_auto_route_for_request(
+        sess,
+        owner=owner,
+        agent_mode=True,
+    )
     requested_model = selected_primary.target.model
     manual_fallback = _manual_fallback_route(selected_primary, sess)
     context_route = selected_primary
@@ -357,6 +446,42 @@ def _last_user_plain_text(messages: List[Dict[str, Any]]) -> str:
         if msg.get("role") == "user":
             return _message_plain_text(msg.get("content"))
     return ""
+
+
+_EXCLUSIVE_TOOL_REQUEST_RE = re.compile(
+    r"\b(?:"
+    r"usa(?:r)?\s+(?:solo|solamente|únicamente|unicamente|exclusivamente)|"
+    r"utiliza(?:r)?\s+(?:solo|solamente|únicamente|unicamente|exclusivamente)|"
+    r"(?:solo|solamente|únicamente|unicamente|exclusivamente)\s+"
+    r"(?:usa(?:r)?|utiliza(?:r)?)|"
+    r"use\s+(?:only|exclusively)|"
+    r"only\s+use"
+    r")\b",
+    re.I,
+)
+
+
+def _detect_exclusive_tools(text: str) -> Optional[set[str]]:
+    """Return explicitly named registered tools for an exclusive request.
+
+    The request must contain an exclusivity phrase. Tool names are matched
+    literally with identifier boundaries, preventing names such as ``bash``
+    from matching inside unrelated words.
+    """
+    plain_text = str(text or "").strip()
+    if not plain_text or not _EXCLUSIVE_TOOL_REQUEST_RE.search(plain_text):
+        return None
+
+    matched = {
+        tool_name
+        for tool_name in known_tool_names()
+        if re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(tool_name)}(?![A-Za-z0-9_])",
+            plain_text,
+            re.I,
+        )
+    }
+    return matched or None
 
 
 def _ensure_current_request_is_latest_user(messages: List[Dict[str, Any]], current_message: str) -> List[Dict[str, Any]]:
@@ -763,7 +888,12 @@ def setup_chat_routes(
             return {"response": memory_response}
 
         selected_primary = (
-            resolve_chat_route(sess, owner=owner, agent_mode=False)
+            _resolve_effective_auto_route_for_request(
+                sess,
+                owner=owner,
+                agent_mode=False,
+                adaptive_eligible=not bool(use_research),
+            )
             if auto_normal
             else _manual_chat_route(sess)
         )
@@ -1967,6 +2097,12 @@ def setup_chat_routes(
                     _agent_model = context_candidate.model if auto_agent else sess.model
                     _agent_headers = dict(context_candidate.headers) if auto_agent else sess.headers
 
+                    # Explicit exclusive requests clamp the agent to the
+                    # registered tool names mentioned in the current message.
+                    _exclusive_tools = _detect_exclusive_tools(
+                        _message_plain_text(message)
+                    )
+
                     async for chunk in stream_agent_loop(
                         _agent_endpoint,
                         _agent_model,
@@ -1989,6 +2125,7 @@ def setup_chat_routes(
                         approved_plan=approved_plan or None,
                         workspace=workspace or None,
                         forced_tools=_forced_tools,
+                        exclusive_tools=_exclusive_tools,
                         uploaded_files=ctx.uploaded_files,
                         route_state=_agent_route_state,
                     ):

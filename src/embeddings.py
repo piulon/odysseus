@@ -43,12 +43,15 @@ class EmbeddingClient:
     """Drop-in replacement for SentenceTransformer.encode() using an HTTP API."""
 
     def __init__(self, url: Optional[str] = None, model: Optional[str] = None, api_key: Optional[str] = None):
-        self.url = url or os.getenv(
-            "EMBEDDING_URL",
-            f"http://{os.getenv('LLM_HOST', 'localhost')}:11434/v1/embeddings",
+        # Docker Compose may inject EMBEDDING_* as present-but-empty.
+        # Treat an empty value like an absent override.
+        self.url = (
+            url
+            or os.getenv("EMBEDDING_URL")
+            or f"http://{os.getenv('LLM_HOST') or 'localhost'}:11434/v1/embeddings"
         )
-        self.model = model or os.getenv("EMBEDDING_MODEL", _DEFAULT_MODEL)
-        self.api_key = api_key or os.getenv("EMBEDDING_API_KEY")
+        self.model = model or os.getenv("EMBEDDING_MODEL") or _DEFAULT_MODEL
+        self.api_key = api_key or os.getenv("EMBEDDING_API_KEY") or None
         self._dim: Optional[int] = None
         # Short connect timeout so a DOWN embedding endpoint (e.g. Ollama not
         # running on :11434) fast-fails to the local FastEmbed fallback instead
@@ -255,9 +258,16 @@ def get_embedding_client():
         if api_key:
             from src.secret_storage import decrypt
             os.environ["EMBEDDING_API_KEY"] = decrypt(api_key)
-    # Try the HTTP embedding API — unless we already found it down this process
-    # (avoids paying the connect timeout again on every RAG/memory/tool probe).
-    if not _http_embed_down:
+    # An HTTP embedding lane is opt-in: an absent or empty EMBEDDING_URL
+    # means there is no custom HTTP endpoint configured. Go straight to
+    # FastEmbed instead of probing the unrelated LLM_HOST and emitting a
+    # misleading startup warning.
+    configured_url = (os.getenv("EMBEDDING_URL") or "").strip()
+
+    # Try the HTTP embedding API — unless there is no configured endpoint or
+    # we already found it down this process (avoids paying the connect timeout
+    # again on every RAG/memory/tool probe).
+    if configured_url and not _http_embed_down:
         try:
             client = EmbeddingClient()
             client.get_sentence_embedding_dimension()  # health check

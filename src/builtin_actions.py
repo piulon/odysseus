@@ -1198,11 +1198,10 @@ async def action_learn_sender_signatures(owner: str, **kwargs) -> Tuple[str, boo
             return "All sender sigs already cached (or no eligible senders)", True
 
         from src.task_endpoint import resolve_task_candidates
+        from src.llm_core import llm_call_async_with_fallback_result
         candidates = resolve_task_candidates(owner=owner)
         if not candidates:
             return "No LLM endpoint available", False
-        model = candidates[0][1]
-
         analyzed = 0
         no_sig = 0
         for addr, msgs in eligible[:20]:  # cost cap per run
@@ -1256,12 +1255,14 @@ async def action_learn_sender_signatures(owner: str, **kwargs) -> Tuple[str, boo
 
             try:
                 await wait_for_interactive_quiet("sender signature action")
-                raw = await llm_call_async_with_fallback(
+                llm_result = await llm_call_async_with_fallback_result(
                     candidates,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0, max_tokens=600,
                     timeout=60,
                 )
+                raw = llm_result.response
+                model_used = llm_result.model
                 from src.text_helpers import strip_think as _st
                 sig = _st(raw or "", prose=False, prompt_echo=False).strip()
                 # Strip surrounding code fences if the LLM added them.
@@ -1292,7 +1293,7 @@ async def action_learn_sender_signatures(owner: str, **kwargs) -> Tuple[str, boo
                     "INSERT OR REPLACE INTO sender_signatures "
                     "(from_address, owner, signature_text, sample_count, last_built_at, model_used, source) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (addr, owner_value, cached_sig, len(bodies), _dt.utcnow().isoformat(), model, "llm"),
+                    (addr, owner_value, cached_sig, len(bodies), _dt.utcnow().isoformat(), model_used, "llm"),
                 )
                 conn.commit()
                 conn.close()
