@@ -532,3 +532,102 @@ def test_catalan_search_word_in_non_web_context_does_not_classify_as_web():
         "Explica què és la cerca binària",
     )
     assert "web" not in intent["domains"]
+
+
+def _ask_user_followup_messages(answer: str):
+    """Conversation where the immediately preceding assistant turn used ask_user."""
+    return [
+        {
+            "role": "user",
+            "content": (
+                "Busca els correus rebuts de odysseus-regression-fixture@gmail.com, "
+                "ordena'ls per data i crea un document Word."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": (
+                "Vols que busqui els correus electrònics rebuts de "
+                "odysseus-regression-fixture@gmail.com i els ordeni per data?"
+            ),
+            "metadata": {
+                "tool_events": [
+                    {
+                        "round": 1,
+                        "tool": "ask_user",
+                        "ask_user": {
+                            "question": (
+                                "Vols que busqui els correus electrònics rebuts de "
+                                "odysseus-regression-fixture@gmail.com i els ordeni per data?"
+                            ),
+                            "options": [
+                                {"label": "Sí"},
+                                {"label": "No"},
+                            ],
+                            "multi": False,
+                        },
+                    }
+                ]
+            },
+        },
+        {"role": "user", "content": answer},
+    ]
+
+
+def test_ask_user_yes_reply_is_structural_continuation():
+    messages = _ask_user_followup_messages("Sí")
+
+    intent = _classify_agent_request(messages, "Sí")
+
+    assert intent["continuation"] is True
+    assert intent["low_signal"] is False
+    assert "email" in intent["domains"]
+    assert "odysseus-regression-fixture@gmail.com" in intent["retrieval_query"]
+
+
+def test_ask_user_freeform_reply_is_structural_continuation():
+    answer = "Només els del 2025"
+    messages = _ask_user_followup_messages(answer)
+
+    intent = _classify_agent_request(messages, answer)
+
+    assert intent["continuation"] is True
+    assert intent["low_signal"] is False
+    assert "email" in intent["domains"]
+    assert "odysseus-regression-fixture@gmail.com" in intent["retrieval_query"]
+
+
+def test_old_ask_user_does_not_leak_into_later_turns():
+    messages = [
+        {
+            "role": "user",
+            "content": "Busca els correus de odysseus-regression-fixture@gmail.com.",
+        },
+        {
+            "role": "assistant",
+            "content": "Vols que ho faci?",
+            "metadata": {
+                "tool_events": [
+                    {
+                        "round": 1,
+                        "tool": "ask_user",
+                        "ask_user": {
+                            "question": "Vols que ho faci?",
+                            "options": [
+                                {"label": "Sí"},
+                                {"label": "No"},
+                            ],
+                            "multi": False,
+                        },
+                    }
+                ]
+            },
+        },
+        {"role": "user", "content": "Sí"},
+        {"role": "assistant", "content": "D'acord."},
+        {"role": "user", "content": "Hola"},
+    ]
+
+    intent = _classify_agent_request(messages, "Hola")
+
+    assert intent["continuation"] is False

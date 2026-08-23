@@ -1262,21 +1262,77 @@ def _assistant_requested_followup(messages: List[Dict]) -> bool:
     return False
 
 
+def _is_ask_user_followup(messages: List[Dict]) -> bool:
+    """True when the latest user turn directly answers a persisted ask_user.
+
+    ``ask_user`` ends the agent turn and stores its structured payload in the
+    preceding assistant message's ``metadata.tool_events``. The next user
+    message is therefore a continuation by construction, regardless of its
+    language or wording.
+
+    Ignore non-conversational context messages between the latest user turn and
+    the preceding assistant turn, but never cross an older user turn.
+    """
+    seen_latest_user = False
+
+    for msg in reversed(messages):
+        role = msg.get("role")
+
+        if not seen_latest_user:
+            if role == "user":
+                seen_latest_user = True
+            continue
+
+        if role == "user":
+            return False
+
+        if role != "assistant":
+            continue
+
+        metadata = msg.get("metadata") or {}
+        tool_events = metadata.get("tool_events") or []
+
+        return any(
+            isinstance(event, dict)
+            and event.get("tool") == "ask_user"
+            and isinstance(event.get("ask_user"), dict)
+            for event in tool_events
+        )
+
+    return False
+
+
 def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, object]:
     """Classify only whether this turn deserves domain tool retrieval.
 
     Normal chat should not inherit old Cookbook/email/document context. Recent
-    context is used only for explicit continuations ("yes", "do it", "1").
+    context is used for explicit continuations ("yes", "do it", "1") and for
+    replies to a structured ``ask_user`` interaction.
     This function does not inject tools directly; selected tools later decide
     which domain rule packs get appended to the system prompt.
     """
     text = str(last_user or "").strip()
+    ask_user_followup = _is_ask_user_followup(messages)
     retry_continuation = _is_contextual_retry_continuation(messages, text)
-    continuation = _is_explicit_continuation(text) or _assistant_requested_followup(messages) or retry_continuation
+    continuation = (
+        ask_user_followup
+        or _is_explicit_continuation(text)
+        or _assistant_requested_followup(messages)
+        or retry_continuation
+    )
     retrieval_query = _recent_context_for_retrieval(messages) if continuation else text
     q = retrieval_query.lower()
 
-    if not text or bool(_LOW_SIGNAL_RE.match(text)) or _is_casual_low_signal(text):
+    if (
+        not text
+        or (
+            not ask_user_followup
+            and (
+                bool(_LOW_SIGNAL_RE.match(text))
+                or _is_casual_low_signal(text)
+            )
+        )
+    ):
         return {
             "low_signal": True,
             "continuation": False,
