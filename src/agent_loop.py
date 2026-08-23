@@ -3203,6 +3203,7 @@ async def stream_agent_loop(
     _ody_qwen_finetune_model = (model or "").lower().startswith("odysseus-qwen3")
     _ody_memory_identity_turn = _looks_like_memory_identity_turn(_last_user)
     _intent = _classify_agent_request(messages, _last_user)
+    _ask_user_followup_turn = _is_ask_user_followup(messages)
     _low_signal_turn = bool(_intent.get("low_signal"))
     _casual_low_signal_turn = _is_casual_low_signal(_last_user)
     _existing_conversation = _user_turn_count(messages) > 1
@@ -4870,6 +4871,29 @@ async def stream_agent_loop(
         suppress_skills=_low_signal_turn,
         active_email=active_email,
     )
+    if _ask_user_followup_turn and not guide_only:
+        _ask_user_resume_directive = (
+            "The user's latest message is the answer to the immediately preceding "
+            "`ask_user` interaction. Interpret it as that answer and continue the "
+            "underlying task from the point where you paused. If the answer "
+            "authorizes the requested action or supplies the missing information, "
+            "proceed with the appropriate available tools now. If it rejects, "
+            "narrows, or changes the action, respect that answer. Do not merely "
+            "echo or acknowledge the user's answer, and do not ask the same "
+            "question again unless new ambiguity genuinely requires it."
+        )
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = (
+                _ask_user_resume_directive
+                + "\n\n"
+                + (messages[0].get("content") or "")
+            )
+        else:
+            messages.insert(
+                0,
+                {"role": "system", "content": _ask_user_resume_directive},
+            )
+        logger.info("[agent-intent] injected ask_user resume directive")
     if _ody_doc_finetune_mode and not plan_mode and not approved_plan and not guide_only:
         messages = _minimal_odysseus_doc_messages(
             messages,
