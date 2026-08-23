@@ -17,6 +17,7 @@ classification + domain seeding must still advertise the email/document tools.
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import src.agent_loop as agent_loop
 import src.tool_index as tool_index
@@ -76,6 +77,33 @@ def _messages(answer="Sí"):
     ]
 
 
+class _FakeEmailMcpManager:
+    """Minimal MCP surface needed to expose native email schemas in tests."""
+
+    def get_all_openai_schemas(self, _disabled_map):
+        def schema(name):
+            return {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "Search mailbox emails.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+
+        return [
+            schema("list_emails"),
+            schema("read_email"),
+            schema("search_emails"),
+            schema("mcp__email__list_emails"),
+            schema("mcp__email__read_email"),
+            schema("mcp__email__search_emails"),
+        ]
+
+    def get_tool_descriptions_for_prompt(self, _disabled_map):
+        return "**email:**\n- search_emails: Search mailbox emails."
+
+
 def test_ask_user_yes_survives_bad_tool_rag_and_sends_email_document_tools(monkeypatch):
     monkeypatch.setattr(
         agent_loop,
@@ -83,7 +111,7 @@ def test_ask_user_yes_survives_bad_tool_rag_and_sends_email_document_tools(monke
         lambda key, default=None: default,
         raising=False,
     )
-    monkeypatch.setattr(agent_loop, "get_mcp_manager", lambda: None, raising=False)
+    monkeypatch.setattr(agent_loop, "get_mcp_manager", _FakeEmailMcpManager, raising=False)
     monkeypatch.setattr(
         agent_loop,
         "estimate_tokens",
@@ -100,11 +128,16 @@ def test_ask_user_yes_survives_bad_tool_rag_and_sends_email_document_tools(monke
     retrieval_queries = []
 
     class BadToolIndex:
+        def index_mcp_tools(self, *_args, **_kwargs):
+            return None
+
         def get_tools_for_query(self, query, k=8):
             retrieval_queries.append(query)
             # Reproduce the important part of the production failure:
-            # semantic retrieval returns an unrelated but truthy tool set.
-            return {"ls"}
+            # semantic retrieval returns unrelated web tools for a mailbox
+            # request. Deterministic routing must rescue email tools and
+            # remove the competing web tools late in selection.
+            return {"ls", "web_search", "web_fetch"}
 
     monkeypatch.setattr(
         tool_index,
@@ -154,7 +187,10 @@ def test_ask_user_yes_survives_bad_tool_rag_and_sends_email_document_tools(monke
     # seeding must rescue the tools required by the original task.
     assert "list_emails" in names
     assert "read_email" in names
+    assert "search_emails" in names
     assert "create_document" in names
+    assert "web_search" not in names
+    assert "web_fetch" not in names
 
     # The model must also be told that this is the answer to the pending
     # ask_user interaction. Tool availability alone is insufficient: the
@@ -168,6 +204,53 @@ def test_ask_user_yes_survives_bad_tool_rag_and_sends_email_document_tools(monke
     assert "answer to the immediately preceding `ask_user` interaction" in system_text
     assert "continue the underlying task" in system_text
     assert "Do not merely echo or acknowledge" in system_text
+
+
+def test_active_email_draft_prunes_search_fetch_tools(monkeypatch):
+    monkeypatch.setattr(agent_loop, "get_setting", lambda key, default=None: default, raising=False)
+    monkeypatch.setattr(agent_loop, "get_mcp_manager", _FakeEmailMcpManager, raising=False)
+    monkeypatch.setattr(agent_loop, "estimate_tokens", lambda *args, **kwargs: 10, raising=False)
+    monkeypatch.setattr(agent_loop, "blocked_tools_for_owner", lambda owner: set(), raising=False)
+
+    sent_tools = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        sent_tools.append(kwargs.get("tools"))
+        yield "data: " + json.dumps({"delta": "ok"}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    active_email = SimpleNamespace(
+        id="email-draft",
+        language="email",
+        title="Reply draft",
+        current_content="To: sender@example.com\nSubject: Re: Hello\n---\nQuoted text",
+    )
+
+    _collect(
+        agent_loop.stream_agent_loop(
+            "https://api.openai.com/v1",
+            "qwen3:14b",
+            [{"role": "user", "content": "reply to this email"}],
+            max_rounds=1,
+            relevant_tools={
+                "list_email_accounts", "list_emails", "read_email", "search_emails",
+                "mcp__email__list_emails", "mcp__email__read_email", "mcp__email__search_emails",
+                "ui_control",
+            },
+            owner="admin",
+            active_document=active_email,
+        )
+    )
+
+    assert sent_tools
+    names = _schema_names(sent_tools[0])
+    assert "search_emails" not in names
+    assert "mcp__email__search_emails" not in names
+    assert "list_emails" not in names
+    assert "mcp__email__list_emails" not in names
+    assert "read_email" not in names
+    assert "mcp__email__read_email" not in names
 
 
 def _capture_model_messages(monkeypatch, messages):
