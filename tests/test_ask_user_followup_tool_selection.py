@@ -78,27 +78,10 @@ def _messages(answer="Sí"):
 
 
 class _FakeEmailMcpManager:
-    """Minimal MCP surface needed to expose native email schemas in tests."""
+    """Mirror production: built-in Python MCP schemas are not returned here."""
 
     def get_all_openai_schemas(self, _disabled_map):
-        def schema(name):
-            return {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": "Search mailbox emails.",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-
-        return [
-            schema("list_emails"),
-            schema("read_email"),
-            schema("search_emails"),
-            schema("mcp__email__list_emails"),
-            schema("mcp__email__read_email"),
-            schema("mcp__email__search_emails"),
-        ]
+        return []
 
     def get_tool_descriptions_for_prompt(self, _disabled_map):
         return "**email:**\n- search_emails: Search mailbox emails."
@@ -187,10 +170,25 @@ def test_ask_user_yes_survives_bad_tool_rag_and_sends_email_document_tools(monke
     # seeding must rescue the tools required by the original task.
     assert "list_emails" in names
     assert "read_email" in names
-    assert "search_emails" in names
+    assert sum(
+        tool.get("function", {}).get("name") == "search_emails"
+        for tool in sent_tools[0]
+    ) == 1
+    assert "mcp__email__search_emails" not in names
     assert "create_document" in names
     assert "web_search" not in names
     assert "web_fetch" not in names
+
+    search_schema = next(
+        tool for tool in sent_tools[0]
+        if tool.get("function", {}).get("name") == "search_emails"
+    )
+    assert search_schema["function"]["parameters"]["required"] == ["query"]
+    block = agent_loop.function_call_to_tool_block(
+        "search_emails",
+        json.dumps({"query": "odysseus-regression-fixture@gmail.com"}),
+    )
+    assert block.tool_type == "mcp__email__search_emails"
 
     # The model must also be told that this is the answer to the pending
     # ask_user interaction. Tool availability alone is insufficient: the
