@@ -230,3 +230,172 @@ def test_sender_email_plus_web_preserves_web_tools_after_required_search(monkeyp
     assert schemas[0] == {"search_emails"}
     assert {"web_search", "web_fetch"} <= schemas[1]
     assert "create_document" not in schemas[1]
+
+
+def test_required_sender_search_retries_long_prose_once_then_executes(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas = []
+    messages_by_round = []
+    executed = []
+    prose = (
+        "Action: search_emails with query sender@example.com. "
+        + ("I will describe the remaining processing steps. " * 12)
+        + "Next action: Call search_emails to retrieve the emails."
+    )
+    assert len(prose) > 400
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        messages_by_round.append(messages)
+        if len(schemas) == 1:
+            yield "data: " + json.dumps({"delta": prose}) + "\n\n"
+        elif len(schemas) == 2:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{
+                    "name": "search_emails",
+                    "arguments": json.dumps({"query": "sender@example.com"}),
+                }],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "No matches."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append((block.tool_type, json.loads(block.content)))
+        return block.tool_type, {"output": "[]", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{
+            "role": "user",
+            "content": (
+                "Crea'm un document Word amb tots els correus de "
+                "sender@example.com, ordenats per data."
+            ),
+        }],
+        max_rounds=3,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert schemas[:2] == [{"search_emails"}, {"search_emails"}]
+    assert executed == [
+        ("mcp__email__search_emails", {"query": "sender@example.com"}),
+    ]
+    assert len(schemas) == 3
+    corrective_text = "\n".join(
+        str(message.get("content") or "")
+        for message in messages_by_round[1]
+        if message.get("role") == "system"
+    )
+    assert "Call the available `search_emails` native tool now" in corrective_text
+    assert "Do not describe or announce the action in prose" in corrective_text
+    for forbidden in {
+        "list_email_accounts", "send_email", "create_document",
+        "web_search", "web_fetch",
+    }:
+        assert forbidden not in schemas[1]
+
+
+def test_required_sender_search_prose_retry_is_bounded(monkeypatch, caplog):
+    _patch_agent(monkeypatch)
+    schemas = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        yield "data: " + json.dumps({
+            "delta": "Action: search_emails. Next action: Call search_emails.",
+        }) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "[]", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{
+            "role": "user",
+            "content": "Create a Word document with emails from sender@example.com.",
+        }],
+        max_rounds=5,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert schemas == [{"search_emails"}, {"search_emails"}]
+    assert executed == []
+    assert "required first retrieval tool still not executed" in caplog.text
+
+
+def test_round_one_required_search_execution_does_not_correctively_retry(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        if len(schemas) == 1:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{
+                    "name": "search_emails",
+                    "arguments": json.dumps({"query": "sender@example.com"}),
+                }],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "No matches."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "[]", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{
+            "role": "user",
+            "content": "Create a Word document with emails from sender@example.com.",
+        }],
+        max_rounds=2,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert schemas[0] == {"search_emails"}
+    assert schemas[1] != {"search_emails"}
+    assert executed == ["mcp__email__search_emails"]
+
+
+def test_ordinary_prose_without_required_retrieval_still_completes(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        yield 'data: {"delta": "A normal prose answer."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+
+    chunks = _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{"role": "user", "content": "What is chronological order?"}],
+        max_rounds=4,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert len(schemas) == 1
+    assert any("A normal prose answer." in chunk for chunk in chunks)
