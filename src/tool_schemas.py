@@ -1083,7 +1083,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_email_accounts",
-            "description": "List configured email accounts. Use this before checking mail when the user names a mailbox/account such as Gmail, work, or a custom domain, then pass the returned account name/email/id to the other email tools.",
+            "description": "List configured email accounts. Use this before checking mail when the user explicitly names a mailbox/account such as Gmail, work, or a custom domain, then pass the returned account name/email/id to the other email tools. Do not use it merely because a request names a sender address (for example, emails/correos/correus from/de sender@example.com); that requires search_emails. After account discovery, continue the original task and do not infer send-email intent.",
             "parameters": {
                 "type": "object",
                 "properties": {},

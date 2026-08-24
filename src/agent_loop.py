@@ -479,7 +479,7 @@ Generate an image. Line 1 = description, line 2 = model name, line 3 = WxH (e.g.
 {"action": "add", "title": "<short todo>", "due_date": "<natural language or ISO datetime>"}
 ```
 Notes, checklists, AND user reminders. Use this for "create/add/write a note", todos, checklists, and "remind me to X at <time>" — never use memory for note content. For reminders, pair a short `title` (what to do) with a `due_date` (when). `due_date` accepts natural language ("tomorrow at 1pm", "in 2 hours", "next monday 9am") or ISO ("2026-05-12T13:00:00"). Actions: `list`, `add` (title, content OR items:[{text,done}], note_type, color, label, due_date), `update`, `delete`, `toggle_item`.""",
-    "list_email_accounts": "- ```list_email_accounts``` — List configured email accounts. Use this before reading/sending when the user says Gmail, work mail, custom domain mail, or any non-default mailbox; pass the returned account name/email/id as `account` to email tools.",
+    "list_email_accounts": "- ```list_email_accounts``` — List configured email accounts. Use this before reading/sending when the user explicitly names Gmail, work mail, a custom domain mailbox, or another non-default mailbox; pass the returned account name/email/id as `account` to email tools. An address in `emails/correos/correus from/de sender@example.com` is a sender filter, not a mailbox name: use search_emails directly. After account discovery, continue the original task; do not infer that the user wants to send email.",
     "send_email": """\
 ```send_email
 {"to": "recipient@example.com", "subject": "Re: Your question", "body": "Hi, ...", "account": "gmail"}
@@ -1298,6 +1298,21 @@ def _email_read_progress_from_result(
     return terminal, usable
 
 
+_EXPLICIT_EMAIL_SENDER_RE = re.compile(
+    r"\b(?:e-?mails?|correos?|correus)\s+(?:from|de)\s+"
+    r"(?P<address>[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+    r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+)",
+    re.IGNORECASE,
+)
+
+
+def _explicit_email_sender_address(text: str) -> Optional[str]:
+    """Return an address explicitly used as an email sender constraint."""
+    match = _EXPLICIT_EMAIL_SENDER_RE.search(str(text or ""))
+    return match.group("address") if match else None
+
+
 def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, object]:
     """Classify only whether this turn deserves domain tool retrieval.
 
@@ -1318,6 +1333,7 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     )
     retrieval_query = _recent_context_for_retrieval(messages) if continuation else text
     q = retrieval_query.lower()
+    explicit_email_sender = _explicit_email_sender_address(retrieval_query)
 
     if (
         not text
@@ -1334,9 +1350,16 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
             "continuation": False,
             "domains": set(),
             "retrieval_query": text,
+            "explicit_email_sender": None,
         }
 
     domains: Set[str] = set()
+
+    # An explicit multilingual "emails from <address>" construction is
+    # sufficient email intent even when the address is not a Gmail domain and
+    # the surrounding mailbox noun is outside the older English keyword set.
+    if explicit_email_sender:
+        domains.add("email")
 
     def has(*patterns: str) -> bool:
         return any(re.search(p, q) for p in patterns)
@@ -1356,7 +1379,7 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         r"ruby|php|swift|kotlin|bash|shell|html|css|sql)\b",
         r"\b(?:code|script|program|game|function|class|module|app)\b",
     )
-    if has(r"\b(documents?|docs?|draft|compose|poem|story|essay|outline|letter|edit|rewrite|proofread|suggest|feedback|review this|make a file)\b"):
+    if has(r"\b(documents?|documentos?|docs?|draft|compose|poem|story|essay|outline|letter|edit|rewrite|proofread|suggest|feedback|review this|make a file)\b"):
         domains.add("documents")
     if "notes_calendar_tasks" not in domains and has(r"\bwrite\b"):
         domains.add("documents")
@@ -1434,6 +1457,7 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         "continuation": continuation,
         "domains": domains,
         "retrieval_query": retrieval_query,
+        "explicit_email_sender": explicit_email_sender,
     }
 
 
@@ -3166,6 +3190,9 @@ async def stream_agent_loop(
     _ody_qwen_finetune_model = (model or "").lower().startswith("odysseus-qwen3")
     _ody_memory_identity_turn = _looks_like_memory_identity_turn(_last_user)
     _intent = _classify_agent_request(messages, _last_user)
+    _explicit_email_sender = str(
+        _intent.get("explicit_email_sender") or ""
+    ).strip()
     _ask_user_followup_turn = _is_ask_user_followup(messages)
     _answered_ask_user = _answered_ask_user_payload(messages) if _ask_user_followup_turn else None
     _answered_ask_user_answer = (
@@ -4843,6 +4870,7 @@ async def stream_agent_loop(
         _is_api_model = any(h in endpoint_url for h in _API_HOSTS) or _model_supports_tools
     _compact_agent_prompt = _is_api_model or _is_ollama_native or _ollama_openai_compat
     _email_document_retrieval_state = "not_applicable"
+    _required_first_retrieval_tool: Optional[str] = None
     _email_retrieval_expected: Set[tuple[str, str, str, str]] = set()
     _email_retrieval_terminal: Set[tuple[str, str, str, str]] = set()
     _email_retrieval_usable: Set[tuple[str, str, str, str]] = set()
@@ -4857,6 +4885,13 @@ async def stream_agent_loop(
     ):
         _email_document_retrieval_state = "retrieval_pending"
         logger.info("[agent] email document retrieval gate active state=retrieval_pending")
+        if _explicit_email_sender and "search_emails" in _relevant_tools:
+            _required_first_retrieval_tool = "search_emails"
+            logger.info(
+                "[agent-intent] explicit email sender requires first retrieval "
+                "tool=search_emails sender=%s",
+                _explicit_email_sender,
+            )
 
     messages, mcp_schemas = _build_system_prompt(
         messages, model, _prompt_active_document, mcp_mgr, disabled_tools,
@@ -4886,6 +4921,17 @@ async def stream_agent_loop(
             )
         else:
             messages.insert(0, {"role": "system", "content": _retrieval_gate_directive})
+        if _required_first_retrieval_tool:
+            _sender_search_directive = (
+                "EXPLICIT EMAIL SENDER: The address "
+                f"`{_explicit_email_sender}` identifies the sender of messages to "
+                "retrieve, not one of the user's configured mailbox accounts. "
+                "Your first action must be `search_emails` with that exact address "
+                "as `query`. Do not call `list_email_accounts` or `send_email` first."
+            )
+            messages[0]["content"] = (
+                _sender_search_directive + "\n\n" + (messages[0].get("content") or "")
+            )
     if _ask_user_followup_turn and not guide_only:
         _ask_user_resume_directive = (
             "The user's latest message is the answer to the immediately preceding "
@@ -5084,7 +5130,11 @@ async def stream_agent_loop(
     _exclude_ask_user_next_round = False
     _pending_tool_nudges = 0
     _MAX_PENDING_TOOL_NUDGES = 1
-    _next_round_tool_restriction: Optional[Set[str]] = None
+    _next_round_tool_restriction: Optional[Set[str]] = (
+        {_required_first_retrieval_tool}
+        if _required_first_retrieval_tool
+        else None
+    )
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -6225,6 +6275,27 @@ async def stream_agent_loop(
                 _substantive_progress = True
 
             if _email_document_retrieval_state == "retrieval_pending":
+                if block.tool_type in {
+                    "mcp__email__list_email_accounts", "list_email_accounts",
+                } and not result.get("error"):
+                    # Account discovery is context for the original retrieval
+                    # task, never a replacement for it. Keep the next model
+                    # round on retrieval tools so account output cannot drift
+                    # into unrelated send-email composition.
+                    _next_round_tool_restriction = (
+                        {"search_emails"}
+                        if _explicit_email_sender
+                        else {"search_emails", "list_emails"}
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "The email-account result only identifies which mailbox "
+                            "to use. Continue the user's original email retrieval and "
+                            "document task now. Do not reinterpret it as a request to "
+                            "list accounts or send an email."
+                        ),
+                    })
                 if block.tool_type in {
                     "mcp__email__search_emails", "mcp__email__list_emails",
                     "search_emails", "list_emails",
