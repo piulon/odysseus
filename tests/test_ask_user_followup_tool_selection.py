@@ -636,6 +636,150 @@ def _answered_question_messages(question, answer="Yes"):
     ]
 
 
+def test_answered_ask_user_answer_echo_is_language_neutral_and_exact():
+    assert agent_loop._is_answered_ask_user_answer_echo("YES", "yes!")
+    assert agent_loop._is_answered_ask_user_answer_echo("Proceed", "proceed.")
+    assert agent_loop._is_answered_ask_user_answer_echo("Sí", "Sí.")
+    assert not agent_loop._is_answered_ask_user_answer_echo(
+        "Sí", "D'acord. Continuaré ara."
+    )
+
+
+def test_answered_ask_user_latest_answer_is_structurally_adjacent():
+    messages = _answered_question_messages("Should I continue?", "Proceed")
+    assert agent_loop._answered_ask_user_latest_user_answer(messages) == "Proceed"
+
+    messages.insert(-1, {"role": "user", "content": "Intervening user turn"})
+    assert agent_loop._answered_ask_user_latest_user_answer(messages) is None
+
+
+def test_live_answer_echo_retries_then_executes_email_tool(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    question = "Vols continuar amb la cerca de correus i la creació del document Word?"
+    model_calls = []
+    executed = []
+    log_messages = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_calls.append(messages)
+        if len(model_calls) <= 2:
+            yield 'data: {"delta": "Sí."}\n\n'
+        elif len(model_calls) == 3:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{"name": "list_email_accounts", "arguments": "{}"}],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "Fet."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "accounts", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+    monkeypatch.setattr(
+        agent_loop.logger, "info",
+        lambda message, *args: log_messages.append(message % args if args else message),
+    )
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o",
+        _answered_question_messages(question, "Sí"),
+        max_rounds=4,
+        relevant_tools={"ask_user", "list_email_accounts", "search_emails", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    ))
+
+    assert len(model_calls) == 4
+    assert executed == ["mcp__email__list_email_accounts"]
+    assert any("structural resume guidance" in message for message in log_messages)
+    assert any("answered ask_user value echoed on round 2" in message for message in log_messages)
+    echo_instruction = "\n".join(
+        str(message.get("content") or "") for message in model_calls[2]
+        if message.get("role") == "system"
+    )
+    assert "only echoed the user's answer" in echo_instruction
+
+
+def test_answer_echo_rejection_is_safe_and_retry_is_bounded(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    question = "Should I perform the task?"
+
+    def run_responses(responses):
+        model_calls = []
+        executed = []
+
+        async def fake_stream(_candidates, messages, **kwargs):
+            model_calls.append(messages)
+            response = responses[min(len(model_calls) - 1, len(responses) - 1)]
+            yield "data: " + json.dumps({"delta": response}) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+        async def fake_execute(block, *args, **kwargs):
+            executed.append(block.tool_type)
+            return block.tool_type, {"output": "unexpected", "exit_code": 0}
+
+        monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+        monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+        _collect(agent_loop.stream_agent_loop(
+            "https://api.openai.com/v1", "gpt-4o",
+            _answered_question_messages(question, "No"),
+            max_rounds=20, relevant_tools={"ask_user", "list_email_accounts"},
+            owner="admin", _is_teacher_run=True,
+        ))
+        return model_calls, executed
+
+    normal_calls, normal_executed = run_responses([
+        "Entès. No continuaré.", "Entès. No continuaré."
+    ])
+    assert len(normal_calls) == 2
+    assert normal_executed == []
+
+    echo_calls, echo_executed = run_responses([
+        "No.", "No.", "Entès. No continuaré."
+    ])
+    assert len(echo_calls) == 3
+    assert echo_executed == []
+
+    bounded_calls, bounded_executed = run_responses(["No."])
+    assert len(bounded_calls) == 3
+    assert bounded_executed == []
+
+
+def test_answer_echo_guard_stops_after_substantive_progress(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    model_calls = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_calls.append(messages)
+        if len(model_calls) == 1:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{"name": "list_email_accounts", "arguments": "{}"}],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "Sí."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "ok", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o",
+        _answered_question_messages("Vols continuar?", "Sí"),
+        max_rounds=6, relevant_tools={"ask_user", "list_email_accounts"},
+        owner="admin", _is_teacher_run=True,
+    ))
+
+    assert executed == ["mcp__email__list_email_accounts"]
+    assert len(model_calls) == 2
+
+
 def test_live_textual_ask_user_reconfirmation_continues_to_email_tool(monkeypatch):
     _patch_basic_agent_dependencies(monkeypatch)
     question = (
