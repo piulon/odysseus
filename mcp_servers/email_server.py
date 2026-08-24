@@ -1852,7 +1852,9 @@ async def list_tools() -> list[Tool]:
             description=(
                 "List the email accounts configured in Odysseus. Returns each account's "
                 "name, email address, and whether it's the default. Use this first when "
-                "the user asks about a specific inbox by name (e.g. 'check work')."
+                "the user explicitly asks about a specific inbox by name (e.g. 'check "
+                "work'). Do not use it merely because the user names the sender of "
+                "messages to search."
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),

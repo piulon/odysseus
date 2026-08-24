@@ -1,0 +1,232 @@
+"""Sender-address retrieval must not be confused with mailbox discovery."""
+
+import asyncio
+import json
+
+import pytest
+
+import src.agent_loop as agent_loop
+
+
+def _collect(gen):
+    async def _run():
+        return [chunk async for chunk in gen]
+
+    return asyncio.run(_run())
+
+
+def _schema_names(tools):
+    return {
+        tool.get("function", {}).get("name") or tool.get("name")
+        for tool in (tools or [])
+        if isinstance(tool, dict)
+    }
+
+
+def _patch_agent(monkeypatch):
+    monkeypatch.setattr(
+        agent_loop, "get_setting", lambda key, default=None: default,
+        raising=False,
+    )
+    monkeypatch.setattr(agent_loop, "get_mcp_manager", lambda: None, raising=False)
+    monkeypatch.setattr(agent_loop, "estimate_tokens", lambda *a, **k: 10, raising=False)
+    monkeypatch.setattr(agent_loop, "blocked_tools_for_owner", lambda owner: set(), raising=False)
+
+
+_EMAIL_DOCUMENT_TOOLS = {
+    "ask_user",
+    "create_document",
+    "list_email_accounts",
+    "list_emails",
+    "read_email",
+    "search_emails",
+    "send_email",
+    "web_fetch",
+    "web_search",
+}
+
+
+@pytest.mark.parametrize("user_text", [
+    "Crea'm un document Word amb tots els correus de sender@example.com, ordenats per data.",
+    "Crea un documento Word con todos los correos de sender@example.com, ordenados por fecha.",
+    "Create a Word document with all emails from sender@example.com, ordered by date.",
+])
+def test_explicit_sender_requires_search_as_first_retrieval_action(monkeypatch, user_text):
+    _patch_agent(monkeypatch)
+    model_schemas = []
+    model_messages = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_schemas.append(_schema_names(kwargs.get("tools")))
+        model_messages.append(messages)
+        if len(model_schemas) == 1:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{
+                    "name": "search_emails",
+                    "arguments": json.dumps({"query": "sender@example.com"}),
+                }],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "No matches."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append((block.tool_type, json.loads(block.content)))
+        return block.tool_type, {"output": "[]", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{"role": "user", "content": user_text}],
+        max_rounds=2,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert agent_loop._explicit_email_sender_address(user_text) == "sender@example.com"
+    assert model_schemas[0] == {"search_emails"}
+    assert "list_email_accounts" not in model_schemas[0]
+    assert "send_email" not in model_schemas[0]
+    assert "create_document" not in model_schemas[0]
+    assert executed == [
+        ("mcp__email__search_emails", {"query": "sender@example.com"}),
+    ]
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in model_messages[0]
+        if message.get("role") == "system"
+    )
+    assert "`sender@example.com` identifies the sender" in system_text
+    assert "exact address as `query`" in system_text
+    assert "web_search" not in model_schemas[1]
+    assert "web_fetch" not in model_schemas[1]
+    assert "create_document" not in model_schemas[1]
+
+
+def test_explicit_account_discovery_still_exposes_list_email_accounts(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        yield "data: " + json.dumps({
+            "type": "tool_calls",
+            "calls": [{"name": "list_email_accounts", "arguments": "{}"}],
+        }) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "work (default)", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{"role": "user", "content": "Quins comptes de correu tinc configurats?"}],
+        max_rounds=1,
+        relevant_tools={"ask_user", "list_email_accounts", "send_email"},
+        owner="admin",
+    ))
+
+    assert agent_loop._explicit_email_sender_address(
+        "Quins comptes de correu tinc configurats?"
+    ) is None
+    assert "list_email_accounts" in schemas[0]
+    assert executed == ["mcp__email__list_email_accounts"]
+
+
+def test_account_discovery_result_keeps_document_task_on_retrieval(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas = []
+    messages_by_round = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        messages_by_round.append(messages)
+        if len(schemas) == 1:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{"name": "list_email_accounts", "arguments": "{}"}],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "Continuing retrieval."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "work (default)", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    user_text = "Create a Word document from all emails in my work mailbox."
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{"role": "user", "content": user_text}],
+        max_rounds=2,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert "list_email_accounts" in schemas[0]
+    assert schemas[1] == {"search_emails", "list_emails"}
+    assert "send_email" not in schemas[1]
+    assert "create_document" not in schemas[1]
+    assert executed == ["mcp__email__list_email_accounts"]
+    round_two_text = "\n".join(
+        str(message.get("content") or "") for message in messages_by_round[1]
+    )
+    assert user_text in round_two_text
+    assert "Continue the user's original email retrieval and document task" in round_two_text
+    assert "Do not reinterpret it as a request to list accounts or send an email" in round_two_text
+
+
+def test_sender_email_plus_web_preserves_web_tools_after_required_search(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        if len(schemas) == 1:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{
+                    "name": "search_emails",
+                    "arguments": json.dumps({"query": "sender@example.com"}),
+                }],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "No matches."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        return block.tool_type, {"output": "[]", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{
+            "role": "user",
+            "content": (
+                "Create a Word document with emails from sender@example.com "
+                "and search the web for current company news."
+            ),
+        }],
+        max_rounds=2,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert schemas[0] == {"search_emails"}
+    assert {"web_search", "web_fetch"} <= schemas[1]
+    assert "create_document" not in schemas[1]
