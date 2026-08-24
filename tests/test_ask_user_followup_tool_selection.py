@@ -793,11 +793,13 @@ def test_live_textual_ask_user_reconfirmation_continues_to_email_tool(monkeypatc
         "niniprimer@gmail.com i crei un document Word ordenat per data?",
     ]
     model_calls = []
+    model_tools = []
     executed = []
     log_messages = []
 
     async def fake_stream(_candidates, messages, **kwargs):
         model_calls.append(messages)
+        model_tools.append(kwargs.get("tools") or [])
         call_number = len(model_calls)
         if call_number <= 2:
             yield "data: " + json.dumps({"delta": responses[call_number - 1]}) + "\n\n"
@@ -830,6 +832,7 @@ def test_live_textual_ask_user_reconfirmation_continues_to_email_tool(monkeypatc
     ))
 
     assert len(model_calls) == 4
+    assert all(_schema_names(tools) == _schema_names(model_tools[0]) for tools in model_tools[1:])
     assert executed == ["mcp__email__list_email_accounts"]
     structural_instruction = "\n".join(
         str(message.get("content") or "") for message in model_calls[1]
