@@ -1365,6 +1365,35 @@ def _questions_are_near_duplicates(first: object, second: object) -> bool:
     return token_overlap >= 0.8 and SequenceMatcher(None, a, b).ratio() >= 0.86
 
 
+def _is_textual_answered_ask_user_reconfirmation(
+    answered_question: object,
+    response_text: object,
+) -> bool:
+    """Conservatively detect a short textual re-ask of an answered question."""
+    response = _strip_think_blocks(str(response_text or "")).strip()
+    if not response or len(response) > 320 or "```" in response:
+        return False
+
+    if _questions_are_near_duplicates(answered_question, response):
+        return True
+
+    # Acknowledgement text can make the whole strings look different while the
+    # response still embeds most of the old question. Require both strong token
+    # coverage and explicit interrogative punctuation for this broader match.
+    question = _normalize_question_for_comparison(answered_question)
+    normalized_response = _normalize_question_for_comparison(response)
+    question_tokens = set(question.split())
+    response_tokens = set(normalized_response.split())
+    if "?" not in response or len(question_tokens) < 6:
+        return False
+    shared = question_tokens & response_tokens
+    return (
+        len(shared) >= 6
+        and len(shared) / len(question_tokens) >= 0.72
+        and len(shared) / len(response_tokens) >= 0.55
+    )
+
+
 def _ask_user_question_from_block(block: ToolBlock) -> str:
     try:
         payload = json.loads(block.content or "{}")
@@ -5153,6 +5182,8 @@ async def stream_agent_loop(
     _intent_nudge_count = 0
     _MAX_INTENT_NUDGES = 2
     _ask_user_resume_retry_done = False
+    _textual_ask_user_reconfirmation_retries = 0
+    _MAX_TEXTUAL_ASK_USER_RECONFIRMATION_RETRIES = 2
     _substantive_progress = False
     _duplicate_ask_user_retries = 0
     _MAX_DUPLICATE_ASK_USER_RETRIES = 2
@@ -5863,6 +5894,50 @@ async def stream_agent_loop(
                 yield (
                     f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                 )
+                continue
+
+            # After the structural retry has had its first opportunity, do not
+            # accept another short textual rendering of the already answered
+            # ask_user question as successful completion. This is deliberately
+            # pre-progress only; after a real tool succeeds, the pending-action
+            # supervisor below owns any remaining work.
+            _textual_reconfirmation = (
+                _ask_user_followup_turn
+                and _ask_user_resume_retry_done
+                and not _substantive_progress
+                and not guide_only
+                and not _force_answer
+                and _answered_ask_user
+                and _is_textual_answered_ask_user_reconfirmation(
+                    _answered_ask_user.get("question", ""),
+                    cleaned_round,
+                )
+            )
+            if (
+                _textual_reconfirmation
+                and _textual_ask_user_reconfirmation_retries
+                < _MAX_TEXTUAL_ASK_USER_RECONFIRMATION_RETRIES
+            ):
+                _textual_ask_user_reconfirmation_retries += 1
+                logger.info(
+                    "[agent] textual ask_user reconfirmation detected on round %d; "
+                    "retrying (%d/%d)",
+                    round_num,
+                    _textual_ask_user_reconfirmation_retries,
+                    _MAX_TEXTUAL_ASK_USER_RECONFIRMATION_RETRIES,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Your previous response text repeated or re-asked the "
+                        "ask_user question that the user has already answered. "
+                        "Do not ask for the same authorization again. Continue "
+                        "the pending authorized task using the available tools, "
+                        "or ask only a materially different clarification if "
+                        "genuinely required."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                 continue
 
             # A long response can still be an unfinished plan. Unlike the
