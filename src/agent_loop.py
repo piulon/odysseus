@@ -1344,11 +1344,59 @@ def _is_ask_user_followup(messages: List[Dict]) -> bool:
     return _answered_ask_user_payload(messages) is not None
 
 
+def _answered_ask_user_latest_user_answer(messages: List[Dict]) -> Optional[object]:
+    """Return the latest user value only when it directly answers ask_user."""
+    seen_latest_user = False
+    latest_user_answer: Optional[object] = None
+
+    for msg in reversed(messages):
+        role = msg.get("role")
+
+        if not seen_latest_user:
+            if role == "user":
+                seen_latest_user = True
+                latest_user_answer = msg.get("content", "")
+            continue
+
+        if role == "user":
+            return None
+
+        if role != "assistant":
+            continue
+
+        metadata = msg.get("metadata") or {}
+        tool_events = metadata.get("tool_events") or []
+        if any(
+            isinstance(event, dict)
+            and event.get("tool") == "ask_user"
+            and isinstance(event.get("ask_user"), dict)
+            for event in tool_events
+        ):
+            return latest_user_answer
+        return None
+
+    return None
+
+
 def _normalize_question_for_comparison(value: object) -> str:
     """Normalize an ask_user question for deterministic duplicate detection."""
     text = unicodedata.normalize("NFKC", str(value or "")).casefold()
     text = "".join(" " if unicodedata.category(ch)[0] in {"P", "S"} else ch for ch in text)
     return " ".join(text.split())
+
+
+def _is_answered_ask_user_answer_echo(
+    latest_user_answer: object,
+    response_text: object,
+) -> bool:
+    """Detect only a tiny exact normalized echo of an ask_user answer."""
+    response = _strip_think_blocks(str(response_text or "")).strip()
+    if not response or len(response) > 80 or "```" in response:
+        return False
+
+    normalized_answer = _normalize_question_for_comparison(latest_user_answer)
+    normalized_response = _normalize_question_for_comparison(response)
+    return bool(normalized_answer and normalized_response == normalized_answer)
 
 
 def _questions_are_near_duplicates(first: object, second: object) -> bool:
@@ -3312,6 +3360,11 @@ async def stream_agent_loop(
     _intent = _classify_agent_request(messages, _last_user)
     _ask_user_followup_turn = _is_ask_user_followup(messages)
     _answered_ask_user = _answered_ask_user_payload(messages) if _ask_user_followup_turn else None
+    _answered_ask_user_answer = (
+        _answered_ask_user_latest_user_answer(messages)
+        if _ask_user_followup_turn
+        else None
+    )
     _low_signal_turn = bool(_intent.get("low_signal"))
     _casual_low_signal_turn = _is_casual_low_signal(_last_user)
     _existing_conversation = _user_turn_count(messages) > 1
@@ -5184,6 +5237,8 @@ async def stream_agent_loop(
     _ask_user_resume_retry_done = False
     _textual_ask_user_reconfirmation_retries = 0
     _MAX_TEXTUAL_ASK_USER_RECONFIRMATION_RETRIES = 2
+    _answered_ask_user_answer_echo_retries = 0
+    _MAX_ANSWERED_ASK_USER_ANSWER_ECHO_RETRIES = 1
     _substantive_progress = False
     _duplicate_ask_user_retries = 0
     _MAX_DUPLICATE_ASK_USER_RETRIES = 2
@@ -5935,6 +5990,48 @@ async def stream_agent_loop(
                         "the pending authorized task using the available tools, "
                         "or ask only a materially different clarification if "
                         "genuinely required."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+
+            # A distinct short-response stall is an exact normalized echo of
+            # the value the user already supplied to ask_user. Keep this
+            # language-neutral and independently bounded; rejection remains a
+            # valid outcome and the retry does not force any tool choice.
+            _answered_value_echo = (
+                _ask_user_followup_turn
+                and _answered_ask_user is not None
+                and _ask_user_resume_retry_done
+                and not _substantive_progress
+                and not guide_only
+                and not _force_answer
+                and _answered_ask_user_answer is not None
+                and _is_answered_ask_user_answer_echo(
+                    _answered_ask_user_answer,
+                    cleaned_round,
+                )
+            )
+            if (
+                _answered_value_echo
+                and _answered_ask_user_answer_echo_retries
+                < _MAX_ANSWERED_ASK_USER_ANSWER_ECHO_RETRIES
+            ):
+                _answered_ask_user_answer_echo_retries += 1
+                logger.info(
+                    "[agent] answered ask_user value echoed on round %d; retrying once",
+                    round_num,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Your previous response only echoed the user's answer to "
+                        "the already completed ask_user interaction. Do not repeat "
+                        "the user's answer. Resolve the answered interaction now: "
+                        "if the answer authorizes the pending task, continue it "
+                        "using the available tools; if it declines or cancels, "
+                        "acknowledge that and stop. Ask another question only if "
+                        "a materially different clarification is genuinely required."
                     ),
                 })
                 yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
