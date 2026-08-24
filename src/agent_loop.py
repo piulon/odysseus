@@ -5244,6 +5244,7 @@ async def stream_agent_loop(
     _MAX_DUPLICATE_ASK_USER_RETRIES = 2
     _pending_tool_nudges = 0
     _MAX_PENDING_TOOL_NUDGES = 1
+    _next_round_tool_restriction: Optional[Set[str]] = None
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -5277,6 +5278,11 @@ async def stream_agent_loop(
     _exhausted_rounds = False
 
     for round_num in range(1, max_rounds + 1):
+        # A pending-tool-action retry may narrow exactly one model request. Consume
+        # the marker before building this round's schemas so it cannot leak into
+        # any later round, including the synthesis round after a successful tool.
+        _round_tool_restriction = _next_round_tool_restriction
+        _next_round_tool_restriction = None
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling
@@ -5339,6 +5345,26 @@ async def stream_agent_loop(
             _last_content = _last_user.lower()
             _wants_mcp = any(kw in _last_content for kw in _MCP_KEYWORDS)
             all_tool_schemas = mcp_schemas if (_wants_mcp and mcp_schemas) else []
+
+        if _round_tool_restriction:
+            _restricted_schemas = [
+                schema for schema in (all_tool_schemas or [])
+                if schema.get("function", {}).get("name") in _round_tool_restriction
+            ]
+            if _restricted_schemas:
+                all_tool_schemas = _restricted_schemas
+                logger.info(
+                    "[agent] restricting round %d tools to pending action: %s",
+                    round_num,
+                    ", ".join(sorted(_round_tool_restriction)),
+                )
+            else:
+                logger.warning(
+                    "[agent] pending tool restriction unavailable on round %d: %s; "
+                    "using normal schemas",
+                    round_num,
+                    ", ".join(sorted(_round_tool_restriction)),
+                )
         agent_stream_timeout = int(get_setting("agent_stream_timeout_seconds", 300) or 300)
 
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
@@ -6046,6 +6072,7 @@ async def stream_agent_loop(
             )
             if _pending_tool and _pending_tool_nudges < _MAX_PENDING_TOOL_NUDGES:
                 _pending_tool_nudges += 1
+                _next_round_tool_restriction = {_pending_tool}
                 logger.info(
                     "[agent] pending-tool-action nudge #%d on round %d: %s",
                     _pending_tool_nudges,

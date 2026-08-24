@@ -172,12 +172,13 @@ def test_long_pending_available_tool_plan_gets_action_round(monkeypatch):
     assert executed == ["mcp__email__search_emails", "create_document"]
     # A normal synthesis round follows successful document creation.
     assert len(model_calls) == 4
-    assert all(
-        "create_document" in {
-            tool.get("function", {}).get("name") for tool in tools
-        }
+    tool_names_by_round = [
+        {tool.get("function", {}).get("name") for tool in tools}
         for _messages, tools in model_calls
-    )
+    ]
+    assert tool_names_by_round[2] == {"create_document"}
+    assert tool_names_by_round[3] == tool_names_by_round[1]
+    assert "create_document" in tool_names_by_round[3]
     pending_instruction = "\n".join(
         str(message.get("content") or "")
         for message in model_calls[2][0]
@@ -186,6 +187,48 @@ def test_long_pending_available_tool_plan_gets_action_round(monkeypatch):
     assert "explicitly identified `create_document` as a pending action" in pending_instruction
     assert "previous attempt ended without making a tool call" not in pending_instruction
     assert not any(event.get("type") == "rounds_exhausted" for event in events)
+
+
+def test_missing_pending_tool_restriction_falls_back_to_normal_schemas(monkeypatch, caplog):
+    _patch_common(monkeypatch)
+    model_tools = []
+
+    async def _fake_stream(_candidates, messages, **kwargs):
+        model_tools.append(kwargs.get("tools") or [])
+        if len(model_tools) == 1:
+            yield f'data: {json.dumps({"delta": "I will call create_document now."})}\n\n'
+        else:
+            yield 'data: {"delta": "Done."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    real_detector = al._pending_available_tool_action
+    detector_calls = 0
+
+    def _missing_detector(text, available_tools):
+        nonlocal detector_calls
+        detector_calls += 1
+        if detector_calls == 1:
+            return "missing_tool"
+        return real_detector(text, available_tools)
+
+    monkeypatch.setattr(al, "stream_llm_with_fallback", _fake_stream, raising=False)
+    monkeypatch.setattr(al, "_pending_available_tool_action", _missing_detector)
+
+    _collect(al.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o",
+        [{"role": "user", "content": "Create a document"}],
+        max_rounds=2, relevant_tools={"create_document"},
+        _is_teacher_run=True,
+    ))
+
+    assert len(model_tools) == 2
+    assert model_tools[1]
+    assert {
+        tool.get("function", {}).get("name") for tool in model_tools[1]
+    } == {
+        tool.get("function", {}).get("name") for tool in model_tools[0]
+    }
+    assert "pending tool restriction unavailable" in caplog.text
 
 
 def test_negative_long_tool_mention_does_not_nudge(monkeypatch):
