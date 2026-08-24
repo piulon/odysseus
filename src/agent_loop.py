@@ -5130,6 +5130,8 @@ async def stream_agent_loop(
     _exclude_ask_user_next_round = False
     _pending_tool_nudges = 0
     _MAX_PENDING_TOOL_NUDGES = 1
+    _required_first_retrieval_retry_done = False
+    _required_first_retrieval_satisfied = False
     _next_round_tool_restriction: Optional[Set[str]] = (
         {_required_first_retrieval_tool}
         if _required_first_retrieval_tool
@@ -5971,6 +5973,46 @@ async def stream_agent_loop(
                 yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                 continue
 
+            # The first retrieval action is deterministic request state, not
+            # prose intent. Give a model that describes instead of calling the
+            # required tool exactly one more round with that same sole schema.
+            if (
+                _required_first_retrieval_tool
+                and not _required_first_retrieval_satisfied
+                and _email_document_retrieval_state == "retrieval_pending"
+                and not guide_only
+                and not _force_answer
+            ):
+                if not _required_first_retrieval_retry_done:
+                    _required_first_retrieval_retry_done = True
+                    _next_round_tool_restriction = {
+                        _required_first_retrieval_tool
+                    }
+                    logger.info(
+                        "[agent] required first retrieval tool was not executed "
+                        "on round %d; retrying once with tool=%s",
+                        round_num,
+                        _required_first_retrieval_tool,
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "The required first retrieval action has not been "
+                            "executed. Call the available `"
+                            f"{_required_first_retrieval_tool}` native tool now. "
+                            "Do not describe or announce the action in prose."
+                        ),
+                    })
+                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                    continue
+                logger.warning(
+                    "[agent] required first retrieval tool still not executed "
+                    "after corrective round %d; stopping tool=%s",
+                    round_num,
+                    _required_first_retrieval_tool,
+                )
+                break
+
             # A long response can still be an unfinished plan. Unlike the
             # generic short-promise detector, this requires an exact callable
             # name from this round's schemas plus explicit pending-action prose.
@@ -6273,6 +6315,23 @@ async def stream_agent_loop(
 
             if block.tool_type != "ask_user" and not result.get("blocked"):
                 _substantive_progress = True
+
+            if (
+                _required_first_retrieval_tool
+                and not result.get("blocked")
+                and (
+                    block.tool_type == _required_first_retrieval_tool
+                    or block.tool_type.endswith(
+                        f"__{_required_first_retrieval_tool}"
+                    )
+                )
+            ):
+                _required_first_retrieval_satisfied = True
+                logger.info(
+                    "[agent] required first retrieval tool executed tool=%s round=%d",
+                    _required_first_retrieval_tool,
+                    round_num,
+                )
 
             if _email_document_retrieval_state == "retrieval_pending":
                 if block.tool_type in {
