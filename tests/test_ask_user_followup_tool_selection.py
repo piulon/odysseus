@@ -616,3 +616,203 @@ def test_materially_different_ask_user_clarification_remains_legal(monkeypatch):
 
     assert executed == ["ask_user"]
     assert any('"type": "ask_user"' in chunk for chunk in chunks)
+
+
+def _answered_question_messages(question, answer="Yes"):
+    return [
+        {"role": "user", "content": "Complete the underlying task."},
+        {
+            "role": "assistant",
+            "content": question,
+            "metadata": {"tool_events": [{
+                "tool": "ask_user",
+                "ask_user": {
+                    "question": question,
+                    "options": [{"label": "Yes"}, {"label": "No"}],
+                },
+            }]},
+        },
+        {"role": "user", "content": answer},
+    ]
+
+
+def test_live_textual_ask_user_reconfirmation_continues_to_email_tool(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    question = (
+        "Vols que continui buscant els correus de niniprimer@gmail.com i creant "
+        "un document Word ordenat per data?"
+    )
+    responses = [
+        "Sí, vols que continui buscant els correus de niniprimer@gmail.com i "
+        "creant un document Word ordenat per data?",
+        "Sí. Estic preparat per continuar. Vols que busqui els correus de "
+        "niniprimer@gmail.com i crei un document Word ordenat per data?",
+    ]
+    model_calls = []
+    executed = []
+    log_messages = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_calls.append(messages)
+        call_number = len(model_calls)
+        if call_number <= 2:
+            yield "data: " + json.dumps({"delta": responses[call_number - 1]}) + "\n\n"
+        elif call_number == 3:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{"name": "list_email_accounts", "arguments": "{}"}],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "Fet."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "accounts", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+    monkeypatch.setattr(
+        agent_loop.logger,
+        "info",
+        lambda message, *args: log_messages.append(message % args if args else message),
+    )
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o",
+        _answered_question_messages(question, "Sí"),
+        max_rounds=4,
+        relevant_tools={"ask_user", "list_email_accounts", "search_emails", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    ))
+
+    assert len(model_calls) == 4
+    assert executed == ["mcp__email__list_email_accounts"]
+    structural_instruction = "\n".join(
+        str(message.get("content") or "") for message in model_calls[1]
+        if message.get("role") == "system"
+    )
+    textual_instruction = "\n".join(
+        str(message.get("content") or "") for message in model_calls[2]
+        if message.get("role") == "system"
+    )
+    assert "previous attempt ended without making a tool call" in structural_instruction
+    assert "response text repeated or re-asked" in textual_instruction
+    assert any(
+        "textual ask_user reconfirmation detected on round 2" in message
+        for message in log_messages
+    )
+    assert not any(tool == "ask_user" for tool in executed)
+
+
+def test_generic_textual_reconfirmation_with_prefix_is_detected(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    question = "Should I search the archived project messages and prepare the requested report?"
+    model_calls = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_calls.append(messages)
+        if len(model_calls) == 1:
+            yield 'data: {"delta": "Understood."}\n\n'
+        elif len(model_calls) == 2:
+            yield "data: " + json.dumps({
+                "delta": "I am ready now. Should I search the archived project messages and prepare the requested report?"
+            }) + "\n\n"
+        elif len(model_calls) == 3:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{"name": "list_email_accounts", "arguments": "{}"}],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "Done."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "ok", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", _answered_question_messages(question),
+        max_rounds=4, relevant_tools={"ask_user", "list_email_accounts"},
+        owner="admin", _is_teacher_run=True,
+    ))
+
+    assert len(model_calls) == 4
+    assert executed == ["mcp__email__list_email_accounts"]
+
+
+def test_materially_different_textual_clarification_does_not_retry(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    model_calls = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_calls.append(messages)
+        text = "Understood." if len(model_calls) == 1 else "Which date range should the report include?"
+        yield "data: " + json.dumps({"delta": text}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o",
+        _answered_question_messages("Should I search the mailbox and create a report?"),
+        max_rounds=5, relevant_tools={"ask_user", "search_emails", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    ))
+
+    assert len(model_calls) == 2
+
+
+def test_textual_reconfirmation_retry_is_bounded(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    question = "Should I search the mailbox and create the requested document?"
+    model_calls = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_calls.append(messages)
+        yield "data: " + json.dumps({"delta": question}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", _answered_question_messages(question),
+        max_rounds=20, relevant_tools={"ask_user", "search_emails", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    ))
+
+    # One structural retry, two independently bounded textual retries, then stop.
+    assert len(model_calls) == 4
+
+
+def test_textual_reconfirmation_guard_stops_after_substantive_progress(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    question = "Should I search the mailbox and create the requested document?"
+    model_calls = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_calls.append(messages)
+        if len(model_calls) == 1:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{"name": "list_email_accounts", "arguments": "{}"}],
+            }) + "\n\n"
+        else:
+            yield "data: " + json.dumps({"delta": question}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "ok", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", _answered_question_messages(question),
+        max_rounds=6, relevant_tools={"ask_user", "list_email_accounts"},
+        owner="admin", _is_teacher_run=True,
+    ))
+
+    assert executed == ["mcp__email__list_email_accounts"]
+    assert len(model_calls) == 2
