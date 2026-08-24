@@ -580,6 +580,66 @@ def test_immediate_duplicate_ask_user_is_suppressed_then_action_runs(monkeypatch
     assert "already been answered" in duplicate_retry_text
 
 
+def test_repeated_duplicate_ask_user_gets_corrective_round_without_ask_user(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    sent_tool_names = []
+    executed = []
+
+    duplicate_call = {
+        "type": "tool_calls",
+        "calls": [{
+            "name": "ask_user",
+            "arguments": json.dumps({
+                "question": (
+                    "Vols que busqui els correus electrònics rebuts de "
+                    "odysseus-regression-fixture@gmail.com i els ordeni per data?"
+                ),
+                "options": [{"label": "Sí"}, {"label": "No"}],
+            }),
+        }],
+    }
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        sent_tool_names.append(_schema_names(kwargs.get("tools")))
+        if len(sent_tool_names) == 1:
+            yield "data: " + json.dumps(duplicate_call) + "\n\n"
+        elif len(sent_tool_names) == 2:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{"name": "search_emails", "arguments": "{}"}],
+            }) + "\n\n"
+        else:
+            yield "data: " + json.dumps({"delta": "Fet."}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "[]", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    chunks = _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", _messages("Sí"),
+        max_rounds=4,
+        relevant_tools={
+            "ask_user", "search_emails", "list_emails", "read_email",
+            "create_document",
+        },
+        owner="admin", _is_teacher_run=True,
+    ))
+
+    assert len(sent_tool_names) == 3
+    assert "ask_user" in sent_tool_names[0]
+    assert "ask_user" not in sent_tool_names[1]
+    assert {"search_emails", "list_emails", "read_email"} <= sent_tool_names[1]
+    assert "create_document" not in sent_tool_names[1]
+    assert "ask_user" in sent_tool_names[2]
+    assert executed == ["mcp__email__search_emails"]
+    assert any('"delta": "Fet."' in chunk for chunk in chunks)
+    assert not any("The model returned an empty response" in chunk for chunk in chunks)
+
+
 def test_materially_different_ask_user_clarification_remains_legal(monkeypatch):
     _patch_basic_agent_dependencies(monkeypatch)
     executed = []
