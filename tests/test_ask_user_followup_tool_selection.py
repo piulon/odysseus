@@ -23,6 +23,20 @@ import src.agent_loop as agent_loop
 import src.tool_index as tool_index
 
 
+def test_ask_user_function_call_conversion_preserves_json_payload():
+    for question in ("Should I continue?", "Vols que continuï?"):
+        block = agent_loop.function_call_to_tool_block(
+            "ask_user",
+            json.dumps({
+                "question": question,
+                "options": [{"label": "Yes"}, {"label": "No"}],
+            }, ensure_ascii=False),
+        )
+        assert block.tool_type == "ask_user"
+        payload = json.loads(block.content)
+        assert payload["question"] == question
+
+
 def _collect(gen):
     async def _run():
         return [chunk async for chunk in gen]
@@ -500,3 +514,105 @@ def test_ask_user_rejection_retry_does_not_force_action_tool(monkeypatch):
     # Exactly one structural reconsideration, then the rejection is accepted.
     assert len(model_calls) == 2
     assert executed == []
+
+
+def test_immediate_duplicate_ask_user_is_suppressed_then_action_runs(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    model_calls = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_calls.append(messages)
+        if len(model_calls) == 1:
+            yield "data: " + json.dumps({"delta": "Entesos, continuaré."}) + "\n\n"
+        elif len(model_calls) == 2:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{
+                    "name": "ask_user",
+                    "arguments": json.dumps({
+                        "question": (
+                            "Vols que busqui els correus electrònics rebuts de "
+                            "odysseus-regression-fixture@gmail.com, i els ordeni per data ara?"
+                        ),
+                        "options": [{"label": "Sí"}, {"label": "No"}],
+                    }),
+                }],
+            }) + "\n\n"
+        elif len(model_calls) == 3:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{"name": "list_emails", "arguments": "{}"}],
+            }) + "\n\n"
+        else:
+            yield "data: " + json.dumps({"delta": "Fet."}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "[]", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    chunks = _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", _messages("Sí"),
+        max_rounds=4,
+        relevant_tools={"ask_user", "list_emails", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    ))
+
+    assert len(model_calls) == 4
+    assert executed == ["mcp__email__list_emails"]
+    events = [
+        json.loads(chunk[6:]) for chunk in chunks
+        if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]")
+    ]
+    assert not any(event.get("type") == "ask_user" for event in events)
+    duplicate_retry_text = "\n".join(
+        str(message.get("content") or "")
+        for message in model_calls[2]
+        if message.get("role") == "system"
+    )
+    assert "already been answered" in duplicate_retry_text
+
+
+def test_materially_different_ask_user_clarification_remains_legal(monkeypatch):
+    _patch_basic_agent_dependencies(monkeypatch)
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        yield "data: " + json.dumps({
+            "type": "tool_calls",
+            "calls": [{
+                "name": "ask_user",
+                "arguments": json.dumps({
+                    "question": "Quin interval de dates vols incloure?",
+                    "options": [{"label": "2025"}, {"label": "Tot"}],
+                }),
+            }],
+        }) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {
+            "ask_user": {
+                "question": "Quin interval de dates vols incloure?",
+                "options": [{"label": "2025"}, {"label": "Tot"}],
+            },
+            "exit_code": 0,
+        }
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    chunks = _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", _messages("Sí"),
+        max_rounds=2,
+        relevant_tools={"ask_user", "list_emails", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    ))
+
+    assert executed == ["ask_user"]
+    assert any('"type": "ask_user"' in chunk for chunk in chunks)

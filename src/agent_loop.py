@@ -12,6 +12,8 @@ import json
 import re
 import time
 import logging
+import unicodedata
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable, List, Dict, Optional, Set
 from urllib.parse import urlparse
@@ -1295,8 +1297,8 @@ def _assistant_requested_followup(messages: List[Dict]) -> bool:
     return False
 
 
-def _is_ask_user_followup(messages: List[Dict]) -> bool:
-    """True when the latest user turn directly answers a persisted ask_user.
+def _answered_ask_user_payload(messages: List[Dict]) -> Optional[Dict]:
+    """Return the persisted ask_user payload answered by the latest user turn.
 
     ``ask_user`` ends the agent turn and stores its structured payload in the
     preceding assistant message's ``metadata.tool_events``. The next user
@@ -1325,14 +1327,88 @@ def _is_ask_user_followup(messages: List[Dict]) -> bool:
         metadata = msg.get("metadata") or {}
         tool_events = metadata.get("tool_events") or []
 
-        return any(
-            isinstance(event, dict)
-            and event.get("tool") == "ask_user"
-            and isinstance(event.get("ask_user"), dict)
-            for event in tool_events
-        )
+        for event in reversed(tool_events):
+            if (
+                isinstance(event, dict)
+                and event.get("tool") == "ask_user"
+                and isinstance(event.get("ask_user"), dict)
+            ):
+                return event["ask_user"]
+        return None
 
-    return False
+    return None
+
+
+def _is_ask_user_followup(messages: List[Dict]) -> bool:
+    """True when the latest user turn directly answers a persisted ask_user."""
+    return _answered_ask_user_payload(messages) is not None
+
+
+def _normalize_question_for_comparison(value: object) -> str:
+    """Normalize an ask_user question for deterministic duplicate detection."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    text = "".join(" " if unicodedata.category(ch)[0] in {"P", "S"} else ch for ch in text)
+    return " ".join(text.split())
+
+
+def _questions_are_near_duplicates(first: object, second: object) -> bool:
+    """Conservatively match the same question with small wording changes."""
+    a = _normalize_question_for_comparison(first)
+    b = _normalize_question_for_comparison(second)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    token_overlap = len(a_tokens & b_tokens) / max(len(a_tokens), len(b_tokens))
+    return token_overlap >= 0.8 and SequenceMatcher(None, a, b).ratio() >= 0.86
+
+
+def _ask_user_question_from_block(block: ToolBlock) -> str:
+    try:
+        payload = json.loads(block.content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    return str(payload.get("question") or "") if isinstance(payload, dict) else ""
+
+
+def _pending_available_tool_action(text: str, available_tools: Set[str]) -> Optional[str]:
+    """Find an explicitly named available tool described as a pending action."""
+    clean = _strip_think_blocks(text or "")
+    if not clean or not available_tools:
+        return None
+    pending_prefix = (
+        r"(?:the\s+)?next\s+step\s+is|the\s+tool\s+call\s+would\s+be|"
+        r"i\s+need\s+to|i\s+(?:should|will)\s+|let\s+me\s+"
+    )
+    for tool_name in sorted(available_tools, key=len, reverse=True):
+        if not tool_name:
+            continue
+        tool_pattern = re.escape(tool_name)
+        match = re.search(
+            rf"(?:{pending_prefix})\b[^\n]{{0,220}}\b{tool_pattern}\b",
+            clean,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        sentence_start = max(clean.rfind("\n", 0, match.start()), clean.rfind(".", 0, match.start())) + 1
+        sentence_end_candidates = [
+            pos for pos in (clean.find("\n", match.end()), clean.find(".", match.end()))
+            if pos >= 0
+        ]
+        sentence_end = min(sentence_end_candidates) if sentence_end_candidates else min(len(clean), match.end() + 180)
+        sentence = clean[sentence_start:sentence_end]
+        if re.search(
+            rf"\b(?:cannot|can't|can\s+not|unable\s+to|not\s+able\s+to|should\s+not|will\s+not|do\s+not|don't)\b[^\n]{{0,120}}\b{tool_pattern}\b|"
+            rf"\b{tool_pattern}\b[^\n]{{0,80}}\b(?:unavailable|disabled|not\s+available)\b",
+            sentence,
+            re.IGNORECASE,
+        ):
+            continue
+        return tool_name
+    return None
 
 
 def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, object]:
@@ -3206,6 +3282,7 @@ async def stream_agent_loop(
     _ody_memory_identity_turn = _looks_like_memory_identity_turn(_last_user)
     _intent = _classify_agent_request(messages, _last_user)
     _ask_user_followup_turn = _is_ask_user_followup(messages)
+    _answered_ask_user = _answered_ask_user_payload(messages) if _ask_user_followup_turn else None
     _low_signal_turn = bool(_intent.get("low_signal"))
     _casual_low_signal_turn = _is_casual_low_signal(_last_user)
     _existing_conversation = _user_turn_count(messages) > 1
@@ -5076,6 +5153,11 @@ async def stream_agent_loop(
     _intent_nudge_count = 0
     _MAX_INTENT_NUDGES = 2
     _ask_user_resume_retry_done = False
+    _substantive_progress = False
+    _duplicate_ask_user_retries = 0
+    _MAX_DUPLICATE_ASK_USER_RETRIES = 2
+    _pending_tool_nudges = 0
+    _MAX_PENDING_TOOL_NUDGES = 1
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -5174,6 +5256,7 @@ async def stream_agent_loop(
         agent_stream_timeout = int(get_setting("agent_stream_timeout_seconds", 300) or 300)
 
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
+        _available_tool_names = {name for name in _tool_names_sent if name}
         logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent} relevant_tools={sorted(_relevant_tools) if _relevant_tools else 'ALL'}")
 
         # Legacy rebuilds its configured fallback chain per round. Auto uses a
@@ -5560,6 +5643,56 @@ async def stream_agent_loop(
                     yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                     continue
 
+        # A resumed ask_user answer is already authoritative. Suppress only an
+        # immediate duplicate question before any substantive action has run;
+        # materially different questions and all later clarifications remain legal.
+        _duplicate_ask_user_suppressed = False
+        if _answered_ask_user and not _substantive_progress and tool_blocks:
+            _answered_question = _answered_ask_user.get("question", "")
+            _kept_blocks = []
+            _kept_calls = []
+            for _idx, _block in enumerate(tool_blocks):
+                _is_duplicate = (
+                    _block.tool_type == "ask_user"
+                    and _questions_are_near_duplicates(
+                        _answered_question,
+                        _ask_user_question_from_block(_block),
+                    )
+                )
+                if _is_duplicate:
+                    _duplicate_ask_user_suppressed = True
+                    continue
+                _kept_blocks.append(_block)
+                if _idx < len(converted_calls):
+                    _kept_calls.append(converted_calls[_idx])
+            if _duplicate_ask_user_suppressed:
+                tool_blocks = _kept_blocks
+                converted_calls = _kept_calls
+                if used_native:
+                    native_tool_calls = _kept_calls
+                _duplicate_ask_user_retries += 1
+                logger.info(
+                    "[agent] suppressed immediate duplicate ask_user on resumed round %d (attempt %d/%d)",
+                    round_num,
+                    _duplicate_ask_user_retries,
+                    _MAX_DUPLICATE_ASK_USER_RETRIES,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The ask_user question you just attempted has already been answered. "
+                        "Do not show or ask it again. Continue the pending task with the "
+                        "available tools, or ask a materially different clarification only "
+                        "if new missing information genuinely requires it."
+                    ),
+                })
+                if not tool_blocks:
+                    if _duplicate_ask_user_retries >= _MAX_DUPLICATE_ASK_USER_RETRIES:
+                        logger.warning("[agent] duplicate ask_user retry guard exhausted on round %d", round_num)
+                        break
+                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                    continue
+
         # Force-answer round: we told the model to STOP calling tools and
         # answer. If it ignored that and emitted a (possibly DSML) tool
         # call anyway, discard it — don't execute, don't re-loop. Keep
@@ -5700,6 +5833,7 @@ async def stream_agent_loop(
             # must remain a valid no-tool outcome on the retry.
             if (
                 _ask_user_followup_turn
+                and not _substantive_progress
                 and not guide_only
                 and not _force_answer
                 and not _ask_user_resume_retry_done
@@ -5729,6 +5863,34 @@ async def stream_agent_loop(
                 yield (
                     f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                 )
+                continue
+
+            # A long response can still be an unfinished plan. Unlike the
+            # generic short-promise detector, this requires an exact callable
+            # name from this round's schemas plus explicit pending-action prose.
+            _pending_tool = _pending_available_tool_action(
+                _strip_think_blocks(cleaned_round).strip(),
+                _available_tool_names,
+            )
+            if _pending_tool and _pending_tool_nudges < _MAX_PENDING_TOOL_NUDGES:
+                _pending_tool_nudges += 1
+                logger.info(
+                    "[agent] pending-tool-action nudge #%d on round %d: %s",
+                    _pending_tool_nudges,
+                    round_num,
+                    _pending_tool,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"Your previous response explicitly identified `{_pending_tool}` "
+                        "as a pending action but made no tool call. If that action is "
+                        "still required, call the available tool now. Otherwise give a "
+                        "concise final explanation of why the requested task cannot or "
+                        "should not be completed."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                 continue
 
             # ── Intent-without-action supervisor ─────────────────────
@@ -6016,6 +6178,9 @@ async def stream_agent_loop(
                             await _tool_task
                         except (asyncio.CancelledError, Exception):
                             pass
+
+            if block.tool_type != "ask_user" and not result.get("blocked"):
+                _substantive_progress = True
 
             # A skill the model just loaded can prescribe tools that weren't
             # RAG-selected this turn (declared via requires_toolsets in its
