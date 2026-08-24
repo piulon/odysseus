@@ -33,6 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 server = Server("email")
 EMAIL_SOCKET_TIMEOUT = float(os.environ.get("EMAIL_SOCKET_TIMEOUT", "20"))
+BATCH_READ_MAX_TARGETS = 20
+BATCH_READ_MAX_BODY_CHARS = 40_000
 from src.constants import DATA_DIR as _DATA_DIR, APP_DB, EMAIL_CACHE_DB, SETTINGS_FILE as _SETTINGS_FILE, MAIL_ATTACHMENTS_DIR
 DATA_DIR = Path(_DATA_DIR)
 
@@ -2131,9 +2133,13 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="read_email",
             description=(
-                "Read the full content of a specific email. "
-                "Provide either the UID (from list_emails) or a Message-ID. "
-                "Returns the subject, sender, date, and full body text."
+                "Read email body content. For one message, provide either the UID "
+                "(from list_emails/search_emails) or a Message-ID. When several known "
+                "messages must be read for one downstream task such as a summary or "
+                "document, pass them together in `targets` instead of issuing one "
+                "read_email call per message. Batch targets preserve their own account, "
+                "folder, and UID/Message-ID; at most 20 targets and 40000 aggregate body "
+                "characters are returned."
             ),
             inputSchema={
                 "type": "object",
@@ -2150,6 +2156,29 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "IMAP folder (default: INBOX)",
                         "default": "INBOX",
+                    },
+                    "targets": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": BATCH_READ_MAX_TARGETS,
+                        "description": (
+                            "Ordered messages to read in one bounded batch. Each target "
+                            "must include uid or message_id and may specify its own folder "
+                            "and account. Do not combine this with top-level uid/message_id."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "uid": {"type": "string", "description": "Email UID from search/list results"},
+                                "message_id": {"type": "string", "description": "RFC Message-ID header value"},
+                                "folder": {"type": "string", "description": "IMAP folder for this message (default: INBOX)", "default": "INBOX"},
+                                "account": {"type": "string", "description": "Account name/email/id for this message"},
+                            },
+                            "anyOf": [
+                                {"required": ["uid"]},
+                                {"required": ["message_id"]},
+                            ],
+                        },
                     },
                     **ACCOUNT_PROP,
                 },
@@ -2307,6 +2336,110 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "read_email":
+            targets = arguments.get("targets")
+            if targets is not None:
+                if not isinstance(targets, list):
+                    return [TextContent(type="text", text="Error: targets must be an array")]
+                if not targets:
+                    return [TextContent(type="text", text="Error: targets must contain at least one message")]
+                if arguments.get("uid") or arguments.get("message_id"):
+                    return [TextContent(
+                        type="text",
+                        text="Error: use either targets for a batch or top-level uid/message_id for one email, not both",
+                    )]
+
+                items = []
+                body_chars = 0
+                accepted = targets[:BATCH_READ_MAX_TARGETS]
+                for index, raw_target in enumerate(accepted):
+                    target = dict(raw_target) if isinstance(raw_target, dict) else {}
+                    identity = {
+                        "index": index,
+                        "uid": target.get("uid"),
+                        "message_id": target.get("message_id"),
+                        "folder": target.get("folder", "INBOX"),
+                        "account": target.get("account"),
+                    }
+                    if not identity["uid"] and not identity["message_id"]:
+                        items.append({**identity, "status": "error", "error": "uid or message_id is required"})
+                        continue
+                    if body_chars >= BATCH_READ_MAX_BODY_CHARS:
+                        items.append({
+                            **identity,
+                            "status": "omitted",
+                            "truncated": True,
+                            "reason": "aggregate_body_cap_reached",
+                        })
+                        continue
+
+                    try:
+                        target_account = target.get("account")
+                        if len(_list_accounts_raw()) >= 2 and not target_account:
+                            result = _read_email_across_accounts(
+                                uid=identity["uid"],
+                                message_id=identity["message_id"],
+                                folder=identity["folder"],
+                            )
+                        else:
+                            result = _read_email(
+                                uid=identity["uid"],
+                                message_id=identity["message_id"],
+                                folder=identity["folder"],
+                                account=target_account,
+                            )
+                    except Exception as exc:
+                        items.append({**identity, "status": "error", "error": str(exc)})
+                        continue
+                    if "error" in result:
+                        items.append({**identity, "status": "error", "error": result["error"]})
+                        continue
+
+                    body = str(result.get("body") or "")
+                    remaining = BATCH_READ_MAX_BODY_CHARS - body_chars
+                    returned_body = body[:remaining]
+                    was_truncated = len(returned_body) < len(body)
+                    body_chars += len(returned_body)
+                    items.append({
+                        **identity,
+                        "status": "success",
+                        "truncated": was_truncated,
+                        "subject": result.get("subject", ""),
+                        "from": result.get("from", ""),
+                        "from_address": result.get("from_address", ""),
+                        "date": result.get("date", ""),
+                        "resolved_uid": result.get("uid"),
+                        "resolved_message_id": result.get("message_id", ""),
+                        "resolved_account": result.get("account", "default"),
+                        "resolved_account_email": result.get("account_email", ""),
+                        "body": returned_body,
+                        "attachments": result.get("attachments", []),
+                    })
+
+                for index, raw_target in enumerate(targets[BATCH_READ_MAX_TARGETS:], start=BATCH_READ_MAX_TARGETS):
+                    target = dict(raw_target) if isinstance(raw_target, dict) else {}
+                    items.append({
+                        "index": index,
+                        "uid": target.get("uid"),
+                        "message_id": target.get("message_id"),
+                        "folder": target.get("folder", "INBOX"),
+                        "account": target.get("account"),
+                        "status": "omitted",
+                        "truncated": True,
+                        "reason": "target_limit_exceeded",
+                    })
+
+                payload = {
+                    "batch": True,
+                    "requested": len(targets),
+                    "processed": len(accepted),
+                    "max_targets": BATCH_READ_MAX_TARGETS,
+                    "body_chars": body_chars,
+                    "max_body_chars": BATCH_READ_MAX_BODY_CHARS,
+                    "truncated": any(item.get("truncated") for item in items),
+                    "items": items,
+                }
+                return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
             all_accounts = _list_accounts_raw()
             if len(all_accounts) >= 2 and not acct:
                 result = _read_email_across_accounts(
