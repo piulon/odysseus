@@ -1386,6 +1386,43 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         logger.warning(f"Non-object function call arguments for {name}: {args!r}; treating as empty")
         args = {}
 
+    # Defensive compatibility for a malformed shape emitted by some models.
+    # Keep `targets` as the only advertised/public batch contract; normalize
+    # the plural alias before MCP execution and readiness tracking see it.
+    if (
+        (name == "read_email" or tool_type == "mcp__email__read_email")
+        and "uids" in args
+    ):
+        if any(key in args for key in ("targets", "uid", "message_id")):
+            logger.warning(
+                "Rejecting ambiguous read_email arguments: uids cannot be combined "
+                "with targets, uid, or message_id"
+            )
+            return None
+        raw_uids = args.get("uids")
+        if not isinstance(raw_uids, list) or not raw_uids:
+            logger.warning("Rejecting read_email uids: expected a non-empty array")
+            return None
+        normalized_uids = []
+        for value in raw_uids:
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                logger.warning("Rejecting read_email uids: every UID must be a string or integer")
+                return None
+            uid = str(value).strip()
+            if not uid:
+                logger.warning("Rejecting read_email uids: UIDs cannot be empty")
+                return None
+            normalized_uids.append(uid)
+        targets = []
+        for uid in normalized_uids:
+            target = {"uid": uid}
+            if "folder" in args:
+                target["folder"] = args["folder"]
+            if "account" in args:
+                target["account"] = args["account"]
+            targets.append(target)
+        args = {"targets": targets}
+
     required_args = _REQUIRED_NATIVE_TOOL_ARGS.get(tool_type)
     if required_args and not any(str(args.get(key) or "").strip() for key in required_args):
         logger.warning(f"Rejecting empty required arguments for function call {name}: {args!r}")

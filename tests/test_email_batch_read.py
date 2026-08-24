@@ -10,6 +10,7 @@ import src.agent_tools  # Initialize schema re-exports in application order.
 import src.agent_loop as agent_loop
 import mcp_servers.email_server as es
 from src.tool_schemas import FUNCTION_TOOL_SCHEMAS
+from src.tool_schemas import function_call_to_tool_block
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +57,58 @@ async def test_read_email_schema_exposes_one_ordered_bounded_batch_contract():
     )["function"]["parameters"]["properties"]["targets"]
     assert native["minItems"] == 1
     assert native["maxItems"] == 20
+    assert "uids" not in next(
+        schema for schema in FUNCTION_TOOL_SCHEMAS
+        if schema["function"]["name"] == "read_email"
+    )["function"]["parameters"]["properties"]
+
+
+def test_model_plural_uids_normalize_to_existing_batch_contract():
+    block = function_call_to_tool_block(
+        "read_email",
+        json.dumps({
+            "uids": ["10", 11],
+            "folder": "Archive",
+            "account": "work",
+        }),
+    )
+
+    assert block is not None
+    assert block.tool_type == "mcp__email__read_email"
+    assert json.loads(block.content) == {
+        "targets": [
+            {"uid": "10", "folder": "Archive", "account": "work"},
+            {"uid": "11", "folder": "Archive", "account": "work"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("uids", [[], "10", None, [{}], [True], [1.5]])
+def test_model_plural_uids_reject_malformed_values(uids):
+    assert function_call_to_tool_block(
+        "read_email", json.dumps({"uids": uids}),
+    ) is None
+
+
+def test_model_plural_uids_leave_over_limit_handling_to_existing_batch_path():
+    block = function_call_to_tool_block(
+        "read_email", json.dumps({"uids": list(range(22))}),
+    )
+
+    assert block is not None
+    assert len(json.loads(block.content)["targets"]) == 22
+
+
+@pytest.mark.parametrize("conflict", [
+    {"uid": "11"},
+    {"message_id": "<message@example.test>"},
+    {"targets": [{"uid": "11"}]},
+])
+def test_model_plural_uids_reject_ambiguous_identifier_forms(conflict):
+    arguments = {"uids": ["10"], **conflict}
+    assert function_call_to_tool_block(
+        "read_email", json.dumps(arguments),
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -316,6 +369,7 @@ async def test_production_shaped_batch_reaches_document_in_four_rounds(monkeypat
     ]
     model_rounds = []
     executed = []
+    emitted_plural_uids = []
 
     async def fake_stream(_candidates, messages, **kwargs):
         model_rounds.append({
@@ -328,7 +382,13 @@ async def test_production_shaped_batch_reaches_document_in_four_rounds(monkeypat
             yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
         elif round_number == 2:
             assert "SYNTHETIC_SEARCH_RESULT" in json.dumps(messages)
-            call = {"name": "read_email", "arguments": json.dumps({"targets": targets})}
+            arguments = {
+                "uids": [target["uid"] for target in targets],
+                "folder": "Archive",
+                "account": "work",
+            }
+            emitted_plural_uids.append(arguments)
+            call = {"name": "read_email", "arguments": json.dumps(arguments)}
             yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
         elif round_number == 3:
             assert "synthetic body 0" in json.dumps(messages)
@@ -396,6 +456,11 @@ async def test_production_shaped_batch_reaches_document_in_four_rounds(monkeypat
         if tool_type == "mcp__email__read_email"
     )
     assert batch_payload == {"targets": targets}
+    assert emitted_plural_uids == [{
+        "uids": [target["uid"] for target in targets],
+        "folder": "Archive",
+        "account": "work",
+    }]
     assert len(batch_payload["targets"]) == len(targets) == 10
     assert tool_types == [
         "mcp__email__search_emails", "mcp__email__read_email", "create_document",
