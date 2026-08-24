@@ -1129,15 +1129,39 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_email",
-            "description": "Read the full content of a specific email by UID.",
+            "description": "Read email body content. Legacy single-message usage accepts uid. For a summary, document, or other task needing several known messages, pass all targets together in one bounded call instead of calling read_email once per message. A batch accepts at most 20 ordered targets and returns at most 40000 aggregate body characters.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "uid": {"type": "string", "description": "Email UID to read"},
+                    "message_id": {"type": "string", "description": "RFC Message-ID header value"},
                     "folder": {"type": "string", "description": "IMAP folder (default: INBOX)"},
                     "account": {"type": "string", "description": "Optional account name/email/id from list_email_accounts, especially when the UID came from a non-default mailbox"},
+                    "targets": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Ordered batch targets. Each target keeps its own UID/Message-ID, folder, and account.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "uid": {"type": "string"},
+                                "message_id": {"type": "string"},
+                                "folder": {"type": "string", "description": "Folder for this target (default: INBOX)"},
+                                "account": {"type": "string", "description": "Account name/email/id for this target"},
+                            },
+                            "anyOf": [
+                                {"required": ["uid"]},
+                                {"required": ["message_id"]},
+                            ],
+                        },
+                    },
                 },
-                "required": ["uid"]
+                "anyOf": [
+                    {"required": ["uid"]},
+                    {"required": ["message_id"]},
+                    {"required": ["targets"]},
+                ]
             }
         }
     },
