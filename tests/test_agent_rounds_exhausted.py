@@ -361,7 +361,7 @@ def test_duplicate_ask_user_retry_guard_is_bounded(monkeypatch):
 
     monkeypatch.setattr(al, "stream_llm_with_fallback", _fake_stream, raising=False)
     monkeypatch.setattr(al, "execute_tool_block", _fake_exec, raising=False)
-    _collect(al.stream_agent_loop(
+    chunks = _collect(al.stream_agent_loop(
         "https://api.openai.com/v1", "gpt-4o", _ask_user_resume_messages(),
         max_rounds=20,
         relevant_tools={"ask_user", "list_email_accounts"},
@@ -370,3 +370,5 @@ def test_duplicate_ask_user_retry_guard_is_bounded(monkeypatch):
 
     assert executed == []
     assert len(model_calls) == 3
+    assert any("repeated an already answered question" in chunk for chunk in chunks)
+    assert not any("The model returned an empty response" in chunk for chunk in chunks)

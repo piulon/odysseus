@@ -5081,6 +5081,7 @@ async def stream_agent_loop(
     _substantive_progress = False
     _duplicate_ask_user_retries = 0
     _MAX_DUPLICATE_ASK_USER_RETRIES = 2
+    _exclude_ask_user_next_round = False
     _pending_tool_nudges = 0
     _MAX_PENDING_TOOL_NUDGES = 1
     _next_round_tool_restriction: Optional[Set[str]] = None
@@ -5122,6 +5123,8 @@ async def stream_agent_loop(
         # any later round, including the synthesis round after a successful tool.
         _round_tool_restriction = _next_round_tool_restriction
         _next_round_tool_restriction = None
+        _exclude_ask_user_this_round = _exclude_ask_user_next_round
+        _exclude_ask_user_next_round = False
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling
@@ -5191,6 +5194,17 @@ async def stream_agent_loop(
                 if schema.get("function", {}).get("name") != "create_document"
                 and schema.get("name") != "create_document"
             ]
+
+        if _exclude_ask_user_this_round:
+            all_tool_schemas = [
+                schema for schema in (all_tool_schemas or [])
+                if schema.get("function", {}).get("name") != "ask_user"
+                and schema.get("name") != "ask_user"
+            ]
+            logger.info(
+                "[agent] excluding ask_user from corrective continuation round %d",
+                round_num,
+            )
 
         if _round_tool_restriction:
             _restricted_schemas = [
@@ -5616,6 +5630,7 @@ async def stream_agent_loop(
                 if used_native:
                     native_tool_calls = _kept_calls
                 _duplicate_ask_user_retries += 1
+                _exclude_ask_user_next_round = True
                 logger.info(
                     "[agent] suppressed immediate duplicate ask_user on resumed round %d (attempt %d/%d)",
                     round_num,
@@ -5632,8 +5647,18 @@ async def stream_agent_loop(
                     ),
                 })
                 if not tool_blocks:
-                    if _duplicate_ask_user_retries >= _MAX_DUPLICATE_ASK_USER_RETRIES:
-                        logger.warning("[agent] duplicate ask_user retry guard exhausted on round %d", round_num)
+                    if _exclude_ask_user_this_round:
+                        _duplicate_guard_error = (
+                            "The model repeated an already answered question after ask_user "
+                            "was disabled for the corrective continuation."
+                        )
+                        logger.warning(
+                            "[agent] duplicate ask_user emitted while unavailable on corrective "
+                            "round %d; stopping duplicate loop",
+                            round_num,
+                        )
+                        full_response += _duplicate_guard_error
+                        yield f'data: {json.dumps({"delta": _duplicate_guard_error})}\n\n'
                         break
                     yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                     continue
