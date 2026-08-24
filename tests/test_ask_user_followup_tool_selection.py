@@ -189,7 +189,10 @@ def test_ask_user_yes_survives_bad_tool_rag_and_sends_email_document_tools(monke
         for tool in sent_tools[0]
     ) == 1
     assert "mcp__email__search_emails" not in names
-    assert "create_document" in names
+    # This request needs mailbox bodies before document creation. Retrieval
+    # tools remain available after the answer, but create_document must stay
+    # hidden until those explicit search targets have terminal read results.
+    assert "create_document" not in names
     assert "web_search" not in names
     assert "web_fetch" not in names
 

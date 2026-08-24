@@ -14,7 +14,7 @@ import time
 import logging
 import unicodedata
 from difflib import SequenceMatcher
-from typing import AsyncGenerator, List, Dict, Optional, Set
+from typing import Any, AsyncGenerator, List, Dict, Optional, Set
 from urllib.parse import urlparse
 
 from src.llm_core import (
@@ -1176,6 +1176,126 @@ def _pending_available_tool_action(text: str, available_tools: Set[str]) -> Opti
             continue
         return tool_name
     return None
+
+
+def _email_retrieval_target_key(
+    *,
+    uid: Any = None,
+    message_id: Any = None,
+    folder: Any = None,
+    account: Any = None,
+) -> tuple[str, str, str, str]:
+    """Stable request-local identity for one searched/read email."""
+    return (
+        str(uid or "").strip(),
+        str(message_id or "").strip(),
+        str(folder or "INBOX").strip() or "INBOX",
+        str(account or "").strip(),
+    )
+
+
+def _email_search_targets_from_result(block_content: str, result: Dict) -> Set[tuple[str, str, str, str]]:
+    """Extract only the explicit UID/folder set returned by search_emails."""
+    try:
+        arguments = json.loads(block_content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    account = arguments.get("account")
+    raw = str(result.get("output") or result.get("content") or result.get("results") or "")
+    targets: Set[tuple[str, str, str, str]] = set()
+    for match in re.finditer(
+        r"(?ms)^\s*\d+\.\s+.*?(?=^\s*\d+\.\s+|\Z)",
+        raw,
+    ):
+        item = match.group(0)
+        uid_match = re.search(r"(?m)^\s*UID:\s*(\S+)\s*$", item)
+        if not uid_match:
+            continue
+        folder_match = re.search(r"(?m)^\s*Folder:\s*(.+?)\s*$", item)
+        targets.add(_email_retrieval_target_key(
+            uid=uid_match.group(1),
+            folder=(
+                folder_match.group(1)
+                if folder_match
+                else str(arguments.get("folder") or "INBOX")
+            ),
+            account=account,
+        ))
+    return targets
+
+
+def _email_read_progress_from_result(
+    block_content: str,
+    result: Dict,
+) -> tuple[Set[tuple[str, str, str, str]], Set[tuple[str, str, str, str]]]:
+    """Return terminal and usable searched-target identities from one read."""
+    try:
+        arguments = json.loads(block_content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return set(), set()
+
+    raw_targets = arguments.get("targets")
+    if isinstance(raw_targets, list):
+        requested = [target if isinstance(target, dict) else {} for target in raw_targets]
+    else:
+        requested = [arguments]
+    requested_keys = [
+        _email_retrieval_target_key(
+            uid=target.get("uid"),
+            message_id=target.get("message_id"),
+            folder=target.get("folder"),
+            account=target.get("account"),
+        )
+        for target in requested
+    ]
+
+    raw = str(result.get("output") or result.get("content") or result.get("results") or "")
+    terminal: Set[tuple[str, str, str, str]] = set()
+    usable: Set[tuple[str, str, str, str]] = set()
+    if isinstance(raw_targets, list):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return terminal, usable
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return terminal, usable
+        for fallback_index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            index = item.get("index", fallback_index)
+            if not isinstance(index, int) or index < 0 or index >= len(requested_keys):
+                continue
+            if item.get("status") not in {"success", "error", "omitted"}:
+                continue
+            # These omissions mean the message body was not returned. Keep the
+            # target pending so a later bounded batch can attempt it.
+            if (
+                item.get("status") == "omitted"
+                and item.get("reason") in {
+                    "target_limit_exceeded",
+                    "aggregate_body_cap_reached",
+                }
+            ):
+                continue
+            key = requested_keys[index]
+            terminal.add(key)
+            if item.get("status") == "success" and str(item.get("body") or "").strip():
+                usable.add(key)
+        return terminal, usable
+
+    if requested_keys and raw and not raw.lstrip().lower().startswith("error:") and not result.get("error"):
+        terminal.add(requested_keys[0])
+        # Legacy read_email emits headers plus the full body. Treat a non-error
+        # result as usable; batch mode remains the preferred bounded path.
+        usable.add(requested_keys[0])
+    elif requested_keys and (result.get("error") or raw.lstrip().lower().startswith("error:")):
+        terminal.add(requested_keys[0])
+    return terminal, usable
 
 
 def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, object]:
@@ -4722,6 +4842,22 @@ async def stream_agent_loop(
     else:
         _is_api_model = any(h in endpoint_url for h in _API_HOSTS) or _model_supports_tools
     _compact_agent_prompt = _is_api_model or _is_ollama_native or _ollama_openai_compat
+    _email_document_retrieval_state = "not_applicable"
+    _email_retrieval_expected: Set[tuple[str, str, str, str]] = set()
+    _email_retrieval_terminal: Set[tuple[str, str, str, str]] = set()
+    _email_retrieval_usable: Set[tuple[str, str, str, str]] = set()
+    if (
+        not guide_only
+        and not _active_document_relevant
+        and {"email", "documents"}.issubset(_intent_domains)
+        and _relevant_tools is not None
+        and "create_document" in _relevant_tools
+        and "read_email" in _relevant_tools
+        and bool({"search_emails", "list_emails"} & _relevant_tools)
+    ):
+        _email_document_retrieval_state = "retrieval_pending"
+        logger.info("[agent] email document retrieval gate active state=retrieval_pending")
+
     messages, mcp_schemas = _build_system_prompt(
         messages, model, _prompt_active_document, mcp_mgr, disabled_tools,
         needs_admin=_effective_needs_admin, relevant_tools=_relevant_tools,
@@ -4732,6 +4868,24 @@ async def stream_agent_loop(
         suppress_skills=_low_signal_turn,
         active_email=active_email,
     )
+    if _email_document_retrieval_state == "retrieval_pending":
+        _retrieval_gate_directive = (
+            "EMAIL DOCUMENT RETRIEVAL GATE: This document must be based on mailbox "
+            "content. `create_document` is intentionally unavailable until retrieval "
+            "is complete. First call `search_emails` or `list_emails`, then retrieve "
+            "every returned message with `read_email`. Batch known targets in ordered "
+            "`targets` arrays of at most 20, repeating bounded batches until every "
+            "returned target has a body or a terminal error/omission. Do not create a "
+            "placeholder document and do not announce `create_document` as the next "
+            "action while retrieval is incomplete. Once retrieval is ready, create the "
+            "document once with its substantive final content."
+        )
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = (
+                _retrieval_gate_directive + "\n\n" + (messages[0].get("content") or "")
+            )
+        else:
+            messages.insert(0, {"role": "system", "content": _retrieval_gate_directive})
     if _ask_user_followup_turn and not guide_only:
         _ask_user_resume_directive = (
             "The user's latest message is the answer to the immediately preceding "
@@ -5030,6 +5184,13 @@ async def stream_agent_loop(
             _last_content = _last_user.lower()
             _wants_mcp = any(kw in _last_content for kw in _MCP_KEYWORDS)
             all_tool_schemas = mcp_schemas if (_wants_mcp and mcp_schemas) else []
+
+        if _email_document_retrieval_state == "retrieval_pending":
+            all_tool_schemas = [
+                schema for schema in (all_tool_schemas or [])
+                if schema.get("function", {}).get("name") != "create_document"
+                and schema.get("name") != "create_document"
+            ]
 
         if _round_tool_restriction:
             _restricted_schemas = [
@@ -5403,6 +5564,29 @@ async def stream_agent_loop(
                     })
                     yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                     continue
+
+        # Schema filtering is the primary readiness gate. Keep this execution
+        # backstop for fenced/local tool syntax so a hidden create_document can
+        # never open a placeholder before mailbox retrieval is complete.
+        if _email_document_retrieval_state == "retrieval_pending" and tool_blocks:
+            _kept_blocks = []
+            _kept_converted_calls = []
+            _dropped_premature_create = False
+            for _idx, _block in enumerate(tool_blocks):
+                if _block.tool_type == "create_document":
+                    _dropped_premature_create = True
+                    continue
+                _kept_blocks.append(_block)
+                if _idx < len(converted_calls):
+                    _kept_converted_calls.append(converted_calls[_idx])
+            if _dropped_premature_create:
+                logger.warning(
+                    "[agent] blocked premature create_document while email retrieval is pending"
+                )
+                tool_blocks = _kept_blocks
+                converted_calls = _kept_converted_calls
+                if used_native:
+                    native_tool_calls = _kept_converted_calls
 
         # A resumed ask_user answer is already authoritative. Suppress only an
         # immediate duplicate question before any substantive action has run;
@@ -5930,6 +6114,7 @@ async def stream_agent_loop(
         tool_results = []
         tool_result_texts = []  # plain text for native tool role messages
         budget_hit = False
+        _email_retrieval_became_ready = False
         for i, block in enumerate(tool_blocks):
             # --- Tool budget check ---
             if max_tool_calls > 0 and total_tool_calls >= max_tool_calls:
@@ -6013,6 +6198,41 @@ async def stream_agent_loop(
 
             if block.tool_type != "ask_user" and not result.get("blocked"):
                 _substantive_progress = True
+
+            if _email_document_retrieval_state == "retrieval_pending":
+                if block.tool_type in {
+                    "mcp__email__search_emails", "mcp__email__list_emails",
+                    "search_emails", "list_emails",
+                } and not result.get("error"):
+                    _found_targets = _email_search_targets_from_result(block.content, result)
+                    if _found_targets:
+                        _email_retrieval_expected.update(_found_targets)
+                        logger.info(
+                            "[agent] email retrieval targets discovered=%d total=%d",
+                            len(_found_targets), len(_email_retrieval_expected),
+                        )
+                elif block.tool_type in {"mcp__email__read_email", "read_email"}:
+                    _terminal, _usable = _email_read_progress_from_result(block.content, result)
+                    _email_retrieval_terminal.update(_terminal & _email_retrieval_expected)
+                    _email_retrieval_usable.update(_usable & _email_retrieval_expected)
+                    logger.info(
+                        "[agent] email retrieval progress resolved=%d/%d usable=%d",
+                        len(_email_retrieval_terminal),
+                        len(_email_retrieval_expected),
+                        len(_email_retrieval_usable),
+                    )
+                    if (
+                        _email_retrieval_expected
+                        and _email_retrieval_expected.issubset(_email_retrieval_terminal)
+                        and _email_retrieval_usable
+                    ):
+                        _email_document_retrieval_state = "retrieval_ready"
+                        _email_retrieval_became_ready = True
+                        logger.info(
+                            "[agent] email document retrieval gate state=retrieval_ready targets=%d usable=%d",
+                            len(_email_retrieval_expected),
+                            len(_email_retrieval_usable),
+                        )
 
             # A skill the model just loaded can prescribe tools that weren't
             # RAG-selected this turn (declared via requires_toolsets in its
@@ -6471,6 +6691,17 @@ async def stream_agent_loop(
         _append_tool_results(messages, round_response, converted_calls,
                              tool_results, tool_result_texts, used_native, round_num,
                              round_reasoning=round_reasoning)
+
+        if _email_retrieval_became_ready:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Email retrieval is now complete for the explicit result set. "
+                    "`create_document` is available again. Create exactly one document "
+                    "with substantive final content derived from the retrieved email "
+                    "bodies and terminal read outcomes; do not create a placeholder."
+                ),
+            })
 
         if (
             _homelab_agent_tool_required
