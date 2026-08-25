@@ -1505,6 +1505,34 @@ def _email_retrieval_target_key(
     )
 
 
+_EMAIL_READ_BATCH_MAX_TARGETS = 20
+
+
+def _email_pending_read_batch(
+    expected: Set[tuple[str, str, str, str]],
+    terminal: Set[tuple[str, str, str, str]],
+) -> tuple[tuple[str, str, str, str], ...]:
+    """Return the next stable batch of searched targets still requiring a read."""
+    return tuple(sorted(expected - terminal)[:_EMAIL_READ_BATCH_MAX_TARGETS])
+
+
+def _email_read_batch_arguments(
+    batch: tuple[tuple[str, str, str, str], ...],
+) -> Dict[str, list[Dict[str, str]]]:
+    """Render canonical retrieval identities as the existing read_email payload."""
+    targets = []
+    for uid, message_id, folder, account in batch:
+        target = {"folder": folder}
+        if uid:
+            target["uid"] = uid
+        if message_id:
+            target["message_id"] = message_id
+        if account:
+            target["account"] = account
+        targets.append(target)
+    return {"targets": targets}
+
+
 def _email_search_targets_from_result(block_content: str, result: Dict) -> Set[tuple[str, str, str, str]]:
     """Extract only the explicit UID/folder set returned by search_emails."""
     try:
@@ -5483,6 +5511,8 @@ async def stream_agent_loop(
     _MAX_PENDING_TOOL_NUDGES = 1
     _required_first_retrieval_retry_done = False
     _required_first_retrieval_satisfied = False
+    _required_email_read_batch: tuple[tuple[str, str, str, str], ...] = ()
+    _required_email_read_retry_done = False
     _next_round_tool_restriction: Optional[Set[str]] = (
         {_required_first_retrieval_tool}
         if _required_first_retrieval_tool
@@ -6251,6 +6281,10 @@ async def stream_agent_loop(
                     and not _required_first_retrieval_satisfied
                     and _email_document_retrieval_state == "retrieval_pending"
                 )
+                and not (
+                    _email_document_retrieval_state == "retrieval_pending"
+                    and _required_email_read_batch
+                )
             ):
                 _ask_user_resume_retry_done = True
                 logger.info(
@@ -6402,6 +6436,48 @@ async def stream_agent_loop(
                     "after corrective round %d; stopping tool=%s",
                     round_num,
                     _required_first_retrieval_tool,
+                )
+                break
+
+            # Search/list results are already the canonical retrieval plan.
+            # While any of those targets remain unread, ordinary prose cannot
+            # complete the document workflow. Give each unchanged pending batch
+            # one structural corrective attempt with the same sole schema.
+            if (
+                _email_document_retrieval_state == "retrieval_pending"
+                and _required_email_read_batch
+                and not guide_only
+                and not _force_answer
+            ):
+                if not _required_email_read_retry_done:
+                    _required_email_read_retry_done = True
+                    _next_round_tool_restriction = {"read_email"}
+                    logger.info(
+                        "[agent] required pending email retrieval was not executed "
+                        "on round %d; retrying once batch_size=%d",
+                        round_num,
+                        len(_required_email_read_batch),
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "Required mailbox retrieval remains pending. Call the "
+                            "available `read_email` native tool now with exactly this "
+                            "bounded batch; do not describe the action in prose: `"
+                            + json.dumps(
+                                _email_read_batch_arguments(_required_email_read_batch),
+                                separators=(",", ":"),
+                            )
+                            + "`."
+                        ),
+                    })
+                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                    continue
+                logger.warning(
+                    "[agent] deterministic pending email retrieval failed after "
+                    "corrective round %d; stopping batch_size=%d",
+                    round_num,
+                    len(_required_email_read_batch),
                 )
                 break
 
@@ -7265,6 +7341,37 @@ async def stream_agent_loop(
                     "bodies and terminal read outcomes; do not create a placeholder."
                 ),
             })
+        elif (
+            _email_document_retrieval_state == "retrieval_pending"
+            and _email_retrieval_expected
+        ):
+            _next_required_email_read_batch = _email_pending_read_batch(
+                _email_retrieval_expected,
+                _email_retrieval_terminal,
+            )
+            if _next_required_email_read_batch:
+                if _next_required_email_read_batch != _required_email_read_batch:
+                    _required_email_read_retry_done = False
+                _required_email_read_batch = _next_required_email_read_batch
+                _next_round_tool_restriction = {"read_email"}
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Continue the required mailbox retrieval now. Call `read_email` "
+                        "with exactly this next bounded batch: `"
+                        + json.dumps(
+                            _email_read_batch_arguments(_required_email_read_batch),
+                            separators=(",", ":"),
+                        )
+                        + "`. Do not answer in prose while these targets remain unread."
+                    ),
+                })
+                logger.info(
+                    "[agent] requiring pending email retrieval batch_size=%d "
+                    "remaining=%d",
+                    len(_required_email_read_batch),
+                    len(_email_retrieval_expected - _email_retrieval_terminal),
+                )
 
         if (
             _homelab_agent_tool_required
