@@ -5513,6 +5513,7 @@ async def stream_agent_loop(
     _required_first_retrieval_satisfied = False
     _required_email_read_batch: tuple[tuple[str, str, str, str], ...] = ()
     _required_email_read_retry_done = False
+    _deterministic_email_read_no_progress = False
     _next_round_tool_restriction: Optional[Set[str]] = (
         {_required_first_retrieval_tool}
         if _required_first_retrieval_tool
@@ -5697,6 +5698,7 @@ async def stream_agent_loop(
             else None
         )
 
+<<<<<<< HEAD
         _round_stream_kwargs = {
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -5725,6 +5727,57 @@ async def stream_agent_loop(
             )
 
         async for chunk in _round_stream:
+=======
+        _model_stream = stream_llm_with_fallback(
+            _candidates,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            prompt_type=prompt_type if round_num == 1 else None,
+            tools=all_tool_schemas if all_tool_schemas else None,
+            tool_choice_none=_ody_doc_finetune_mode,
+            tool_choice_name=_forced_tool_name,
+            timeout=agent_stream_timeout,
+            session_id=session_id,
+            workload=workload,
+        )
+        _deterministic_read_batch = (
+            _required_email_read_batch
+            if (
+                _email_document_retrieval_state == "retrieval_pending"
+                and _required_email_read_batch
+                and _round_tool_restriction == {"read_email"}
+                and not guide_only
+                and not _force_answer
+            )
+            else ()
+        )
+        if _deterministic_read_batch:
+            _deterministic_email_read_no_progress = False
+            async def _deterministic_read_stream():
+                yield "data: " + json.dumps({
+                    "type": "tool_calls",
+                    "calls": [{
+                        "id": f"supervisor_read_{round_num}",
+                        "name": "read_email",
+                        "arguments": json.dumps(
+                            _email_read_batch_arguments(_deterministic_read_batch),
+                            separators=(",", ":"),
+                        ),
+                    }],
+                }) + "\n\n"
+                yield "data: [DONE]\n\n"
+
+            _model_stream = _deterministic_read_stream()
+            logger.info(
+                "[agent] supervisor directly executing pending email retrieval "
+                "round=%d batch_size=%d",
+                round_num,
+                len(_deterministic_read_batch),
+            )
+
+        async for chunk in _model_stream:
+>>>>>>> 6e3a45be (fix(agent): execute pending email reads directly)
             if not _round_first_event_logged:
                 _round_first_event_logged = True
                 logger.info(
@@ -6851,9 +6904,14 @@ async def stream_agent_loop(
                             len(_found_targets), len(_email_retrieval_expected),
                         )
                 elif block.tool_type in {"mcp__email__read_email", "read_email"}:
+                    _resolved_before_read = len(_email_retrieval_terminal)
                     _terminal, _usable = _email_read_progress_from_result(block.content, result)
                     _email_retrieval_terminal.update(_terminal & _email_retrieval_expected)
                     _email_retrieval_usable.update(_usable & _email_retrieval_expected)
+                    if _deterministic_read_batch:
+                        _deterministic_email_read_no_progress = (
+                            len(_email_retrieval_terminal) == _resolved_before_read
+                        )
                     logger.info(
                         "[agent] email retrieval progress resolved=%d/%d usable=%d",
                         len(_email_retrieval_terminal),
@@ -7330,6 +7388,14 @@ async def stream_agent_loop(
         _append_tool_results(messages, round_response, converted_calls,
                              tool_results, tool_result_texts, used_native, round_num,
                              round_reasoning=round_reasoning)
+
+        if _deterministic_email_read_no_progress:
+            logger.warning(
+                "[agent] deterministic pending email retrieval made no progress; "
+                "stopping batch_size=%d",
+                len(_deterministic_read_batch),
+            )
+            break
 
         if _email_retrieval_became_ready:
             messages.append({
