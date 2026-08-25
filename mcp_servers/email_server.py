@@ -690,6 +690,21 @@ def _fixture_search_emails(query, folders=None, max_results=20, account=None) ->
     return out[: int(max_results or 20)]
 
 
+class EmailSearchResults(list):
+    """List-compatible search results with per-folder diagnostics."""
+
+    def __init__(self, values=(), *, folder_diagnostics=None):
+        super().__init__(values)
+        self.folder_diagnostics = folder_diagnostics or []
+
+
+def _resolve_search_folder(conn, logical_folder: str) -> str:
+    """Resolve a logical search folder through provider-aware helpers."""
+    if (logical_folder or "").strip().lower() == "sent":
+        return _detect_sent_folder(conn)
+    return _resolve_folder(conn, logical_folder, _folder_role_from_name(logical_folder))
+
+
 def _fixture_read_email(uid=None, message_id=None, folder="INBOX", account=None) -> dict | None:
     if not _fixture_email_enabled():
         return None
@@ -844,18 +859,33 @@ def _search_emails(query, folders=None, max_results=20, account=None):
         folders = ["INBOX", "Sent", "Archive"]
     cache = _get_cached_summaries()
     out = []
+    folder_diagnostics = []
     conn = _imap_connect(account)
-    touched = []
     try:
-        for folder in folders:
+        for logical_folder in folders:
+            resolved_folder = logical_folder
+            diagnostic = {
+                "logical_folder": logical_folder,
+                "resolved_folder": resolved_folder,
+                "status": "error",
+                "match_count": None,
+                "error": None,
+            }
             try:
-                status, _ = conn.select(_q(folder), readonly=True)
+                resolved_folder = _resolve_search_folder(conn, logical_folder)
+                diagnostic["resolved_folder"] = resolved_folder
+                status, select_data = conn.select(_q(resolved_folder), readonly=True)
                 if status != "OK":
+                    diagnostic["error"] = f"SELECT failed: {select_data!r}"
                     continue
                 status, data = conn.uid("SEARCH", None, search_cmd)
-                if status != "OK" or not data or not data[0]:
+                if status != "OK":
+                    diagnostic["error"] = f"SEARCH failed: {data!r}"
                     continue
-                uid_list = list(reversed(data[0].split()))[:max_results]
+                raw_uids = data[0].split() if data and data[0] else []
+                diagnostic["status"] = "ok"
+                diagnostic["match_count"] = len(raw_uids)
+                uid_list = list(reversed(raw_uids))[:max_results]
                 for uid in uid_list:
                     try:
                         status, msg_data = conn.uid("FETCH", uid, "(RFC822.HEADER)")
@@ -881,18 +911,24 @@ def _search_emails(query, folders=None, max_results=20, account=None):
                             "to": to_str,
                             "cc": cc_str,
                             "date": date_str,
-                            "_folder": folder,
+                            "_folder": logical_folder,
+                            "_resolved_folder": resolved_folder,
                             "summary": cached.get("summary", ""),
                         })
                     except Exception:
                         continue
-            except Exception:
-                continue
+            except Exception as exc:
+                diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                folder_diagnostics.append(diagnostic)
     finally:
         try: conn.logout()
         except Exception: pass
     # Cap total across folders.
-    return out[: max_results * len(folders)]
+    return EmailSearchResults(
+        out[: max_results * len(folders)],
+        folder_diagnostics=folder_diagnostics,
+    )
 
 
 def _list_attachments_from_msg(msg):
@@ -2320,7 +2356,26 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 hits = _search_emails(q, folders=folders, max_results=max_results, account=acct)
             except Exception as e:
                 return [TextContent(type="text", text=f"Search failed: {e}")]
+            folder_errors = [
+                item for item in getattr(hits, "folder_diagnostics", [])
+                if item.get("status") == "error"
+            ]
+            successful_folders = [
+                item for item in getattr(hits, "folder_diagnostics", [])
+                if item.get("status") == "ok"
+            ]
+            error_text = "; ".join(
+                f"{item['logical_folder']} -> {item['resolved_folder']}: {item.get('error') or 'unknown failure'}"
+                for item in folder_errors
+            )
             if not hits:
+                if folder_errors and not successful_folders:
+                    return [TextContent(type="text", text=f"Search failed in all requested folders: {error_text}")]
+                if folder_errors:
+                    return [TextContent(
+                        type="text",
+                        text=f'No emails matched "{q}".\n\n[FOLDER SEARCH ERRORS: {error_text}]',
+                    )]
                 return [TextContent(type="text", text=f'No emails matched "{q}".')]
             lines = [f'Found {len(hits)} email(s) matching "{q}":\n']
             for i, em in enumerate(hits, 1):
@@ -2335,6 +2390,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     lines.append(f"   To: {em['to']}")
                 if em.get('summary'):
                     lines.append(f"   Summary: {em['summary']}")
+            if folder_errors:
+                lines.append(f"\n[FOLDER SEARCH ERRORS: {error_text}]")
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "read_email":
