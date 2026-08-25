@@ -600,7 +600,11 @@ async def test_pending_create_is_unavailable_until_email_retrieval_ready(monkeyp
 
     async def fake_execute(block, *args, **kwargs):
         if block.tool_type == "mcp__email__search_emails":
-            return block.tool_type, {"output": _synthetic_search_output(targets), "exit_code": 0}
+            return block.tool_type, {
+                "stdout": _synthetic_search_output(targets),
+                "stderr": "",
+                "exit_code": 0,
+            }
         raise AssertionError(f"unexpected tool while retrieval is pending: {block.tool_type}")
 
     _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
@@ -624,6 +628,10 @@ async def test_pending_create_is_unavailable_until_email_retrieval_ready(monkeyp
     assert all("read_email" in schemas for schemas in model_schemas)
     assert not any("pending-tool-action" in message for message in log_messages)
     assert not any("restricting round" in message for message in log_messages)
+    assert any(
+        "email retrieval targets discovered=1 total=1" in message
+        for message in log_messages
+    )
     assert any("The next step is to call create_document." in chunk for chunk in chunks)
 
 
