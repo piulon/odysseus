@@ -594,8 +594,11 @@ async def test_pending_create_is_unavailable_until_email_retrieval_ready(monkeyp
             yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
         elif round_number == 2:
             yield 'data: {"delta": "The next step is to call create_document."}\n\n'
+        elif round_number == 3:
+            assert "Required mailbox retrieval remains pending" in json.dumps(messages)
+            yield 'data: {"delta": "I will create the document next."}\n\n'
         else:
-            raise AssertionError("unavailable create_document prose must not trigger another round")
+            raise AssertionError("required read corrective retry must remain bounded")
         yield "data: [DONE]\n\n"
 
     async def fake_execute(block, *args, **kwargs):
@@ -623,16 +626,126 @@ async def test_pending_create_is_unavailable_until_email_retrieval_ready(monkeyp
         _is_teacher_run=True,
     )]
 
-    assert len(model_schemas) == 2
+    assert len(model_schemas) == 3
     assert all("create_document" not in schemas for schemas in model_schemas)
-    assert all("read_email" in schemas for schemas in model_schemas)
+    assert model_schemas[1:] == [{"read_email"}, {"read_email"}]
     assert not any("pending-tool-action" in message for message in log_messages)
-    assert not any("restricting round" in message for message in log_messages)
+    assert sum("required pending email retrieval was not executed" in message for message in log_messages) == 1
     assert any(
         "email retrieval targets discovered=1 total=1" in message
         for message in log_messages
     )
     assert any("The next step is to call create_document." in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_pending_read_prose_retry_executes_same_bounded_batch_once(monkeypatch):
+    targets = [
+        {"uid": str(index), "folder": "INBOX", "account": "work"}
+        for index in range(25)
+    ]
+    canonical = {
+        agent_loop._email_retrieval_target_key(**target) for target in targets
+    }
+    first_keys = agent_loop._email_pending_read_batch(canonical, set())
+    first_batch = agent_loop._email_read_batch_arguments(first_keys)["targets"]
+    second_keys = agent_loop._email_pending_read_batch(canonical, set(first_keys))
+    second_batch = agent_loop._email_read_batch_arguments(second_keys)["targets"]
+    model_rounds = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_rounds.append({
+            "messages": json.loads(json.dumps(messages)),
+            "schemas": _schema_names(kwargs.get("tools")),
+        })
+        round_number = len(model_rounds)
+        if round_number == 1:
+            call = {"name": "search_emails", "arguments": json.dumps({
+                "query": "synthetic", "account": "work", "max_results": 25,
+            })}
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        elif round_number == 2:
+            assert model_rounds[-1]["schemas"] == {"read_email"}
+            assert any(
+                json.dumps({"targets": first_batch}, separators=(",", ":"))
+                in str(message.get("content") or "")
+                for message in messages
+            )
+            yield 'data: {"delta": "I will read those messages now."}\n\n'
+        elif round_number == 3:
+            assert model_rounds[-1]["schemas"] == {"read_email"}
+            assert any(
+                json.dumps({"targets": first_batch}, separators=(",", ":"))
+                in str(message.get("content") or "")
+                for message in messages
+            )
+            call = {"name": "read_email", "arguments": json.dumps({"targets": first_batch})}
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        elif round_number == 4:
+            assert model_rounds[-1]["schemas"] == {"read_email"}
+            assert any(
+                json.dumps({"targets": second_batch}, separators=(",", ":"))
+                in str(message.get("content") or "")
+                for message in messages
+            )
+            call = {"name": "read_email", "arguments": json.dumps({"targets": second_batch})}
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        elif round_number == 5:
+            assert "create_document" in model_rounds[-1]["schemas"]
+            call = {"name": "create_document", "arguments": json.dumps({
+                "title": "Synthetic report",
+                "language": "markdown",
+                "content": "# Synthetic report",
+            })}
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        else:
+            yield 'data: {"delta": "Done."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        if block.tool_type == "create_document":
+            title, language, content = block.content.split("\n", 2)
+            payload = {"title": title, "language": language, "content": content}
+        else:
+            payload = json.loads(block.content)
+        executed.append((block.tool_type, payload))
+        if block.tool_type == "mcp__email__search_emails":
+            return block.tool_type, {
+                "stdout": _synthetic_search_output(targets), "stderr": "", "exit_code": 0,
+            }
+        if block.tool_type == "mcp__email__read_email":
+            return block.tool_type, {
+                "output": _synthetic_batch_output(payload["targets"]), "exit_code": 0,
+            }
+        return block.tool_type, {
+            "output": "SYNTHETIC_DOCUMENT_RESULT", "action": "create",
+            "doc_id": "synthetic-doc", "title": payload["title"],
+            "language": payload["language"], "content": payload["content"],
+            "version": 1, "exit_code": 0,
+        }
+
+    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
+    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1",
+        "gpt-4o",
+        [{"role": "user", "content": "Create a document from twenty-five emails."}],
+        max_rounds=20,
+        relevant_tools={"search_emails", "read_email", "create_document", "ask_user", "send_email"},
+        owner="admin",
+        _is_teacher_run=True,
+    )]
+
+    read_payloads = [
+        payload for tool_type, payload in executed
+        if tool_type == "mcp__email__read_email"
+    ]
+    assert read_payloads == [{"targets": first_batch}, {"targets": second_batch}]
+    assert model_rounds[1]["schemas"] == {"read_email"}
+    assert model_rounds[2]["schemas"] == {"read_email"}
+    assert model_rounds[3]["schemas"] == {"read_email"}
+    assert all("create_document" not in row["schemas"] for row in model_rounds[1:4])
+    assert any("Done." in chunk for chunk in chunks)
 
 
 @pytest.mark.asyncio
