@@ -5713,14 +5713,20 @@ async def stream_agent_loop(
             bool(all_tool_schemas),
             agent_stream_timeout,
         )
-        # Force an explicitly exclusive single tool only on the first round.
-        # Later rounds must remain automatic so the model can turn the tool
-        # result into a final response instead of repeatedly calling the tool.
+        # Force an explicitly exclusive single tool on the first round.
+        # Later rounds normally remain automatic so the model can turn tool
+        # results into a final response. Exception: an email-backed document
+        # request that has completed retrieval but still requires create_document.
         _forced_tool_name = (
             _tool_names_sent[0]
-            if round_num == 1
-            and exclusive_tools
-            and len(_tool_names_sent) == 1
+            if len(_tool_names_sent) == 1
+            and (
+                (round_num == 1 and exclusive_tools)
+                or (
+                    _email_document_creation_pending
+                    and _tool_names_sent[0] == "create_document"
+                )
+            )
             else None
         )
 

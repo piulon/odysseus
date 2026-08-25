@@ -449,6 +449,7 @@ async def test_production_shaped_batch_reaches_document_in_four_rounds(monkeypat
         model_rounds.append({
             "messages": json.loads(json.dumps(messages)),
             "schemas": _schema_names(kwargs.get("tools")),
+            "tool_choice_name": kwargs.get("tool_choice_name"),
         })
         round_number = len(model_rounds)
         if round_number == 1:
@@ -530,7 +531,9 @@ async def test_production_shaped_batch_reaches_document_in_four_rounds(monkeypat
     assert "create_document" not in model_rounds[0]["schemas"]
     assert "read_email" in model_rounds[0]["schemas"]
     assert model_rounds[1]["schemas"] == {"create_document"}
+    assert model_rounds[1]["tool_choice_name"] == "create_document"
     assert "create_document" in model_rounds[2]["schemas"]
+    assert model_rounds[2]["tool_choice_name"] is None
     assert model_rounds[2]["schemas"] != {"create_document"}
     assert any("Synthetic report created." in chunk for chunk in chunks)
 
