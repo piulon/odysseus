@@ -2214,6 +2214,7 @@ def setup_chat_routes(
                         uploaded_files=ctx.uploaded_files,
                         route_state=_agent_route_state,
                         routing_trace=routing_trace,
+                        conversation_history=sess.get_context_messages(),
                     ):
                         if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                             try:
