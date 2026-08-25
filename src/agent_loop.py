@@ -5724,7 +5724,6 @@ async def stream_agent_loop(
             else None
         )
 
-<<<<<<< HEAD
         _round_stream_kwargs = {
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -5737,36 +5736,6 @@ async def stream_agent_loop(
             "workload": workload,
         }
 
-        if route_state is not None:
-            _round_stream = _stream_auto_agent_round(
-                route_state,
-                messages,
-                **_round_stream_kwargs,
-            )
-        else:
-            _round_stream = stream_llm_with_fallback(
-                _candidates,
-                messages,
-                _routing_trace=routing_trace,
-                _routing_lane="agent",
-                **_round_stream_kwargs,
-            )
-
-        async for chunk in _round_stream:
-=======
-        _model_stream = stream_llm_with_fallback(
-            _candidates,
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            prompt_type=prompt_type if round_num == 1 else None,
-            tools=all_tool_schemas if all_tool_schemas else None,
-            tool_choice_none=_ody_doc_finetune_mode,
-            tool_choice_name=_forced_tool_name,
-            timeout=agent_stream_timeout,
-            session_id=session_id,
-            workload=workload,
-        )
         _deterministic_read_batch = (
             _required_email_read_batch
             if (
@@ -5794,7 +5763,7 @@ async def stream_agent_loop(
                 }) + "\n\n"
                 yield "data: [DONE]\n\n"
 
-            _model_stream = _deterministic_read_stream()
+            _round_stream = _deterministic_read_stream()
             logger.info(
                 "[agent] supervisor directly executing pending email retrieval "
                 "round=%d batch_size=%d",
@@ -5802,8 +5771,23 @@ async def stream_agent_loop(
                 len(_deterministic_read_batch),
             )
 
-        async for chunk in _model_stream:
->>>>>>> 6e3a45be (fix(agent): execute pending email reads directly)
+
+        elif route_state is not None:
+            _round_stream = _stream_auto_agent_round(
+                route_state,
+                messages,
+                **_round_stream_kwargs,
+            )
+        else:
+            _round_stream = stream_llm_with_fallback(
+                _candidates,
+                messages,
+                _routing_trace=routing_trace,
+                _routing_lane="agent",
+                **_round_stream_kwargs,
+            )
+
+        async for chunk in _round_stream:
             if not _round_first_event_logged:
                 _round_first_event_logged = True
                 logger.info(
