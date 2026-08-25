@@ -1297,7 +1297,13 @@ def _email_read_progress_from_result(
         for target in requested
     ]
 
-    raw = str(result.get("output") or result.get("content") or result.get("results") or "")
+    raw = str(
+        result.get("stdout")
+        or result.get("output")
+        or result.get("content")
+        or result.get("results")
+        or ""
+    )
     terminal: Set[tuple[str, str, str, str]] = set()
     usable: Set[tuple[str, str, str, str]] = set()
     if isinstance(raw_targets, list):

@@ -361,6 +361,81 @@ def test_unattempted_omissions_do_not_mark_messages_terminal():
     ) not in terminal
 
 
+def test_production_mcp_stdout_batch_advances_retrieval_accounting():
+    targets = [
+        {"uid": "11", "folder": "INBOX"},
+        {"uid": "12", "folder": "[Provider]/Sent", "account": "work"},
+        {"uid": "13", "folder": "Archive"},
+    ]
+    payload = _synthetic_batch_output(
+        targets,
+        failures={"12": "error"},
+    )
+
+    terminal, usable = agent_loop._email_read_progress_from_result(
+        json.dumps({"targets": targets}),
+        {"stdout": payload, "stderr": "", "exit_code": 0},
+    )
+
+    expected = {
+        agent_loop._email_retrieval_target_key(**target) for target in targets
+    }
+    assert terminal == expected
+    assert usable == {
+        agent_loop._email_retrieval_target_key(**targets[0]),
+        agent_loop._email_retrieval_target_key(**targets[2]),
+    }
+
+
+def test_read_progress_keeps_output_compatibility_and_accepts_empty_stdout():
+    targets = [{"uid": "21", "folder": "INBOX"}]
+    payload = _synthetic_batch_output(targets)
+
+    terminal, usable = agent_loop._email_read_progress_from_result(
+        json.dumps({"targets": targets}),
+        {"stdout": "", "output": payload, "exit_code": 0},
+    )
+
+    expected = {agent_loop._email_retrieval_target_key(**targets[0])}
+    assert terminal == expected
+    assert usable == expected
+
+
+def test_malformed_production_stdout_fabricates_no_read_progress():
+    targets = [{"uid": "31", "folder": "INBOX"}]
+
+    terminal, usable = agent_loop._email_read_progress_from_result(
+        json.dumps({"targets": targets}),
+        {"stdout": "malformed batch output", "stderr": "", "exit_code": 0},
+    )
+
+    assert terminal == set()
+    assert usable == set()
+
+
+def test_read_progress_uses_full_execution_result_not_persisted_truncation():
+    targets = [
+        {"uid": str(index), "folder": "INBOX" if index % 2 else "Archive"}
+        for index in range(20)
+    ]
+    full_stdout = _synthetic_batch_output(targets)
+    persisted_tool_event = {
+        "output": full_stdout[:100] + "\n... (truncated, persisted copy)",
+    }
+
+    terminal, usable = agent_loop._email_read_progress_from_result(
+        json.dumps({"targets": targets}),
+        {"stdout": full_stdout, "stderr": "", "exit_code": 0},
+    )
+
+    expected = {
+        agent_loop._email_retrieval_target_key(**target) for target in targets
+    }
+    assert terminal == expected
+    assert usable == expected
+    assert "truncated" in persisted_tool_event["output"]
+
+
 @pytest.mark.asyncio
 async def test_production_shaped_batch_reaches_document_in_four_rounds(monkeypatch):
     targets = [
