@@ -2384,6 +2384,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     f"   From: {em['from']} ({em['from_address']})\n"
                     f"   Date: {em['date']}\n"
                     f"   Folder: {em.get('_folder', 'INBOX')}\n"
+                    f"   Resolved Folder: {em.get('_resolved_folder', em.get('_folder', 'INBOX'))}\n"
                     f"   UID: {em['uid']}"
                 )
                 if em.get('to'):

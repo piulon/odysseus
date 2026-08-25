@@ -1204,7 +1204,16 @@ def _email_search_targets_from_result(block_content: str, result: Dict) -> Set[t
     if not isinstance(arguments, dict):
         arguments = {}
     account = arguments.get("account")
-    raw = str(result.get("output") or result.get("content") or result.get("results") or "")
+    # MCPManager returns TextContent as stdout, while direct/synthetic tool
+    # handlers commonly use output/content/results. Parse the full execution
+    # result here, before the separate UI/persistence truncation path.
+    raw = str(
+        result.get("stdout")
+        or result.get("output")
+        or result.get("content")
+        or result.get("results")
+        or ""
+    )
     targets: Set[tuple[str, str, str, str]] = set()
     for match in re.finditer(
         r"(?ms)^\s*\d+\.\s+.*?(?=^\s*\d+\.\s+|\Z)",
@@ -1214,11 +1223,17 @@ def _email_search_targets_from_result(block_content: str, result: Dict) -> Set[t
         uid_match = re.search(r"(?m)^\s*UID:\s*(\S+)\s*$", item)
         if not uid_match:
             continue
+        resolved_folder_match = re.search(
+            r"(?m)^\s*Resolved Folder:\s*(.+?)\s*$",
+            item,
+        )
         folder_match = re.search(r"(?m)^\s*Folder:\s*(.+?)\s*$", item)
         targets.add(_email_retrieval_target_key(
             uid=uid_match.group(1),
             folder=(
-                folder_match.group(1)
+                resolved_folder_match.group(1)
+                if resolved_folder_match
+                else folder_match.group(1)
                 if folder_match
                 else str(arguments.get("folder") or "INBOX")
             ),
