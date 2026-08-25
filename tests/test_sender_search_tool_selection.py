@@ -399,3 +399,126 @@ def test_ordinary_prose_without_required_retrieval_still_completes(monkeypatch):
 
     assert len(schemas) == 1
     assert any("A normal prose answer." in chunk for chunk in chunks)
+
+
+def _structured_ask_user_message():
+    return {
+        "role": "assistant",
+        "content": "Vols que continuï?",
+        "metadata": {
+            "tool_events": [{
+                "round": 1,
+                "tool": "ask_user",
+                "ask_user": {
+                    "question": "Vols que continuï?",
+                    "options": [{"label": "Sí"}, {"label": "No"}],
+                    "multi": False,
+                },
+            }],
+        },
+    }
+
+
+def test_new_session_foreign_ask_context_uses_required_search_retry(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas = []
+    messages_by_round = []
+    executed = []
+    current = {
+        "role": "user",
+        "content": (
+            "Crea'm un document Word amb tots els correus de "
+            "sender@example.com, ordenats per data."
+        ),
+    }
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        messages_by_round.append(messages)
+        if len(schemas) == 1:
+            yield 'data: {"delta": "Action: search_emails. Next action: Call search_emails."}\n\n'
+        elif len(schemas) == 2:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{
+                    "name": "search_emails",
+                    "arguments": json.dumps({"query": "sender@example.com"}),
+                }],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "No matches."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append((block.tool_type, json.loads(block.content)))
+        return block.tool_type, {"output": "[]", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [_structured_ask_user_message(), current],
+        conversation_history=[current],
+        max_rounds=3,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert schemas[:2] == [{"search_emails"}, {"search_emails"}]
+    assert executed == [
+        ("mcp__email__search_emails", {"query": "sender@example.com"}),
+    ]
+    corrective_system = "\n".join(
+        str(message.get("content") or "")
+        for message in messages_by_round[1]
+        if message.get("role") == "system"
+    )
+    assert "Call the available `search_emails` native tool now" in corrective_system
+    assert "resuming immediately after an `ask_user`" not in corrective_system
+
+
+def test_required_search_wins_over_contradictory_ask_followup_state(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas = []
+    messages_by_round = []
+    current = {
+        "role": "user",
+        "content": "Create a document with emails from sender@example.com.",
+    }
+    history = [
+        {"role": "user", "content": "Please prepare an email document."},
+        _structured_ask_user_message(),
+        current,
+    ]
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        messages_by_round.append(messages)
+        yield 'data: {"delta": "Action: search_emails. Next action: Call search_emails."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        history,
+        conversation_history=history,
+        max_rounds=4,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert schemas == [{"search_emails"}, {"search_emails"}]
+    for forbidden in {
+        "list_email_accounts", "send_email", "create_document",
+        "web_search", "web_fetch",
+    }:
+        assert forbidden not in schemas[1]
+    corrective_system = "\n".join(
+        str(message.get("content") or "")
+        for message in messages_by_round[1]
+        if message.get("role") == "system"
+    )
+    assert "Call the available `search_emails` native tool now" in corrective_system
+    assert "resuming immediately after an `ask_user`" not in corrective_system

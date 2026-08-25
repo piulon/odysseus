@@ -1022,6 +1022,7 @@ def _answered_ask_user_payload(messages: List[Dict]) -> Optional[Dict]:
                 isinstance(event, dict)
                 and event.get("tool") == "ask_user"
                 and isinstance(event.get("ask_user"), dict)
+                and str(event["ask_user"].get("question") or "").strip()
             ):
                 return event["ask_user"]
         return None
@@ -1313,7 +1314,12 @@ def _explicit_email_sender_address(text: str) -> Optional[str]:
     return match.group("address") if match else None
 
 
-def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, object]:
+def _classify_agent_request(
+    messages: List[Dict],
+    last_user: str,
+    *,
+    conversation_messages: Optional[List[Dict]] = None,
+) -> Dict[str, object]:
     """Classify only whether this turn deserves domain tool retrieval.
 
     Normal chat should not inherit old Cookbook/email/document context. Recent
@@ -1323,15 +1329,16 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     which domain rule packs get appended to the system prompt.
     """
     text = str(last_user or "").strip()
-    ask_user_followup = _is_ask_user_followup(messages)
-    retry_continuation = _is_contextual_retry_continuation(messages, text)
+    conversation = messages if conversation_messages is None else conversation_messages
+    ask_user_followup = _is_ask_user_followup(conversation)
+    retry_continuation = _is_contextual_retry_continuation(conversation, text)
     continuation = (
         ask_user_followup
         or _is_explicit_continuation(text)
-        or _assistant_requested_followup(messages)
+        or _assistant_requested_followup(conversation)
         or retry_continuation
     )
-    retrieval_query = _recent_context_for_retrieval(messages) if continuation else text
+    retrieval_query = _recent_context_for_retrieval(conversation) if continuation else text
     q = retrieval_query.lower()
     explicit_email_sender = _explicit_email_sender_address(retrieval_query)
 
@@ -3145,6 +3152,7 @@ async def stream_agent_loop(
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
     _is_teacher_run: bool = False,
+    conversation_history: Optional[List[Dict]] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
 
@@ -3189,20 +3197,33 @@ async def stream_agent_loop(
     _last_user = _extract_last_user_message(messages)
     _ody_qwen_finetune_model = (model or "").lower().startswith("odysseus-qwen3")
     _ody_memory_identity_turn = _looks_like_memory_identity_turn(_last_user)
-    _intent = _classify_agent_request(messages, _last_user)
+    # The model prompt may contain recalled/RAG/synthetic context. Only the
+    # route-owned session history can establish conversational adjacency.
+    _conversation_messages = (
+        messages if conversation_history is None else conversation_history
+    )
+    _intent = _classify_agent_request(
+        messages,
+        _last_user,
+        conversation_messages=_conversation_messages,
+    )
     _explicit_email_sender = str(
         _intent.get("explicit_email_sender") or ""
     ).strip()
-    _ask_user_followup_turn = _is_ask_user_followup(messages)
-    _answered_ask_user = _answered_ask_user_payload(messages) if _ask_user_followup_turn else None
+    _ask_user_followup_turn = _is_ask_user_followup(_conversation_messages)
+    _answered_ask_user = (
+        _answered_ask_user_payload(_conversation_messages)
+        if _ask_user_followup_turn
+        else None
+    )
     _answered_ask_user_answer = (
-        _answered_ask_user_latest_user_answer(messages)
+        _answered_ask_user_latest_user_answer(_conversation_messages)
         if _ask_user_followup_turn
         else None
     )
     _low_signal_turn = bool(_intent.get("low_signal"))
     _casual_low_signal_turn = _is_casual_low_signal(_last_user)
-    _existing_conversation = _user_turn_count(messages) > 1
+    _existing_conversation = _user_turn_count(_conversation_messages) > 1
     _active_document_relevant = _turn_targets_active_document(_intent, _last_user, active_document)
     _active_email_draft_relevant = _active_document_relevant and _is_email_document_obj(active_document)
     if _active_email_draft_relevant:
@@ -5859,6 +5880,11 @@ async def stream_agent_loop(
                 and not guide_only
                 and not _force_answer
                 and not _ask_user_resume_retry_done
+                and not (
+                    _required_first_retrieval_tool
+                    and not _required_first_retrieval_satisfied
+                    and _email_document_retrieval_state == "retrieval_pending"
+                )
             ):
                 _ask_user_resume_retry_done = True
                 logger.info(
