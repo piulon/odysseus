@@ -529,8 +529,9 @@ async def test_production_shaped_batch_reaches_document_in_four_rounds(monkeypat
     assert len(model_rounds) < 20
     assert "create_document" not in model_rounds[0]["schemas"]
     assert "read_email" in model_rounds[0]["schemas"]
-    assert "create_document" in model_rounds[1]["schemas"]
-    assert model_rounds[2]["schemas"] == model_rounds[1]["schemas"]
+    assert model_rounds[1]["schemas"] == {"create_document"}
+    assert "create_document" in model_rounds[2]["schemas"]
+    assert model_rounds[2]["schemas"] != {"create_document"}
     assert any("Synthetic report created." in chunk for chunk in chunks)
 
 
@@ -904,14 +905,67 @@ async def test_post_batch_pending_document_restriction_is_one_round_only(monkeyp
     assert len(model_rounds) == 4
     assert len(model_rounds) < 20
     assert "create_document" not in model_rounds[0]["schemas"]
-    assert "create_document" in model_rounds[1]["schemas"]
+    assert model_rounds[1]["schemas"] == {"create_document"}
     assert model_rounds[2]["schemas"] == {"create_document"}
-    assert model_rounds[1]["schemas"] != {"create_document"}
-    assert model_rounds[3]["schemas"] == model_rounds[1]["schemas"]
+    assert "create_document" in model_rounds[3]["schemas"]
+    assert model_rounds[3]["schemas"] != {"create_document"}
     pending_instruction = "\n".join(
         str(message.get("content") or "")
         for message in model_rounds[2]["messages"]
         if message.get("role") == "system"
     )
-    assert "explicitly identified `create_document` as a pending action" in pending_instruction
+    assert "one corrective document-creation round" in pending_instruction
     assert any("Synthetic pending report created." in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_post_readiness_document_prose_stops_after_one_corrective_round(monkeypatch):
+    targets = [{"uid": "1", "folder": "INBOX", "account": "work"}]
+    model_rounds = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_rounds.append({
+            "messages": json.loads(json.dumps(messages)),
+            "schemas": _schema_names(kwargs.get("tools")),
+        })
+        if len(model_rounds) == 1:
+            call = {
+                "name": "search_emails",
+                "arguments": json.dumps({"query": "synthetic", "account": "work"}),
+            }
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        else:
+            yield 'data: {"delta": "I have summarized the emails."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        if block.tool_type == "mcp__email__search_emails":
+            return block.tool_type, {
+                "output": _synthetic_search_output(targets),
+                "exit_code": 0,
+            }
+        assert block.tool_type == "mcp__email__read_email"
+        return block.tool_type, {
+            "output": _synthetic_batch_output(targets),
+            "exit_code": 0,
+        }
+
+    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
+    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1",
+        "gpt-4o",
+        [{"role": "user", "content": "Create a Word document from the synthetic emails, ordered by date."}],
+        max_rounds=20,
+        relevant_tools={"search_emails", "read_email", "create_document", "send_email"},
+        owner="admin",
+        _is_teacher_run=True,
+    )]
+
+    assert len(model_rounds) == 3
+    assert model_rounds[1]["schemas"] == {"create_document"}
+    assert model_rounds[2]["schemas"] == {"create_document"}
+    corrective_context = json.dumps(model_rounds[2]["messages"])
+    assert "one corrective document-creation round" in corrective_context
+    assert "Word document" in corrective_context
+    assert "ordered by date" in corrective_context
+    assert any("required_artifact_creation_failed" in chunk for chunk in chunks)
