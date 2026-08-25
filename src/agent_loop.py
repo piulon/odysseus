@@ -4944,6 +4944,10 @@ async def stream_agent_loop(
     _email_retrieval_expected: Set[tuple[str, str, str, str]] = set()
     _email_retrieval_terminal: Set[tuple[str, str, str, str]] = set()
     _email_retrieval_usable: Set[tuple[str, str, str, str]] = set()
+    # An email-backed document request remains incomplete until the model has
+    # successfully called create_document after retrieval becomes ready.
+    _email_document_creation_pending = False
+    _email_document_creation_retry_done = False
     if (
         not guide_only
         and not _active_document_relevant
@@ -5319,6 +5323,22 @@ async def stream_agent_loop(
                 if schema.get("function", {}).get("name") != "create_document"
                 and schema.get("name") != "create_document"
             ]
+
+        # Retrieval is complete, but the explicit artifact request is not.
+        # Keep synthesis model-mediated while making create_document the only
+        # available action for this bounded progression round.
+        if _email_document_creation_pending:
+            _document_schemas = [
+                schema for schema in (all_tool_schemas or [])
+                if schema.get("function", {}).get("name") == "create_document"
+                or schema.get("name") == "create_document"
+            ]
+            if _document_schemas:
+                all_tool_schemas = _document_schemas
+                logger.info(
+                    "[agent] requiring post-readiness document creation round=%d",
+                    round_num,
+                )
 
         if _exclude_ask_user_this_round:
             all_tool_schemas = [
@@ -5912,6 +5932,50 @@ async def stream_agent_loop(
             yield f'data: {json.dumps({"delta": cleaned_round})}\n\n'
 
         if not tool_blocks:
+            # Retrieval readiness is structural workflow state: an explicit
+            # email-backed artifact request cannot be completed by prose while
+            # its document is still missing. Give the model one normal
+            # create-only synthesis round, then exactly one corrective round.
+            if (
+                _email_document_creation_pending
+                and not guide_only
+                and not _force_answer
+            ):
+                if not _email_document_creation_retry_done:
+                    _email_document_creation_retry_done = True
+                    logger.info(
+                        "[agent] required post-readiness create_document was not "
+                        "executed on round %d; retrying once",
+                        round_num,
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "The requested artifact is still missing. Create it now "
+                            "through the native `create_document` tool. This is the "
+                            "one corrective document-creation round: do not answer "
+                            "in prose, do not reopen email retrieval, and preserve "
+                            "the user's original document instructions and the "
+                            "retrieved usable email content already in context."
+                        ),
+                    })
+                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                    continue
+                logger.warning(
+                    "[agent] required artifact creation failed after corrective "
+                    "round %d: create_document was not called",
+                    round_num,
+                )
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "type": "required_artifact_creation_failed",
+                        "reason": "create_document_not_called",
+                        "round": round_num,
+                    })
+                    + "\n\n"
+                )
+                break
             # ── Completion verifier (mechanism 3a) ────────────────────
             # The model is finishing. If this was an effectful agentic turn,
             # have a fresh-context verifier independently check the work
@@ -6547,6 +6611,7 @@ async def stream_agent_loop(
                         and _email_retrieval_usable
                     ):
                         _email_document_retrieval_state = "retrieval_ready"
+                        _email_document_creation_pending = True
                         _email_retrieval_became_ready = True
                         logger.info(
                             "[agent] email document retrieval gate state=retrieval_ready targets=%d usable=%d",
@@ -6920,6 +6985,18 @@ async def stream_agent_loop(
                 and not result.get("error")
             ):
                 _ody_doc_tool_completed = True
+            if (
+                _email_document_creation_pending
+                and block.tool_type == "create_document"
+                and not result.get("error")
+                and not result.get("blocked")
+                and (result.get("doc_id") or result.get("action") == "create")
+            ):
+                _email_document_creation_pending = False
+                logger.info(
+                    "[agent] required post-readiness artifact created round=%d",
+                    round_num,
+                )
 
         # Healthy diagnostic results are factual and need no probabilistic
         # second-round synthesis. This also prevents unsupported remediation
