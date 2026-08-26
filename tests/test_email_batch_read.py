@@ -825,7 +825,7 @@ async def test_sixty_pending_reads_execute_in_three_batches_without_selection_ro
 
 
 @pytest.mark.asyncio
-async def test_post_batch_pending_document_restriction_is_one_round_only(monkeypatch):
+async def test_post_batch_pending_document_is_structurally_completed_once(monkeypatch):
     targets = [
         {"uid": str(index), "folder": "INBOX", "account": "work"}
         for index in range(10)
@@ -845,16 +845,6 @@ async def test_post_batch_pending_document_restriction_is_one_round_only(monkeyp
         elif round_number == 2:
             assert "synthetic body 0" in json.dumps(messages)
             yield 'data: {"delta": "The next step is to call create_document."}\n\n'
-        elif round_number == 3:
-            call = {
-                "name": "create_document",
-                "arguments": json.dumps({
-                    "title": "Synthetic pending report",
-                    "language": "markdown",
-                    "content": "# Synthetic pending report",
-                }),
-            }
-            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
         else:
             assert "SYNTHETIC_DOCUMENT_RESULT" in json.dumps(messages)
             yield 'data: {"delta": "Synthetic pending report created."}\n\n'
@@ -905,31 +895,29 @@ async def test_post_batch_pending_document_restriction_is_one_round_only(monkeyp
     assert tool_types == [
         "mcp__email__search_emails", "mcp__email__read_email", "create_document",
     ]
-    assert len(model_rounds) == 4
+    assert len(model_rounds) == 3
     assert len(model_rounds) < 20
     assert "create_document" not in model_rounds[0]["schemas"]
     assert model_rounds[1]["schemas"] == {"create_document"}
-    assert model_rounds[2]["schemas"] == {"create_document"}
-    assert "create_document" in model_rounds[3]["schemas"]
-    assert model_rounds[3]["schemas"] != {"create_document"}
-    pending_instruction = "\n".join(
-        str(message.get("content") or "")
-        for message in model_rounds[2]["messages"]
-        if message.get("role") == "system"
-    )
-    assert "one corrective document-creation round" in pending_instruction
+    assert "create_document" in model_rounds[2]["schemas"]
+    assert model_rounds[2]["schemas"] != {"create_document"}
     assert any("Synthetic pending report created." in chunk for chunk in chunks)
 
 
 @pytest.mark.asyncio
-async def test_post_readiness_document_prose_stops_after_one_corrective_round(monkeypatch):
-    targets = [{"uid": "1", "folder": "INBOX", "account": "work"}]
+async def test_post_readiness_document_prose_is_structurally_completed(monkeypatch):
+    targets = [
+        {"uid": "2", "folder": "INBOX", "account": "work"},
+        {"uid": "1", "folder": "INBOX", "account": "work"},
+    ]
     model_rounds = []
+    executed = []
 
     async def fake_stream(_candidates, messages, **kwargs):
         model_rounds.append({
             "messages": json.loads(json.dumps(messages)),
             "schemas": _schema_names(kwargs.get("tools")),
+            "tool_choice_name": kwargs.get("tool_choice_name"),
         })
         if len(model_rounds) == 1:
             call = {
@@ -937,26 +925,45 @@ async def test_post_readiness_document_prose_stops_after_one_corrective_round(mo
                 "arguments": json.dumps({"query": "synthetic", "account": "work"}),
             }
             yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
-        else:
+        elif len(model_rounds) == 2:
             yield 'data: {"delta": "I have summarized the emails."}\n\n'
+        else:
+            yield 'data: {"delta": "The document is ready."}\n\n'
         yield "data: [DONE]\n\n"
 
     async def fake_execute(block, *args, **kwargs):
+        if block.tool_type == "create_document":
+            title, language, content = block.content.split("\n", 2)
+            executed.append((block.tool_type, content))
+            return block.tool_type, {
+                "output": "SYNTHETIC_DOCUMENT_RESULT",
+                "action": "create",
+                "doc_id": "ollama-supervised-doc",
+                "title": title,
+                "language": language,
+                "content": content,
+                "version": 1,
+                "exit_code": 0,
+            }
+        executed.append((block.tool_type, block.content))
         if block.tool_type == "mcp__email__search_emails":
             return block.tool_type, {
                 "output": _synthetic_search_output(targets),
                 "exit_code": 0,
             }
         assert block.tool_type == "mcp__email__read_email"
+        payload = json.loads(_synthetic_batch_output(targets))
+        payload["items"][0]["date"] = "Tue, 25 Aug 2026 12:00:00 +0200"
+        payload["items"][1]["date"] = "Mon, 24 Aug 2026 12:00:00 +0200"
         return block.tool_type, {
-            "output": _synthetic_batch_output(targets),
+            "output": json.dumps(payload),
             "exit_code": 0,
         }
 
     _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
     chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
-        "https://api.openai.com/v1",
-        "gpt-4o",
+        "http://ollama:11434/v1/chat/completions",
+        "qwen3:14b",
         [{"role": "user", "content": "Create a Word document from the synthetic emails, ordered by date."}],
         max_rounds=20,
         relevant_tools={"search_emails", "read_email", "create_document", "send_email"},
@@ -966,9 +973,17 @@ async def test_post_readiness_document_prose_stops_after_one_corrective_round(mo
 
     assert len(model_rounds) == 3
     assert model_rounds[1]["schemas"] == {"create_document"}
-    assert model_rounds[2]["schemas"] == {"create_document"}
-    corrective_context = json.dumps(model_rounds[2]["messages"])
-    assert "one corrective document-creation round" in corrective_context
-    assert "Word document" in corrective_context
-    assert "ordered by date" in corrective_context
-    assert any("required_artifact_creation_failed" in chunk for chunk in chunks)
+    assert model_rounds[1]["tool_choice_name"] == "create_document"
+    assert model_rounds[2]["schemas"] != {"create_document"}
+    tool_types = [tool_type for tool_type, _content in executed]
+    assert tool_types == [
+        "mcp__email__search_emails",
+        "mcp__email__read_email",
+        "create_document",
+    ]
+    content = executed[-1][1]
+    assert "synthetic body 1" in content
+    assert "synthetic body 2" in content
+    assert content.index("synthetic body 1") < content.index("synthetic body 2")
+    assert "placeholder" not in content.lower()
+    assert not any("required_artifact_creation_failed" in chunk for chunk in chunks)

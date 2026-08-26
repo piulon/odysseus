@@ -8,11 +8,13 @@ The LLM decides when to use tools by writing fenced code blocks.
 
 import asyncio
 import collections
+import datetime
 import json
 import re
 import time
 import logging
 import unicodedata
+from email.utils import parsedate_to_datetime
 from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable, List, Dict, Optional, Set
@@ -1656,6 +1658,104 @@ def _email_read_progress_from_result(
     elif requested_keys and (result.get("error") or raw.lstrip().lower().startswith("error:")):
         terminal.add(requested_keys[0])
     return terminal, usable
+
+
+def _email_document_items_from_result(block_content: str, result: Dict) -> list[Dict[str, str]]:
+    """Return substantive successful messages from one completed read call."""
+    try:
+        arguments = json.loads(block_content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return []
+
+    raw = str(
+        result.get("stdout")
+        or result.get("output")
+        or result.get("content")
+        or result.get("results")
+        or ""
+    )
+    targets = arguments.get("targets")
+    if isinstance(targets, list):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [
+            {
+                "subject": str(item.get("subject") or "(No subject)"),
+                "from": str(item.get("from") or item.get("from_address") or ""),
+                "date": str(item.get("date") or ""),
+                "body": str(item.get("body") or "").strip(),
+            }
+            for item in items
+            if isinstance(item, dict)
+            and item.get("status") == "success"
+            and str(item.get("body") or "").strip()
+        ]
+
+    if not raw or result.get("error") or raw.lstrip().lower().startswith("error:"):
+        return []
+
+    def _header(name: str) -> str:
+        match = re.search(rf"(?mi)^\*\*{name}:\*\*\s*(.*?)\s*$", raw)
+        return match.group(1) if match else ""
+
+    body = raw.split("\n---\n", 1)[-1].strip()
+    if not body:
+        return []
+    return [{
+        "subject": _header("Subject") or "(No subject)",
+        "from": _header("From"),
+        "date": _header("Date"),
+        "body": body,
+    }]
+
+
+def _required_email_document_block(
+    items: list[Dict[str, str]], user_request: str,
+) -> Optional[ToolBlock]:
+    """Build the required artifact directly from already retrieved email bodies."""
+    substantive = [item for item in items if str(item.get("body") or "").strip()]
+    if not substantive:
+        return None
+
+    request_lc = str(user_request or "").lower()
+    if "date" in request_lc and re.search(r"\b(?:sort|order|ordered|chronolog)", request_lc):
+        def _date_key(item: Dict[str, str]) -> tuple[int, datetime.datetime]:
+            try:
+                parsed = parsedate_to_datetime(str(item.get("date") or "").strip())
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+                return 0, parsed.astimezone(datetime.timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                return 1, datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+
+        reverse = bool(re.search(r"\b(?:newest|latest|descending|reverse)\b", request_lc))
+        substantive = sorted(substantive, key=_date_key, reverse=reverse)
+
+    sections = []
+    for item in substantive:
+        metadata = []
+        if item.get("from"):
+            metadata.append(f"**From:** {item['from']}")
+        if item.get("date"):
+            metadata.append(f"**Date:** {item['date']}")
+        sections.append(
+            "## " + str(item.get("subject") or "(No subject)")
+            + ("\n\n" + "\n\n".join(metadata) if metadata else "")
+            + "\n\n" + str(item["body"]).strip()
+        )
+    content = "# Retrieved emails\n\n" + "\n\n---\n\n".join(sections)
+    return function_call_to_tool_block("create_document", json.dumps({
+        "title": "Retrieved emails",
+        "language": "markdown",
+        "content": content,
+    }, ensure_ascii=False))
 
 
 _EXPLICIT_EMAIL_SENDER_RE = re.compile(
@@ -5257,6 +5357,7 @@ async def stream_agent_loop(
     _email_retrieval_expected: Set[tuple[str, str, str, str]] = set()
     _email_retrieval_terminal: Set[tuple[str, str, str, str]] = set()
     _email_retrieval_usable: Set[tuple[str, str, str, str]] = set()
+    _email_document_items: list[Dict[str, str]] = []
     # An email-backed document request remains incomplete until the model has
     # successfully called create_document after retrieval becomes ready.
     _email_document_creation_pending = False
@@ -6276,6 +6377,28 @@ async def stream_agent_loop(
                 logger.info(f"Auto-created document from {lang_tag} code block ({code_body.count(chr(10))+1} lines)")
                 break  # only auto-create one document per round
 
+        # Some OpenAI-compatible providers accept tools but ignore tool_choice.
+        # Once mailbox retrieval is structurally complete, turn the successful
+        # read results into the one required document call in the supervisor.
+        if (
+            not tool_blocks
+            and _email_document_creation_pending
+            and not guide_only
+            and not _force_answer
+        ):
+            _required_document_block = _required_email_document_block(
+                _email_document_items,
+                _last_user,
+            )
+            if _required_document_block is not None:
+                tool_blocks.append(_required_document_block)
+                logger.info(
+                    "[agent] structurally completing post-readiness "
+                    "create_document round=%d messages=%d",
+                    round_num,
+                    len(_email_document_items),
+                )
+
         # Save cleaned round text for history persistence
         # Keep <think> blocks so they render in the thinking section on reload
         # Mirror the same fenced-pattern gate used to resolve tool_blocks above:
@@ -6966,6 +7089,9 @@ async def stream_agent_loop(
                 elif block.tool_type in {"mcp__email__read_email", "read_email"}:
                     _resolved_before_read = len(_email_retrieval_terminal)
                     _terminal, _usable = _email_read_progress_from_result(block.content, result)
+                    _email_document_items.extend(
+                        _email_document_items_from_result(block.content, result)
+                    )
                     _email_retrieval_terminal.update(_terminal & _email_retrieval_expected)
                     _email_retrieval_usable.update(_usable & _email_retrieval_expected)
                     if _deterministic_read_batch:
