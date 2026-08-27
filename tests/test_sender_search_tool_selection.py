@@ -47,6 +47,100 @@ _EMAIL_DOCUMENT_TOOLS = {
 
 
 @pytest.mark.parametrize("user_text", [
+    "Busca el correu més recent de niniprimer@gmail.com i digues-me només la data i l'assumpte.",
+    "Busca el correo más reciente de sender@example.com y dime solo la fecha y el asunto.",
+    "Find the most recent email from sender@example.com and tell me only the date and subject.",
+])
+def test_sender_specific_lookup_requires_search_as_first_retrieval_action(
+    monkeypatch, user_text,
+):
+    _patch_agent(monkeypatch)
+    model_schemas = []
+    model_messages = []
+    executed = []
+    expected_address = (
+        "niniprimer@gmail.com" if "niniprimer" in user_text else "sender@example.com"
+    )
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_schemas.append(_schema_names(kwargs.get("tools")))
+        model_messages.append(messages)
+        if len(model_schemas) == 1:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{
+                    "name": "search_emails",
+                    "arguments": json.dumps({"query": expected_address}),
+                }],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "No matches."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append((block.tool_type, json.loads(block.content)))
+        return block.tool_type, {"output": "No emails matched.", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{"role": "user", "content": user_text}],
+        max_rounds=2,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert agent_loop._explicit_email_sender_address(user_text) == expected_address
+    assert model_schemas[0] == {"search_emails"}
+    assert executed == [
+        ("mcp__email__search_emails", {"query": expected_address}),
+    ]
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in model_messages[0]
+        if message.get("role") == "system"
+    )
+    assert f"`{expected_address}` identifies the sender" in system_text
+    assert "exact address as `query`" in system_text
+
+
+def test_generic_recent_email_browsing_keeps_list_emails_available(monkeypatch):
+    _patch_agent(monkeypatch)
+    model_schemas = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_schemas.append(_schema_names(kwargs.get("tools")))
+        yield "data: " + json.dumps({
+            "type": "tool_calls",
+            "calls": [{"name": "list_emails", "arguments": '{"max_results": 5}'}],
+        }) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "Found 5 email(s).", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+
+    user_text = "Mostra els últims correus."
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{"role": "user", "content": user_text}],
+        max_rounds=1,
+        relevant_tools=set(_EMAIL_DOCUMENT_TOOLS),
+        owner="admin",
+    ))
+
+    assert agent_loop._explicit_email_sender_address(user_text) is None
+    assert "list_emails" in model_schemas[0]
+    assert executed == ["mcp__email__list_emails"]
+
+
+@pytest.mark.parametrize("user_text", [
     "Crea'm un document Word amb tots els correus de sender@example.com, ordenats per data.",
     "Crea un documento Word con todos los correos de sender@example.com, ordenados por fecha.",
     "Create a Word document with all emails from sender@example.com, ordered by date.",

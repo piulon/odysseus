@@ -1965,7 +1965,11 @@ def _required_email_document_block(
 
 
 _EXPLICIT_EMAIL_SENDER_RE = re.compile(
-    r"\b(?:e-?mails?|correos?|correus)\s+(?:from|de)\s+"
+    r"\b(?:e-?mails?|correos?|correus?)\s+"
+    r"(?:(?:most\s+recent|latest|last|newest|recent|"
+    r"m[eé]s\s+recent|m[aá]s\s+reciente|"
+    r"[uú]ltim|[uú]ltimo)\s+)?"
+    r"(?:from|de)\s+"
     r"(?P<address>[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
     r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
     r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+)",
@@ -5573,6 +5577,18 @@ async def stream_agent_loop(
     _email_document_creation_retry_done = False
     if (
         not guide_only
+        and _explicit_email_sender
+        and _relevant_tools is not None
+        and "search_emails" in _relevant_tools
+    ):
+        _required_first_retrieval_tool = "search_emails"
+        logger.info(
+            "[agent-intent] explicit email sender requires first retrieval "
+            "tool=search_emails sender=%s",
+            _explicit_email_sender,
+        )
+    if (
+        not guide_only
         and not _active_document_relevant
         and {"email", "documents"}.issubset(_intent_domains)
         and _relevant_tools is not None
@@ -5582,13 +5598,6 @@ async def stream_agent_loop(
     ):
         _email_document_retrieval_state = "retrieval_pending"
         logger.info("[agent] email document retrieval gate active state=retrieval_pending")
-        if _explicit_email_sender and "search_emails" in _relevant_tools:
-            _required_first_retrieval_tool = "search_emails"
-            logger.info(
-                "[agent-intent] explicit email sender requires first retrieval "
-                "tool=search_emails sender=%s",
-                _explicit_email_sender,
-            )
 
     messages, mcp_schemas = _build_system_prompt(
         messages, model, _prompt_active_document, mcp_mgr, disabled_tools,
@@ -5618,17 +5627,17 @@ async def stream_agent_loop(
             )
         else:
             messages.insert(0, {"role": "system", "content": _retrieval_gate_directive})
-        if _required_first_retrieval_tool:
-            _sender_search_directive = (
-                "EXPLICIT EMAIL SENDER: The address "
-                f"`{_explicit_email_sender}` identifies the sender of messages to "
-                "retrieve, not one of the user's configured mailbox accounts. "
-                "Your first action must be `search_emails` with that exact address "
-                "as `query`. Do not call `list_email_accounts` or `send_email` first."
-            )
-            messages[0]["content"] = (
-                _sender_search_directive + "\n\n" + (messages[0].get("content") or "")
-            )
+    if _required_first_retrieval_tool:
+        _sender_search_directive = (
+            "EXPLICIT EMAIL SENDER: The address "
+            f"`{_explicit_email_sender}` identifies the sender of messages to "
+            "retrieve, not one of the user's configured mailbox accounts. "
+            "Your first action must be `search_emails` with that exact address "
+            "as `query`. Do not call `list_email_accounts` or `send_email` first."
+        )
+        messages[0]["content"] = (
+            _sender_search_directive + "\n\n" + (messages[0].get("content") or "")
+        )
     if _ask_user_followup_turn and not guide_only:
         _ask_user_resume_directive = (
             "The user's latest message is the answer to the immediately preceding "
@@ -6726,7 +6735,6 @@ async def stream_agent_loop(
                 and not (
                     _required_first_retrieval_tool
                     and not _required_first_retrieval_satisfied
-                    and _email_document_retrieval_state == "retrieval_pending"
                 )
                 and not (
                     _email_document_retrieval_state == "retrieval_pending"
@@ -6852,7 +6860,6 @@ async def stream_agent_loop(
             if (
                 _required_first_retrieval_tool
                 and not _required_first_retrieval_satisfied
-                and _email_document_retrieval_state == "retrieval_pending"
                 and not guide_only
                 and not _force_answer
             ):
