@@ -1659,6 +1659,39 @@ def _email_search_result_is_incomplete(result: Dict) -> bool:
     return "[DISCOVERY INCOMPLETE:" in raw
 
 
+def _email_search_result_has_metadata(result: Dict, fields: Set[str]) -> bool:
+    """Return whether one searched envelope contains every requested field."""
+    if not fields:
+        return False
+    raw = str(
+        result.get("stdout")
+        or result.get("output")
+        or result.get("content")
+        or result.get("results")
+        or ""
+    )
+    blocks = re.findall(r"(?ms)^\s*\d+\.\s+.*?(?=^\s*\d+\.\s+|\Z)", raw)
+    if not blocks:
+        blocks = [raw]
+    for block in blocks:
+        available: Set[str] = set()
+        if re.search(r"(?m)^\s*\d+\.\s+\*\*.+?\*\*", block):
+            available.add("subject")
+        if re.search(r"(?m)^\s*Subject\s*:\s*.+", block, re.IGNORECASE):
+            available.add("subject")
+        if re.search(r"(?m)^\s*Date\s*:\s*.+", block, re.IGNORECASE):
+            available.add("date")
+        if re.search(r"(?m)^\s*From\s*:\s*.+", block, re.IGNORECASE):
+            available.add("sender")
+        if re.search(r"(?m)^\s*(?:Resolved )?Folder\s*:\s*.+", block, re.IGNORECASE):
+            available.add("folder")
+        if re.search(r"(?m)^\s*UID\s*:\s*\S+", block, re.IGNORECASE):
+            available.add("uid")
+        if fields.issubset(available):
+            return True
+    return False
+
+
 def _email_read_progress_from_result(
     block_content: str,
     result: Dict,
@@ -1965,7 +1998,11 @@ def _required_email_document_block(
 
 
 _EXPLICIT_EMAIL_SENDER_RE = re.compile(
-    r"\b(?:e-?mails?|correos?|correus)\s+(?:from|de)\s+"
+    r"\b(?:e-?mails?|correos?|correus?)\s+"
+    r"(?:(?:most\s+recent|latest|last|newest|recent|"
+    r"m[eé]s\s+recent|m[aá]s\s+reciente|"
+    r"[uú]ltim|[uú]ltimo)\s+)?"
+    r"(?:from|de)\s+"
     r"(?P<address>[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
     r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
     r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+)",
@@ -1977,6 +2014,41 @@ def _explicit_email_sender_address(text: str) -> Optional[str]:
     """Return an address explicitly used as an email sender constraint."""
     match = _EXPLICIT_EMAIL_SENDER_RE.search(str(text or ""))
     return match.group("address") if match else None
+
+
+def _requested_email_metadata_fields(text: str) -> Set[str]:
+    """Return explicitly requested envelope fields for metadata-only email turns."""
+    normalized = unicodedata.normalize("NFKD", str(text or "").lower())
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    if re.search(
+        r"\b(?:body|content|text|contenido|contingut|cos|read|lee|llegeix|"
+        r"summar(?:ize|ise)|resume|resum|attachment|adjunt|quoted|citat|"
+        r"document|word|all|every|todos?|tots?)\b",
+        normalized,
+    ):
+        return set()
+    fields: Set[str] = set()
+    if re.search(r"\b(?:date|fecha|data)\b", normalized):
+        fields.add("date")
+    if re.search(r"\b(?:subject|asunto|assumpte)\b", normalized):
+        fields.add("subject")
+    if not fields:
+        return set()
+    if not re.search(
+        r"\b(?:only|solo|nomes|what|tell|dime|digues|quina|quin|cual|cu[aá]l|"
+        r"what's|what is|most recent|latest|recent|mes recent|mas reciente)\b",
+        normalized,
+    ):
+        return set()
+    return fields
+
+
+def _logical_tool_name(name: Any) -> str:
+    """Normalize a registered tool name for narrow routing comparisons."""
+    value = str(name or "")
+    if value.startswith("mcp__email__"):
+        return value[len("mcp__email__"):]
+    return value
 
 
 def _classify_agent_request(
@@ -3877,6 +3949,7 @@ async def stream_agent_loop(
     _explicit_email_sender = str(
         _intent.get("explicit_email_sender") or ""
     ).strip()
+    _requested_email_metadata = _requested_email_metadata_fields(_last_user)
     _ask_user_followup_turn = _is_ask_user_followup(_conversation_messages)
     _answered_ask_user = (
         _answered_ask_user_payload(_conversation_messages)
@@ -5562,6 +5635,7 @@ async def stream_agent_loop(
     _compact_agent_prompt = _is_api_model or _is_ollama_native or _ollama_openai_compat
     _email_document_retrieval_state = "not_applicable"
     _required_first_retrieval_tool: Optional[str] = None
+    _metadata_only_email_satisfied = False
     _email_retrieval_expected: Set[tuple[str, str, str, str]] = set()
     _email_retrieval_terminal: Set[tuple[str, str, str, str]] = set()
     _email_retrieval_usable: Set[tuple[str, str, str, str]] = set()
@@ -5571,6 +5645,17 @@ async def stream_agent_loop(
     # successfully called create_document after retrieval becomes ready.
     _email_document_creation_pending = False
     _email_document_creation_retry_done = False
+    if not guide_only and _explicit_email_sender:
+        if _relevant_tools is None:
+            from src.tool_index import ALWAYS_AVAILABLE
+            _relevant_tools = set(ALWAYS_AVAILABLE)
+        _relevant_tools.add("search_emails")
+        _required_first_retrieval_tool = "search_emails"
+        logger.info(
+            "[agent-intent] explicit email sender requires first retrieval "
+            "tool=search_emails sender=%s",
+            _explicit_email_sender,
+        )
     if (
         not guide_only
         and not _active_document_relevant
@@ -5582,13 +5667,6 @@ async def stream_agent_loop(
     ):
         _email_document_retrieval_state = "retrieval_pending"
         logger.info("[agent] email document retrieval gate active state=retrieval_pending")
-        if _explicit_email_sender and "search_emails" in _relevant_tools:
-            _required_first_retrieval_tool = "search_emails"
-            logger.info(
-                "[agent-intent] explicit email sender requires first retrieval "
-                "tool=search_emails sender=%s",
-                _explicit_email_sender,
-            )
 
     messages, mcp_schemas = _build_system_prompt(
         messages, model, _prompt_active_document, mcp_mgr, disabled_tools,
@@ -5618,17 +5696,22 @@ async def stream_agent_loop(
             )
         else:
             messages.insert(0, {"role": "system", "content": _retrieval_gate_directive})
-        if _required_first_retrieval_tool:
-            _sender_search_directive = (
-                "EXPLICIT EMAIL SENDER: The address "
-                f"`{_explicit_email_sender}` identifies the sender of messages to "
-                "retrieve, not one of the user's configured mailbox accounts. "
-                "Your first action must be `search_emails` with that exact address "
-                "as `query`. Do not call `list_email_accounts` or `send_email` first."
-            )
-            messages[0]["content"] = (
-                _sender_search_directive + "\n\n" + (messages[0].get("content") or "")
-            )
+    if _required_first_retrieval_tool:
+        _sender_search_directive = (
+            "EXPLICIT EMAIL SENDER: The address "
+            f"`{_explicit_email_sender}` identifies the sender of messages to "
+            "retrieve, not one of the user's configured mailbox accounts. "
+            "Your first action must be `search_emails` with that exact address "
+            "as `query`. Do not call `list_email_accounts` or `send_email` first."
+        )
+        messages[0]["content"] = (
+            _sender_search_directive + "\n\n" + (messages[0].get("content") or "")
+        )
+    _metadata_only_email_fields = (
+        _requested_email_metadata
+        if "email" in _intent_domains and not _active_document_relevant
+        else set()
+    )
     if _ask_user_followup_turn and not guide_only:
         _ask_user_resume_directive = (
             "The user's latest message is the answer to the immediately preceding "
@@ -5919,7 +6002,8 @@ async def stream_agent_loop(
                 ]
                 _mcp_filtered = [
                     s for s in mcp_schemas
-                    if s.get("function", {}).get("name") in _relevant_tools
+                    if _logical_tool_name(s.get("function", {}).get("name"))
+                    in {_logical_tool_name(name) for name in _relevant_tools}
                 ]
                 all_tool_schemas = base_schemas + _mcp_filtered
             else:
@@ -5979,7 +6063,8 @@ async def stream_agent_loop(
         if _round_tool_restriction:
             _restricted_schemas = [
                 schema for schema in (all_tool_schemas or [])
-                if schema.get("function", {}).get("name") in _round_tool_restriction
+                if _logical_tool_name(schema.get("function", {}).get("name"))
+                in _round_tool_restriction
             ]
             if _restricted_schemas:
                 all_tool_schemas = _restricted_schemas
@@ -6726,7 +6811,6 @@ async def stream_agent_loop(
                 and not (
                     _required_first_retrieval_tool
                     and not _required_first_retrieval_satisfied
-                    and _email_document_retrieval_state == "retrieval_pending"
                 )
                 and not (
                     _email_document_retrieval_state == "retrieval_pending"
@@ -6852,7 +6936,6 @@ async def stream_agent_loop(
             if (
                 _required_first_retrieval_tool
                 and not _required_first_retrieval_satisfied
-                and _email_document_retrieval_state == "retrieval_pending"
                 and not guide_only
                 and not _force_answer
             ):
@@ -7295,6 +7378,29 @@ async def stream_agent_loop(
                     "[agent] required first retrieval tool executed tool=%s round=%d",
                     _required_first_retrieval_tool,
                     round_num,
+                )
+
+            if (
+                _metadata_only_email_fields
+                and block.tool_type in {
+                    "mcp__email__search_emails", "search_emails",
+                }
+                and not result.get("blocked")
+                and not result.get("error")
+                and _email_search_result_has_metadata(
+                    result, _metadata_only_email_fields
+                )
+            ):
+                _metadata_only_email_satisfied = True
+                _force_answer = True
+                _metadata_labels = [
+                    label for key, label in (("date", "date"), ("subject", "subject"))
+                    if key in _metadata_only_email_fields
+                ]
+                logger.info(
+                    "[agent] metadata-only email request satisfied from search result "
+                    "fields=%s; suppressing further email retrieval",
+                    sorted(_metadata_only_email_fields),
                 )
 
             if _email_document_retrieval_state == "retrieval_pending":
@@ -7833,6 +7939,18 @@ async def stream_agent_loop(
         _append_tool_results(messages, round_response, converted_calls,
                              tool_results, tool_result_texts, used_native, round_num,
                              round_reasoning=round_reasoning)
+
+        if _metadata_only_email_satisfied:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "The metadata-only email request is already satisfied by the "
+                    "verified search result. Answer only with the requested email "
+                    f"metadata: {', '.join(_metadata_labels)}. Do not retrieve or "
+                    "include body content, and do not add unrelated commentary or "
+                    "an unsolicited offer."
+                ),
+            })
 
         if _deterministic_email_read_no_progress:
             logger.warning(
