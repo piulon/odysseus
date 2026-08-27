@@ -165,6 +165,48 @@ def test_missing_message_id_fallback_is_deterministic_and_conservative():
     assert agent_loop._email_canonical_identity(first) != agent_loop._email_canonical_identity(distinct)
 
 
+def test_lossless_document_intent_excludes_non_artifact_summaries():
+    assert agent_loop._requires_lossless_email_document(
+        "Create a Word document with all emails involving Alex"
+    )
+    assert not agent_loop._requires_lossless_email_document(
+        "Summarize all emails involving Alex"
+    )
+    assert not agent_loop._requires_lossless_email_document(
+        "Create a document summarizing recent emails involving Alex"
+    )
+
+
+def test_lossless_renderer_handles_zero_one_and_malformed_dates():
+    assert agent_loop._required_email_document_block(
+        [], "Create a document with all emails", lossless=True,
+    ) is None
+    one = {
+        "resolved_message_id": "<one@example.test>",
+        "subject": "Only message",
+        "date": "not an RFC date",
+        "body": "body with trailing whitespace  \n",
+    }
+    rendered = agent_loop._render_lossless_email_document([one])
+    assert rendered.count("<!-- odysseus-email-entry -->") == 1
+    assert "body with trailing whitespace  \n" in rendered
+
+    missing = {**one, "resolved_message_id": "<missing@example.test>", "date": ""}
+    valid = {
+        **one,
+        "resolved_message_id": "<valid@example.test>",
+        "date": "Mon, 24 Aug 2026 12:00:00 +0200",
+    }
+    ordered = agent_loop._render_lossless_email_document([missing, one, valid])
+    assert ordered.index("<valid@example.test>") < ordered.index("<missing@example.test>")
+    assert ordered.index("<valid@example.test>") < ordered.index("<one@example.test>")
+
+    incomplete = agent_loop._render_lossless_email_document(
+        [one], discovery_complete=False,
+    )
+    assert "not guaranteed to contain every mailbox match" in incomplete
+
+
 def test_discovery_incomplete_marker_is_structural():
     assert agent_loop._email_search_result_is_incomplete({
         "stdout": "Found 100 email(s)\n[DISCOVERY INCOMPLETE: limit reached]",
@@ -172,6 +214,22 @@ def test_discovery_incomplete_marker_is_structural():
     assert not agent_loop._email_search_result_is_incomplete({
         "stdout": "Found 60 email(s)",
     })
+
+
+def test_lossless_renderer_keeps_same_subject_messages_with_distinct_ids():
+    messages = [
+        {
+            "resolved_message_id": f"<{index}@example.test>",
+            "subject": "Same subject",
+            "date": "Mon, 24 Aug 2026 12:00:00 +0200",
+            "body": f"body {index}",
+        }
+        for index in (1, 2)
+    ]
+    rendered = agent_loop._render_lossless_email_document(messages)
+    assert rendered.count("<!-- odysseus-email-entry -->") == 2
+    assert "body 1" in rendered
+    assert "body 2" in rendered
 
 
 @pytest.mark.parametrize("uids", [[], "10", None, [{}], [True], [1.5]])
@@ -1078,3 +1136,115 @@ async def test_post_readiness_document_prose_is_structurally_completed(monkeypat
     assert content.index("synthetic body 1") < content.index("synthetic body 2")
     assert "placeholder" not in content.lower()
     assert not any("required_artifact_creation_failed" in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_exhaustive_document_replaces_model_summary_with_exact_unique_corpus(monkeypatch):
+    targets = [
+        {
+            "uid": str(index + 1),
+            "folder": "INBOX" if index < 31 else "[Provider]/All Mail",
+            "account": "work",
+        }
+        for index in range(47)
+    ]
+    executed = []
+    model_rounds = 0
+
+    def batch_payload(batch):
+        items = []
+        for index, target in enumerate(batch):
+            global_index = int(target["uid"]) - 1
+            canonical_index = global_index if global_index < 31 else global_index - 31
+            day = canonical_index + 1
+            items.append({
+                "index": index,
+                "uid": target["uid"],
+                "folder": target["folder"],
+                "account": target["account"],
+                "status": "success",
+                "truncated": False,
+                "resolved_uid": target["uid"],
+                "resolved_folder": target["folder"],
+                "resolved_message_id": f"<message-{canonical_index:02d}@example.test>",
+                "subject": "Same subject" if canonical_index in {4, 5} else f"Subject {canonical_index}",
+                "from": "Synthetic Sender",
+                "from_address": "sender@example.test",
+                "to": "recipient@example.test",
+                "date": f"{day:02d} Jan 2026 10:00:00 +0000",
+                "body": f"LOSSLESS BODY {canonical_index:02d}\nsecond line",
+                "attachments": [],
+            })
+        return json.dumps({"batch": True, "items": items})
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        nonlocal model_rounds
+        model_rounds += 1
+        if model_rounds == 1:
+            call = {"name": "search_emails", "arguments": json.dumps({
+                "query": "synthetic", "account": "work", "max_results": 20,
+                "folders": ["INBOX", "Sent", "Archive"],
+            })}
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        elif model_rounds == 2:
+            call = {"name": "create_document", "arguments": json.dumps({
+                "title": "All synthetic emails",
+                "language": "markdown",
+                "content": "A model-written summary containing only three messages.",
+            })}
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        else:
+            yield 'data: {"delta": "Document created."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        if block.tool_type == "create_document":
+            title, language, content = block.content.split("\n", 2)
+            payload = {"title": title, "language": language, "content": content}
+        else:
+            payload = json.loads(block.content)
+        executed.append((block.tool_type, payload))
+        if block.tool_type == "mcp__email__search_emails":
+            assert payload["max_results"] == agent_loop._EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS
+            assert "cursor" not in payload and "offset" not in payload
+            return block.tool_type, {
+                "stdout": _synthetic_search_output(targets), "stderr": "", "exit_code": 0,
+            }
+        if block.tool_type == "mcp__email__read_email":
+            return block.tool_type, {
+                "stdout": batch_payload(payload["targets"]), "stderr": "", "exit_code": 0,
+            }
+        return block.tool_type, {
+            "output": "SYNTHETIC_DOCUMENT_RESULT", "action": "create",
+            "doc_id": "lossless-doc", "title": payload["title"],
+            "language": payload["language"], "content": payload["content"],
+            "version": 1, "exit_code": 0,
+        }
+
+    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
+    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1",
+        "gpt-4o",
+        [{"role": "user", "content": (
+            "Create a Word document with all emails involving synthetic, "
+            "ordered chronologically."
+        )}],
+        max_rounds=20,
+        relevant_tools={"search_emails", "read_email", "create_document"},
+        owner="admin",
+        _is_teacher_run=True,
+    )]
+
+    read_payloads = [payload for tool, payload in executed if tool == "mcp__email__read_email"]
+    assert [len(payload["targets"]) for payload in read_payloads] == [20, 20, 7]
+    document = next(payload for tool, payload in executed if tool == "create_document")
+    content = document["content"]
+    assert document["title"] == "All synthetic emails"
+    assert content.count("<!-- odysseus-email-entry -->") == 31
+    assert "model-written summary" not in content
+    for index in range(31):
+        identity = f"<message-{index:02d}@example.test>"
+        assert content.count(identity) == 1
+        assert content.count(f"LOSSLESS BODY {index:02d}") == 1
+    assert content.index("<message-00@example.test>") < content.index("<message-30@example.test>")
+    assert any("Document created." in chunk for chunk in chunks)

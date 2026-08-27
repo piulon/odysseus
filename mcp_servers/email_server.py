@@ -1029,6 +1029,8 @@ def _read_email(uid=None, message_id=None, folder="INBOX", account=None):
         attachments = _list_attachments_from_msg(msg)
 
         sender_name, sender_addr = email.utils.parseaddr(sender)
+        to_str = _decode_header(msg.get("To", ""))
+        cc_str = _decode_header(msg.get("Cc", ""))
 
         return {
             "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
@@ -1039,6 +1041,8 @@ def _read_email(uid=None, message_id=None, folder="INBOX", account=None):
             "subject": subject,
             "from": sender_name or sender_addr,
             "from_address": sender_addr,
+            "to": to_str,
+            "cc": cc_str,
             "date": date_str,
             "body": body[:8000],
             "attachments": attachments,
@@ -2482,9 +2486,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "subject": result.get("subject", ""),
                         "from": result.get("from", ""),
                         "from_address": result.get("from_address", ""),
+                        "to": result.get("to", ""),
+                        "cc": result.get("cc", ""),
                         "date": result.get("date", ""),
                         "resolved_uid": result.get("uid"),
                         "resolved_message_id": result.get("message_id", ""),
+                        "resolved_folder": identity["folder"],
                         "resolved_account": result.get("account", "default"),
                         "resolved_account_email": result.get("account_email", ""),
                         "body": returned_body,

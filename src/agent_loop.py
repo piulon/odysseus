@@ -9,6 +9,7 @@ The LLM decides when to use tools by writing fenced code blocks.
 import asyncio
 import collections
 import datetime
+import hashlib
 import json
 import re
 import time
@@ -1737,7 +1738,7 @@ def _email_read_progress_from_result(
 
 
 def _email_document_items_from_result(block_content: str, result: Dict) -> list[Dict[str, str]]:
-    """Return substantive successful messages from one completed read call."""
+    """Return structured successful messages from one completed read call."""
     try:
         arguments = json.loads(block_content or "{}")
     except (TypeError, json.JSONDecodeError):
@@ -1763,15 +1764,27 @@ def _email_document_items_from_result(block_content: str, result: Dict) -> list[
             return []
         return [
             {
+                "uid": str(item.get("uid") or ""),
+                "message_id": str(item.get("message_id") or ""),
+                "folder": str(item.get("folder") or ""),
+                "account": str(item.get("account") or ""),
+                "resolved_uid": str(item.get("resolved_uid") or ""),
+                "resolved_message_id": str(item.get("resolved_message_id") or ""),
+                "resolved_folder": str(item.get("resolved_folder") or item.get("folder") or ""),
+                "resolved_account": str(item.get("resolved_account") or ""),
+                "resolved_account_email": str(item.get("resolved_account_email") or ""),
                 "subject": str(item.get("subject") or "(No subject)"),
                 "from": str(item.get("from") or item.get("from_address") or ""),
+                "from_address": str(item.get("from_address") or ""),
+                "to": str(item.get("to") or item.get("recipients") or ""),
+                "cc": str(item.get("cc") or ""),
                 "date": str(item.get("date") or ""),
-                "body": str(item.get("body") or "").strip(),
+                "body": str(item.get("body") or ""),
+                "attachments": item.get("attachments") if isinstance(item.get("attachments"), list) else [],
             }
             for item in items
             if isinstance(item, dict)
             and item.get("status") == "success"
-            and str(item.get("body") or "").strip()
         ]
 
     if not raw or result.get("error") or raw.lstrip().lower().startswith("error:"):
@@ -1792,10 +1805,127 @@ def _email_document_items_from_result(block_content: str, result: Dict) -> list[
     }]
 
 
+def _requires_lossless_email_document(text: str) -> bool:
+    """Limit deterministic corpus assembly to explicit exhaustive artifacts."""
+    if not _has_exhaustive_email_intent(text):
+        return False
+    normalized = unicodedata.normalize("NFKD", str(text or "").lower())
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    return bool(re.search(
+        r"\b(?:document|doc|word|list|listing|archive|history|"
+        r"documento|document|llista|lista|arxiu|archivo|historial)\b",
+        normalized,
+    ))
+
+
+def _deduplicate_email_document_items(items: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """Keep the first retrieved representation of each canonical RFC message."""
+    unique: list[Dict[str, Any]] = []
+    seen: Set[tuple[str, ...]] = set()
+    for item in items:
+        identity = _email_canonical_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(item)
+    return unique
+
+
+def _email_document_sort_key(item: Dict[str, Any]) -> tuple[Any, ...]:
+    """Sort valid RFC dates ascending; malformed/missing dates last, stably."""
+    original = str(item.get("date") or "").strip()
+    try:
+        parsed = parsedate_to_datetime(original)
+        if parsed is None:
+            raise ValueError("missing parsed date")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        timestamp = parsed.astimezone(datetime.timezone.utc)
+        return 0, timestamp, _email_canonical_identity(item)
+    except (TypeError, ValueError, OverflowError):
+        return (
+            1,
+            datetime.datetime.max.replace(tzinfo=datetime.timezone.utc),
+            original,
+            _email_canonical_identity(item),
+        )
+
+
+def _render_lossless_email_document(
+    items: list[Dict[str, Any]], *, discovery_complete: bool = True,
+) -> str:
+    """Render exactly one deterministic section per canonical retrieved email."""
+    unique = sorted(_deduplicate_email_document_items(items), key=_email_document_sort_key)
+    sections = []
+    for item in unique:
+        identity = _email_canonical_identity(item)
+        identity_text = (
+            identity[1]
+            if identity[0] == "message-id"
+            else "fallback-sha256:" + hashlib.sha256(
+                repr(identity).encode("utf-8")
+            ).hexdigest()
+        )
+        metadata = [f"**Canonical identity:** {identity_text}"]
+        for label, field in (
+            ("Folder", "resolved_folder"),
+            ("UID", "resolved_uid"),
+            ("Subject", "subject"),
+            ("From", "from"),
+            ("From address", "from_address"),
+            ("To", "to"),
+            ("Cc", "cc"),
+            ("Date", "date"),
+        ):
+            value = str(item.get(field) or "")
+            if value:
+                metadata.append(f"**{label}:** {value}")
+        attachments = item.get("attachments")
+        if isinstance(attachments, list) and attachments:
+            metadata.append("**Attachments:**")
+            for attachment in attachments:
+                if isinstance(attachment, dict):
+                    metadata.append(
+                        "- " + json.dumps(attachment, ensure_ascii=False, sort_keys=True)
+                    )
+        sections.append(
+            "<!-- odysseus-email-entry -->\n"
+            + "\n\n".join(metadata)
+            + "\n\n**Body:**\n\n"
+            + str(item.get("body") or "")
+        )
+    notice = ""
+    if not discovery_complete:
+        notice = (
+            "Discovery reached the email backend's bounded per-folder limit. "
+            "This document contains every unique successfully retrieved message, "
+            "but is not guaranteed to contain every mailbox match.\n\n"
+        )
+    return "# Retrieved emails\n\n" + notice + "\n\n---\n\n".join(sections)
+
+
 def _required_email_document_block(
-    items: list[Dict[str, str]], user_request: str,
+    items: list[Dict[str, str]], user_request: str, *, title: Optional[str] = None,
+    lossless: bool = False, discovery_complete: bool = True,
 ) -> Optional[ToolBlock]:
     """Build the required artifact directly from already retrieved email bodies."""
+    if lossless:
+        unique = _deduplicate_email_document_items(items)
+        if not unique:
+            return None
+        content = _render_lossless_email_document(
+            unique,
+            discovery_complete=discovery_complete,
+        )
+        document_title = title or "Retrieved emails"
+        if not discovery_complete:
+            document_title = "Retrieved email subset"
+        return function_call_to_tool_block("create_document", json.dumps({
+            "title": document_title,
+            "language": "markdown",
+            "content": content,
+        }, ensure_ascii=False))
+
     substantive = [item for item in items if str(item.get("body") or "").strip()]
     if not substantive:
         return None
@@ -3788,6 +3918,7 @@ async def stream_agent_loop(
     # user turns only for explicit continuations ("yes", "do it", "1").
     _retrieval_query = str(_intent.get("retrieval_query") or _last_user)
     _exhaustive_email_intent = _has_exhaustive_email_intent(_retrieval_query)
+    _lossless_email_document = _requires_lossless_email_document(_retrieval_query)
     logger.info(
         "[agent-intent] latest=%r continuation=%s low_signal=%s domains=%s active_doc_relevant=%s retrieval_query=%r",
         _last_user[:120],
@@ -5435,6 +5566,7 @@ async def stream_agent_loop(
     _email_retrieval_terminal: Set[tuple[str, str, str, str]] = set()
     _email_retrieval_usable: Set[tuple[str, str, str, str]] = set()
     _email_document_items: list[Dict[str, str]] = []
+    _email_discovery_complete = True
     # An email-backed document request remains incomplete until the model has
     # successfully called create_document after retrieval becomes ready.
     _email_document_creation_pending = False
@@ -6466,6 +6598,8 @@ async def stream_agent_loop(
             _required_document_block = _required_email_document_block(
                 _email_document_items,
                 _last_user,
+                lossless=_lossless_email_document,
+                discovery_complete=_email_discovery_complete,
             )
             if _required_document_block is not None:
                 tool_blocks.append(_required_document_block)
@@ -6911,6 +7045,28 @@ async def stream_agent_loop(
                         ),
                     )
 
+        if _email_document_creation_pending and _lossless_email_document:
+            for _index, _block in enumerate(tool_blocks):
+                if _block.tool_type != "create_document":
+                    continue
+                _model_title = (_block.content.split("\n", 1)[0] or "").strip()
+                _lossless_block = _required_email_document_block(
+                    _email_document_items,
+                    _retrieval_query,
+                    title=_model_title or None,
+                    lossless=True,
+                    discovery_complete=_email_discovery_complete,
+                )
+                if _lossless_block is not None:
+                    tool_blocks[_index] = _lossless_block
+                    logger.info(
+                        "[agent] replaced model document body with deterministic "
+                        "email corpus retrieved=%d unique=%d",
+                        len(_email_document_items),
+                        len(_deduplicate_email_document_items(_email_document_items)),
+                    )
+                break
+
         # ── Loop-breaker (Terminus-style stall detector) ──────────────
         # Stall detector for repeated no-progress tool loops.
         # A round is "useless" ONLY when it re-issues a recent tool call AND
@@ -7168,6 +7324,8 @@ async def stream_agent_loop(
                     "search_emails", "list_emails",
                 } and not result.get("error"):
                     _found_targets = _email_search_targets_from_result(block.content, result)
+                    if _email_search_result_is_incomplete(result):
+                        _email_discovery_complete = False
                     if _found_targets:
                         _email_retrieval_expected.update(_found_targets)
                         logger.info(
