@@ -140,6 +140,73 @@ def test_generic_recent_email_browsing_keeps_list_emails_available(monkeypatch):
     assert executed == ["mcp__email__list_emails"]
 
 
+def test_sender_search_is_seeded_and_clamped_for_mcp_schemas(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas = []
+    executed = []
+
+    class _FakeMcp:
+        pass
+
+    monkeypatch.setattr(agent_loop, "get_mcp_manager", lambda: _FakeMcp(), raising=False)
+    monkeypatch.setattr(agent_loop, "_load_mcp_disabled_map", lambda: {}, raising=False)
+    monkeypatch.setattr(agent_loop, "FUNCTION_TOOL_SCHEMAS", [], raising=False)
+    monkeypatch.setattr(
+        agent_loop,
+        "_build_system_prompt",
+        lambda messages, *args, **kwargs: (
+            messages,
+            [
+                {"type": "function", "function": {"name": "mcp__email__search_emails"}},
+                {"type": "function", "function": {"name": "mcp__email__list_emails"}},
+                {"type": "function", "function": {"name": "mcp__email__list_email_accounts"}},
+            ],
+        ),
+        raising=False,
+    )
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        if len(schemas) == 1:
+            yield "data: " + json.dumps({
+                "type": "tool_calls",
+                "calls": [{
+                    "name": "mcp__email__search_emails",
+                    "arguments": json.dumps({"query": "niniprimer@gmail.com"}),
+                }],
+            }) + "\n\n"
+        else:
+            yield 'data: {"delta": "Done."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append((block.tool_type, json.loads(block.content)))
+        return block.tool_type, {"output": "Found 1 email.", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+    user_text = "Busca el correu més recent de niniprimer@gmail.com i digues-me només la data i l'assumpte."
+
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1/chat/completions", "qwen3:14b",
+        [{"role": "user", "content": user_text}],
+        max_rounds=2,
+        relevant_tools={"list_email_accounts"},
+        owner="admin",
+    ))
+
+    assert agent_loop._explicit_email_sender_address(user_text) == "niniprimer@gmail.com"
+    assert schemas[0] == {"mcp__email__search_emails"}
+    assert schemas[1] == {
+        "mcp__email__search_emails",
+        "mcp__email__list_emails",
+        "mcp__email__list_email_accounts",
+    }
+    assert executed == [
+        ("mcp__email__search_emails", {"query": "niniprimer@gmail.com"}),
+    ]
+
+
 @pytest.mark.parametrize("user_text", [
     "Crea'm un document Word amb tots els correus de sender@example.com, ordenats per data.",
     "Crea un documento Word con todos los correos de sender@example.com, ordenados por fecha.",

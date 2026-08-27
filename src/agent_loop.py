@@ -1983,6 +1983,14 @@ def _explicit_email_sender_address(text: str) -> Optional[str]:
     return match.group("address") if match else None
 
 
+def _logical_tool_name(name: Any) -> str:
+    """Normalize a registered tool name for narrow routing comparisons."""
+    value = str(name or "")
+    if value.startswith("mcp__email__"):
+        return value[len("mcp__email__"):]
+    return value
+
+
 def _classify_agent_request(
     messages: List[Dict],
     last_user: str,
@@ -5575,12 +5583,11 @@ async def stream_agent_loop(
     # successfully called create_document after retrieval becomes ready.
     _email_document_creation_pending = False
     _email_document_creation_retry_done = False
-    if (
-        not guide_only
-        and _explicit_email_sender
-        and _relevant_tools is not None
-        and "search_emails" in _relevant_tools
-    ):
+    if not guide_only and _explicit_email_sender:
+        if _relevant_tools is None:
+            from src.tool_index import ALWAYS_AVAILABLE
+            _relevant_tools = set(ALWAYS_AVAILABLE)
+        _relevant_tools.add("search_emails")
         _required_first_retrieval_tool = "search_emails"
         logger.info(
             "[agent-intent] explicit email sender requires first retrieval "
@@ -5928,7 +5935,8 @@ async def stream_agent_loop(
                 ]
                 _mcp_filtered = [
                     s for s in mcp_schemas
-                    if s.get("function", {}).get("name") in _relevant_tools
+                    if _logical_tool_name(s.get("function", {}).get("name"))
+                    in {_logical_tool_name(name) for name in _relevant_tools}
                 ]
                 all_tool_schemas = base_schemas + _mcp_filtered
             else:
@@ -5988,7 +5996,8 @@ async def stream_agent_loop(
         if _round_tool_restriction:
             _restricted_schemas = [
                 schema for schema in (all_tool_schemas or [])
-                if schema.get("function", {}).get("name") in _round_tool_restriction
+                if _logical_tool_name(schema.get("function", {}).get("name"))
+                in _round_tool_restriction
             ]
             if _restricted_schemas:
                 all_tool_schemas = _restricted_schemas
