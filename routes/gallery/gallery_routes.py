@@ -20,6 +20,11 @@ from src.upload_limits import (
 )
 from src.constants import GENERATED_IMAGES_DIR
 from src.optional_deps import patch_realesrgan_torchvision_compat
+from src.realesrgan_models import (
+    RealESRGANModelError,
+    verified_gfpgan_model,
+    verified_realesrgan_model,
+)
 
 from routes.gallery.gallery_helpers import (
     GalleryPatch, _extract_exif, _image_to_dict, _owner_filter, _human_size,
@@ -1519,12 +1524,23 @@ def setup_gallery_routes() -> APIRouter:
             return {"error": "realesrgan not installed. Install it from Cookbook → Dependencies (search 'realesrgan')."}
         try:
             # General-purpose lightweight model with denoise control.
+            # Real-ESRGAN DNI requires both the normal and weak-denoise
+            # checkpoints. Runtime requests never download model files.
+            general_path = verified_realesrgan_model(
+                "realesr-general-x4v3.pth"
+            )
+            weak_path = verified_realesrgan_model(
+                "realesr-general-wdn-x4v3.pth"
+            )
             from realesrgan.archs.srvgg_arch import SRVGGNetCompact
             model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
                                     num_conv=32, upscale=4, act_type='prelu')
             upsampler = RealESRGANer(
                 scale=4,
-                model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth',
+                model_path=[
+                    str(general_path),
+                    str(weak_path),
+                ],
                 dni_weight=[strength, 1.0 - strength],
                 model=model,
                 tile=400, tile_pad=10, pre_pad=0, half=False,
@@ -1535,6 +1551,16 @@ def setup_gallery_routes() -> APIRouter:
             buf = io.BytesIO()
             out_img.save(buf, format="PNG")
             return {"image": base64.b64encode(buf.getvalue()).decode()}
+        except RealESRGANModelError:
+            logger.warning(
+                "Denoise blocked: Real-ESRGAN checkpoint missing or invalid"
+            )
+            return {
+                "error": (
+                    "Real-ESRGAN model files are missing or invalid. "
+                    "Reinstall realesrgan from Cookbook → Dependencies."
+                )
+            }
         except Exception:
             logger.warning("Denoise failed", exc_info=True)
             return {"error": "Denoise failed"}
@@ -1569,11 +1595,14 @@ def setup_gallery_routes() -> APIRouter:
         except ImportError:
             return {"error": "realesrgan not installed. Install it from Cookbook → Dependencies (search 'realesrgan')."}
         try:
+            model_path = verified_realesrgan_model(
+                "RealESRGAN_x4plus.pth"
+            )
             model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
                             num_block=23, num_grow_ch=32, scale=4)
             upsampler = RealESRGANer(
                 scale=4,
-                model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth',
+                model_path=str(model_path),
                 model=model,
                 tile=400, tile_pad=10, pre_pad=0, half=False,
             )
@@ -1583,6 +1612,16 @@ def setup_gallery_routes() -> APIRouter:
             buf = io.BytesIO()
             out_img.save(buf, format="PNG")
             return {"image": base64.b64encode(buf.getvalue()).decode()}
+        except RealESRGANModelError:
+            logger.warning(
+                "AI upscale blocked: Real-ESRGAN checkpoint missing or invalid"
+            )
+            return {
+                "error": (
+                    "Real-ESRGAN model files are missing or invalid. "
+                    "Reinstall realesrgan from Cookbook → Dependencies."
+                )
+            }
         except Exception:
             logger.warning("AI upscale failed", exc_info=True)
             return {"error": "AI upscale failed"}
@@ -1646,15 +1685,15 @@ def setup_gallery_routes() -> APIRouter:
             from rembg import remove
             cut = remove(crop)
         except ImportError:
-            try:
-                from transformers import pipeline
-                pipe = pipeline("image-segmentation", model="briaai/RMBG-1.4", trust_remote_code=True)
-                mask_img = pipe(crop, return_mask=True).convert("L")
-                tmp = crop.copy()
-                tmp.putalpha(mask_img)
-                cut = tmp
-            except Exception:
-                return {"error": "No background removal model available. Install rembg: pip install rembg"}
+            # Do not fall back to Hugging Face models with remote-code
+            # execution. Background removal is an explicit optional
+            # dependency: operators must install rembg deliberately.
+            return {
+                "error": (
+                    "No background removal model available. "
+                    "Install rembg from Cookbook → Dependencies."
+                )
+            }
 
         # Compose the cropped result back into a full-size transparent canvas.
         if bbox:
@@ -1700,18 +1739,24 @@ def setup_gallery_routes() -> APIRouter:
         # Try GFPGAN first (AI face restoration)
         try:
             from gfpgan import GFPGANer
+            from src.realesrgan_models import (
+                verified_facexlib_model_root,
+            )
             import cv2
 
-            model_path = os.path.join(tempfile.gettempdir(), "gfpgan_models")
-            os.makedirs(model_path, exist_ok=True)
+            facexlib_model_root = verified_facexlib_model_root()
 
             restorer = GFPGANer(
-                model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
+                model_path=str(
+                    verified_gfpgan_model()
+                ),
                 upscale=1,
                 arch="clean",
                 channel_multiplier=2,
                 bg_upsampler=None,
-                model_rootpath=model_path,
+                model_rootpath=str(
+                    facexlib_model_root
+                ),
             )
 
             img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)

@@ -8,6 +8,7 @@ import hashlib
 import threading
 import re
 import os
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from fastapi import HTTPException
 from typing import Optional, Dict, List, Tuple
@@ -508,6 +509,25 @@ def _is_ollama_openai_compat_url(url: str) -> bool:
     return local_ollama_host and (path == "/v1" or path.startswith("/v1/"))
 
 
+def _apply_ollama_openai_compat_reasoning_policy(
+    payload: Dict,
+    url: str,
+    model: str,
+) -> None:
+    """Disable reasoning on Ollama's OpenAI-compatible /v1 surface.
+
+    Native Ollama /api uses ``think``.  Its OpenAI-compatible /v1 API uses
+    ``reasoning_effort`` instead.  Keep this policy narrowly gated so no
+    Ollama-specific parameter leaks to unrelated OpenAI-compatible endpoints.
+    """
+    if (
+        _is_ollama_openai_compat_url(url)
+        and _supports_thinking(model)
+    ):
+        payload.pop("think", None)
+        payload["reasoning_effort"] = "none"
+
+
 def _ollama_api_root(url: str) -> str:
     """Return a native Ollama API root such as https://ollama.com/api."""
     url = (url or "").strip().rstrip("/")
@@ -679,6 +699,12 @@ def _build_ollama_payload(
         payload["options"] = options
     if tools:
         payload["tools"] = tools
+
+    # Disable Qwen/Gemma reasoning in Ollama native API when using tools.
+    # Reasoning can prevent or swallow structured tool calls.
+    if tools and _supports_thinking(model):
+        payload["think"] = False
+
     return payload
 
 
@@ -1351,7 +1377,15 @@ def _convert_openai_content_to_anthropic(content):
     return converted
 
 
-def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=False, tools=None):
+def _build_anthropic_payload(
+    model,
+    messages,
+    temperature,
+    max_tokens,
+    stream=False,
+    tools=None,
+    tool_choice_name=None,
+):
     """Convert OpenAI-style messages to Anthropic format."""
     system_parts = []
     chat_messages = []
@@ -1436,6 +1470,14 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
             # The breakpoint caches all tool defs preceding it in the request.
             anthropic_tools[-1]["cache_control"] = {"type": "ephemeral"}
             payload["tools"] = anthropic_tools
+            if (
+                tool_choice_name
+                and any(t.get("name") == tool_choice_name for t in anthropic_tools)
+            ):
+                payload["tool_choice"] = {
+                    "type": "tool",
+                    "name": tool_choice_name,
+                }
     return payload
 
 def _build_anthropic_headers(headers):
@@ -1856,6 +1898,9 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
+        _apply_ollama_openai_compat_reasoning_policy(
+            payload, url, model
+        )
         _apply_local_generation_stability(payload, target_url, model)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
@@ -1938,21 +1983,47 @@ def llm_call_with_fallback(candidates, messages, **kwargs) -> str:
     raise last_err if last_err else HTTPException(503, "All fallback candidates failed")
 
 
-async def llm_call_async_with_fallback(candidates, messages, **kwargs) -> str:
-    """Async variant of `llm_call_with_fallback` — same semantics."""
+@dataclass(frozen=True)
+class LLMFallbackResult:
+    """Response and non-sensitive identity of the candidate that answered."""
+
+    response: str
+    model: str
+    endpoint_url: str
+    candidate_index: int
+
+
+async def llm_call_async_with_fallback_result(
+    candidates, messages, **kwargs
+) -> LLMFallbackResult:
+    """Run an async fallback chain and identify the candidate that answered."""
     cands = _dedupe_candidates(candidates)
     if not cands:
         raise HTTPException(503, "No model endpoint configured")
     last_err = None
     for i, (url, model, headers) in enumerate(cands):
         try:
-            return await llm_call_async(url, model, messages, headers=headers, **kwargs)
+            response = await llm_call_async(
+                url, model, messages, headers=headers, **kwargs
+            )
+            return LLMFallbackResult(
+                response=response,
+                model=model,
+                endpoint_url=url,
+                candidate_index=i,
+            )
         except Exception as e:
             last_err = e
             tag = "primary" if i == 0 else "candidate"
             logger.warning(f"[fallback] {tag} {model} failed ({type(e).__name__}); trying next")
             continue
     raise last_err if last_err else HTTPException(503, "All fallback candidates failed")
+
+
+async def llm_call_async_with_fallback(candidates, messages, **kwargs) -> str:
+    """Async fallback call preserving the legacy string return contract."""
+    result = await llm_call_async_with_fallback_result(candidates, messages, **kwargs)
+    return result.response
 
 
 async def llm_call_async(
@@ -2066,9 +2137,9 @@ async def llm_call_async(
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
-        # Suppress thinking for qwen3/gemma4 on Ollama /v1 — same as stream_llm.
-        if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
-            payload["think"] = False
+        _apply_ollama_openai_compat_reasoning_policy(
+            payload, url, model
+        )
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         _apply_local_cache_affinity(payload, url, session_id)
@@ -2225,7 +2296,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                      tool_choice_none: bool = False, workload: str = "foreground",
-                     typed_errors: bool = False, safe_logs: bool = False):
+                     typed_errors: bool = False, safe_logs: bool = False,
+                     tool_choice_name: Optional[str] = None):
     safe_logs = bool(safe_logs or typed_errors)
     target_url = _stream_target_url(url)
     async with _local_model_slot(target_url, model, workload):
@@ -2243,6 +2315,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             tool_choice_none=tool_choice_none,
             typed_errors=typed_errors,
             safe_logs=safe_logs,
+            tool_choice_name=tool_choice_name,
         ):
             if typed_errors and chunk.startswith("event: error"):
                 # Provider-specific guards that still emit an SSE error are
@@ -2261,7 +2334,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                             tool_choice_none: bool = False, typed_errors: bool = False,
-                            safe_logs: bool = False):
+                            safe_logs: bool = False,
+                            tool_choice_name: Optional[str] = None):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -2299,7 +2373,15 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
-        payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
+        payload = _build_anthropic_payload(
+            model,
+            messages_copy,
+            temperature,
+            max_tokens,
+            stream=True,
+            tools=tools,
+            tool_choice_name=tool_choice_name,
+        )
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
         h = {"Content-Type": "application/json"}
@@ -2330,6 +2412,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             payload[tok_key] = max_tokens
         if tools:
             payload["tools"] = tools
+            if tool_choice_name:
+                payload["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tool_choice_name},
+                }
         elif tool_choice_none:
             payload["tool_choice"] = "none"
         # Mistral thinking-capable models — send reasoning_effort so Mistral
@@ -2338,11 +2425,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         # (high / medium / low / none); default "high".
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
-        # For Ollama's OpenAI-compat /v1 endpoint with thinking models (qwen3,
-        # gemma4, etc.), suppress thinking so tool calls aren't swallowed inside
-        # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
-        if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
-            payload["think"] = False
+        # Keep Ollama /v1 reasoning disabled using its OpenAI-compatible
+        # control rather than the native /api ``think`` parameter.
+        _apply_ollama_openai_compat_reasoning_policy(
+            payload, url, model
+        )
         _apply_local_cache_affinity(payload, url, session_id)
         _apply_local_generation_stability(payload, target_url, model)
         h = _provider_headers(provider, headers)
@@ -3014,6 +3101,11 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
 
     Yields the same SSE chunk protocol as stream_llm.
     """
+    routing_trace = kwargs.pop("_routing_trace", None)
+    routing_lane = kwargs.pop("_routing_lane", "chat")
+    routing_endpoint_id = kwargs.pop("_routing_endpoint_id", None)
+    from src.routing_observability import log_llm_dispatch, log_routing_fallback
+
     cands = _dedupe_candidates(candidates)
     if not cands:
         yield f'event: error\ndata: {json.dumps({"error": "No model endpoint configured", "status": 503})}\n\n'
@@ -3023,6 +3115,13 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
     last_error = None
     for i, (url, model, headers) in enumerate(cands):
         is_last = (i == len(cands) - 1)
+        log_llm_dispatch(
+            routing_trace,
+            lane=routing_lane,
+            endpoint_id=routing_endpoint_id if i == 0 else None,
+            model=model,
+            endpoint_url=url,
+        )
         emitted = False
         retried = False
         pending_metadata = []
@@ -3034,6 +3133,13 @@ async def stream_llm_with_fallback(candidates, messages, **kwargs):
                     last_error = chunk
                     retried = True
                     if i == 0:
+                        if len(cands) > 1:
+                            log_routing_fallback(
+                                routing_trace,
+                                from_model=model,
+                                to_model=cands[1][1],
+                                reason="primary_dispatch_failed_before_output",
+                            )
                         logger.warning(f"[fallback] primary {model} failed before output; trying fallback")
                     else:
                         logger.warning(f"[fallback] candidate {model} failed; trying next")

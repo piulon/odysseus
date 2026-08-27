@@ -37,6 +37,7 @@ try:
     from src.agent_loop import (
         _detect_admin_intent,
         _classify_agent_request,
+        _is_ask_user_followup,
         _compute_final_metrics,
         _append_tool_results,
         _insert_before_latest_user,
@@ -498,3 +499,179 @@ class TestWebSearchSourcesKeyLookup:
         src_text = result.get("output") or result.get("results") or result.get("stdout") or ""
         assert src_text != ""
         assert "SOURCES" in src_text
+
+
+def test_spanish_explicit_web_request_classifies_as_web():
+    intent = _classify_agent_request(
+        [],
+        "Busca noticias sobre NVIDIA",
+    )
+    assert intent["low_signal"] is False
+    assert "web" in intent["domains"]
+
+
+def test_catalan_explicit_web_request_classifies_as_web():
+    intent = _classify_agent_request(
+        [],
+        "Cerca les últimes notícies sobre IA",
+    )
+    assert intent["low_signal"] is False
+    assert "web" in intent["domains"]
+
+
+def test_spanish_search_word_in_non_web_context_does_not_classify_as_web():
+    intent = _classify_agent_request(
+        [],
+        "Explícame el algoritmo de búsqueda binaria",
+    )
+    assert "web" not in intent["domains"]
+
+
+def test_catalan_search_word_in_non_web_context_does_not_classify_as_web():
+    intent = _classify_agent_request(
+        [],
+        "Explica què és la cerca binària",
+    )
+    assert "web" not in intent["domains"]
+
+
+def _ask_user_followup_messages(answer: str):
+    """Conversation where the immediately preceding assistant turn used ask_user."""
+    return [
+        {
+            "role": "user",
+            "content": (
+                "Busca els correus rebuts de odysseus-regression-fixture@gmail.com, "
+                "ordena'ls per data i crea un document Word."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": (
+                "Vols que busqui els correus electrònics rebuts de "
+                "odysseus-regression-fixture@gmail.com i els ordeni per data?"
+            ),
+            "metadata": {
+                "tool_events": [
+                    {
+                        "round": 1,
+                        "tool": "ask_user",
+                        "ask_user": {
+                            "question": (
+                                "Vols que busqui els correus electrònics rebuts de "
+                                "odysseus-regression-fixture@gmail.com i els ordeni per data?"
+                            ),
+                            "options": [
+                                {"label": "Sí"},
+                                {"label": "No"},
+                            ],
+                            "multi": False,
+                        },
+                    }
+                ]
+            },
+        },
+        {"role": "user", "content": answer},
+    ]
+
+
+def test_ask_user_yes_reply_is_structural_continuation():
+    messages = _ask_user_followup_messages("Sí")
+
+    intent = _classify_agent_request(messages, "Sí")
+
+    assert intent["continuation"] is True
+    assert intent["low_signal"] is False
+    assert "email" in intent["domains"]
+    assert "odysseus-regression-fixture@gmail.com" in intent["retrieval_query"]
+
+
+def test_ask_user_freeform_reply_is_structural_continuation():
+    answer = "Només els del 2025"
+    messages = _ask_user_followup_messages(answer)
+
+    intent = _classify_agent_request(messages, answer)
+
+    assert intent["continuation"] is True
+    assert intent["low_signal"] is False
+    assert "email" in intent["domains"]
+    assert "odysseus-regression-fixture@gmail.com" in intent["retrieval_query"]
+
+
+def test_first_session_turn_ignores_foreign_structured_ask_user_context():
+    current = {"role": "user", "content": "Create a document from my emails."}
+    foreign = _ask_user_followup_messages("Sí")[1]
+    prompt_messages = [foreign, current]
+
+    intent = _classify_agent_request(
+        prompt_messages,
+        current["content"],
+        conversation_messages=[current],
+    )
+
+    assert _is_ask_user_followup([current]) is False
+    assert intent["continuation"] is False
+
+
+def test_first_session_turn_ignores_synthetic_ask_user_shaped_context():
+    current = {"role": "user", "content": "Create a document from my emails."}
+    synthetic = {
+        "role": "assistant",
+        "content": "Recalled note: what would you like me to do?",
+        "metadata": _ask_user_followup_messages("Sí")[1]["metadata"],
+    }
+
+    intent = _classify_agent_request(
+        [synthetic, current],
+        current["content"],
+        conversation_messages=[current],
+    )
+
+    assert intent["continuation"] is False
+
+
+def test_invalid_structured_ask_user_payload_is_not_a_followup():
+    messages = [
+        {"role": "assistant", "metadata": {
+            "tool_events": [{"tool": "ask_user", "ask_user": {}}],
+        }},
+        {"role": "user", "content": "Sí"},
+    ]
+
+    assert _is_ask_user_followup(messages) is False
+
+
+def test_old_ask_user_does_not_leak_into_later_turns():
+    messages = [
+        {
+            "role": "user",
+            "content": "Busca els correus de odysseus-regression-fixture@gmail.com.",
+        },
+        {
+            "role": "assistant",
+            "content": "Vols que ho faci?",
+            "metadata": {
+                "tool_events": [
+                    {
+                        "round": 1,
+                        "tool": "ask_user",
+                        "ask_user": {
+                            "question": "Vols que ho faci?",
+                            "options": [
+                                {"label": "Sí"},
+                                {"label": "No"},
+                            ],
+                            "multi": False,
+                        },
+                    }
+                ]
+            },
+        },
+        {"role": "user", "content": "Sí"},
+        {"role": "assistant", "content": "D'acord."},
+        {"role": "user", "content": "Hola"},
+    ]
+
+    intent = _classify_agent_request(messages, "Hola")
+
+    assert intent["continuation"] is False

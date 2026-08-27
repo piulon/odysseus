@@ -89,6 +89,33 @@ FUNCTION_TOOL_SCHEMAS = [
             }
         }
     },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "homelab",
+            "description": "Inspect Homelab services through the read-only Homelab Operator API.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "status",
+                            "doctor",
+                            "service"
+                        ]
+                    },
+                    "service": {
+                        "type": "string",
+                        "description": "Service name when required."
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    },
+
     {
         "type": "function",
         "function": {
@@ -196,7 +223,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "create_document",
-            "description": "Create a new document in the editor panel. Use this when the user asks to write, create, build, make, or generate code, scripts, programs, games, apps, or any long-form or structured content that is more than a short paragraph, AND there is no already-open document/email draft that the request refers to. If an email compose draft is open, edit that draft instead of creating another document. NEVER put large generated content directly in chat — use this tool instead.",
+            "description": "Create a new editable document in the Odysseus editor panel. Use this when the user asks to write, create, build, make, or generate code, scripts, programs, games, apps, or any long-form or structured content that is more than a short paragraph, AND there is no already-open document/email draft that the request refers to. For a Word/DOCX request, create the actual document with this tool first; the resulting editor document can then be exported as Word/DOCX from the document UI. If an email compose draft is open, edit that draft instead of creating another document. NEVER put large generated content directly in chat — use this tool instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1056,7 +1083,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_email_accounts",
-            "description": "List configured email accounts. Use this before checking mail when the user names a mailbox/account such as Gmail, work, or a custom domain, then pass the returned account name/email/id to the other email tools.",
+            "description": "List configured email accounts. Use this before checking mail when the user explicitly names a mailbox/account such as Gmail, work, or a custom domain, then pass the returned account name/email/id to the other email tools. Do not use it merely because a request names a sender address (for example, emails/correos/correus from/de sender@example.com); that requires search_emails. After account discovery, continue the original task and do not infer send-email intent.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -1102,15 +1129,56 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_email",
-            "description": "Read the full content of a specific email by UID.",
+            "description": "Read email body content. Legacy single-message usage accepts uid. For a summary, document, or other task needing several known messages, pass all targets together in one bounded call instead of calling read_email once per message. A batch accepts at most 20 ordered targets and returns at most 40000 aggregate body characters.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "uid": {"type": "string", "description": "Email UID to read"},
+                    "message_id": {"type": "string", "description": "RFC Message-ID header value"},
                     "folder": {"type": "string", "description": "IMAP folder (default: INBOX)"},
                     "account": {"type": "string", "description": "Optional account name/email/id from list_email_accounts, especially when the UID came from a non-default mailbox"},
+                    "targets": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Ordered batch targets. Each target keeps its own UID/Message-ID, folder, and account.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "uid": {"type": "string"},
+                                "message_id": {"type": "string"},
+                                "folder": {"type": "string", "description": "Folder for this target (default: INBOX)"},
+                                "account": {"type": "string", "description": "Account name/email/id for this target"},
+                            },
+                            "anyOf": [
+                                {"required": ["uid"]},
+                                {"required": ["message_id"]},
+                            ],
+                        },
+                    },
                 },
-                "required": ["uid"]
+                "anyOf": [
+                    {"required": ["uid"]},
+                    {"required": ["message_id"]},
+                    {"required": ["targets"]},
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_emails",
+            "description": "Search emails by free-text query across inbox, sent, and archive. Matches sender, subject, and message body, and returns UIDs for read_email or reply_to_email. Use this when the user names a person or topic that may not be in the most recent inbox slice.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Free-text query matching sender, subject, and message body"},
+                    "folders": {"type": "array", "items": {"type": "string"}, "description": "Folders to search (default: INBOX, Sent, Archive)"},
+                    "max_results": {"type": "integer", "description": "Maximum results per folder (default: 20; exhaustive artifact workflows use the bounded ceiling of 100 because this tool has no pagination contract)"},
+                    "account": {"type": "string", "description": "Optional account name/email/id from list_email_accounts"},
+                },
+                "required": ["query"]
             }
         }
     },
@@ -1318,6 +1386,43 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         logger.warning(f"Non-object function call arguments for {name}: {args!r}; treating as empty")
         args = {}
 
+    # Defensive compatibility for a malformed shape emitted by some models.
+    # Keep `targets` as the only advertised/public batch contract; normalize
+    # the plural alias before MCP execution and readiness tracking see it.
+    if (
+        (name == "read_email" or tool_type == "mcp__email__read_email")
+        and "uids" in args
+    ):
+        if any(key in args for key in ("targets", "uid", "message_id")):
+            logger.warning(
+                "Rejecting ambiguous read_email arguments: uids cannot be combined "
+                "with targets, uid, or message_id"
+            )
+            return None
+        raw_uids = args.get("uids")
+        if not isinstance(raw_uids, list) or not raw_uids:
+            logger.warning("Rejecting read_email uids: expected a non-empty array")
+            return None
+        normalized_uids = []
+        for value in raw_uids:
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                logger.warning("Rejecting read_email uids: every UID must be a string or integer")
+                return None
+            uid = str(value).strip()
+            if not uid:
+                logger.warning("Rejecting read_email uids: UIDs cannot be empty")
+                return None
+            normalized_uids.append(uid)
+        targets = []
+        for uid in normalized_uids:
+            target = {"uid": uid}
+            if "folder" in args:
+                target["folder"] = args["folder"]
+            if "account" in args:
+                target["account"] = args["account"]
+            targets.append(target)
+        args = {"targets": targets}
+
     required_args = _REQUIRED_NATIVE_TOOL_ARGS.get(tool_type)
     if required_args and not any(str(args.get(key) or "").strip() for key in required_args):
         logger.warning(f"Rejecting empty required arguments for function call {name}: {args!r}")
@@ -1353,6 +1458,8 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         tf = args.get("time_filter")
         if content and isinstance(tf, str) and tf in ("day", "week", "month", "year"):
             content = json.dumps({"query": content, "time_filter": tf})
+    elif tool_type == "homelab":
+        content = json.dumps(args) if args else "{}"
     elif tool_type == "read_file":
         # Plain path (back-compat) unless a line range is requested → JSON.
         if args.get("offset") or args.get("limit"):

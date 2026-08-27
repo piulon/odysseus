@@ -47,7 +47,7 @@ ALWAYS_AVAILABLE = frozenset({
 # Tools that the Personal Assistant always has access to during scheduled
 # check-ins and proactive tasks, in addition to RAG-selected tools.
 ASSISTANT_ALWAYS_AVAILABLE = frozenset({
-    "list_email_accounts", "list_emails", "read_email", "send_email", "reply_to_email",
+    "list_email_accounts", "list_emails", "read_email", "search_emails", "send_email", "reply_to_email",
     "bulk_email", "archive_email", "delete_email", "mark_email_read",
     "manage_calendar", "manage_notes", "manage_tasks",
     "manage_memory", "web_search", "read_file",
@@ -109,6 +109,7 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "list_email_accounts": "List configured email accounts and default status. Use before reading or sending mail when the user mentions Gmail, work mail, custom domain mail, another mailbox, or asks to compare/check multiple inboxes.",
     "list_emails": "List emails for a folder/account, newest first, including read messages by default. Shows subject, sender, date, UID, account, and AI summary. Check inbox, find emails needing replies. Supports account from list_email_accounts for Gmail/work/custom mailboxes. For last/latest/newest email, use max_results=1 and unread_only=false.",
     "read_email": "Read the full content of a specific email by UID or Message-ID. View email body, check details. Supports account from list_email_accounts when the UID belongs to a non-default mailbox.",
+    "search_emails": "Search the user's mailbox across inbox, sent, and archive by sender, recipient, subject, topic, or message content. Use for finding emails in the mailbox, not web search.",
     "send_email": "Send a new email via SMTP. Provide recipient, subject, body, and optional account from list_email_accounts. For replying to a thread use reply_to_email instead.",
     "reply_to_email": "SEND a reply email immediately by UID. Do not use for write/draft/open/start reply requests; use ui_control open_email_reply with body so the user can review. Only use when the user explicitly says to send now. For send requests, use the exact UID and account from latest read_email/list_emails output; never invent UID 1. Threads automatically with In-Reply-To/References, prefixes Re:, marks original as Answered.",
     "archive_email": "Move an email out of the inbox into the Archive folder. Use after handling messages you want to keep but get out of the way.",
@@ -135,6 +136,7 @@ BUILTIN_TOOL_DESCRIPTIONS: Dict[str, str] = {
     "app_api": "Generic loopback to allowed Odysseus internal endpoints. Use this when the user wants something the UI can do but there's no named tool for it. Covers calendar, gallery, library/documents, memory, notes, tasks, settings, research, compare, cookbook GPUs/state — allowed UI buttons hit /api/* endpoints and you can hit them too. Sensitive auth/user/admin/shell paths and host-control Cookbook mutation routes are blocked; do NOT use app_api for shell commands, package installs, engine rebuilds, or PID signalling. Use named command tooling for shell commands. action='endpoints' with filter=<keyword> lists available endpoints. action='call' takes method+path+body. Hits same routes the UI uses — auth flows free. NOTE: themes are NOT an API endpoint — use the ui_control tool (create_theme / set_theme), not app_api. SESSIONS/CHATS: do NOT use app_api for these — GET /api/sessions returns EMPTY for tool calls (it's owner-filtered and tool calls authenticate as a different identity). EMAIL ACCOUNTS: do NOT use /api/email/accounts via app_api; use list_email_accounts, list_emails, and read_email instead. To list/rename/archive/delete/fork chats use the list_sessions and manage_session tools instead.",
     "edit_image": "Edit an image in the gallery: upscale (increase resolution), remove background (rembg), inpaint (fill selected area), or harmonize (blend edits). Specify image ID and action.",
     "trigger_research": "Start a deep research job on any topic — appears in the Deep Research sidebar, streams progress, produces a detailed report. Use for 'research X', 'look into Y', 'do deep research on Z', 'investigate'. NOT a scheduled task — it runs now and surfaces in the sidebar.",
+    "homelab": "Inspect the local homelab through the read-only Homelab Operator API. Check overall status, inspect one service and run diagnostics. This tool cannot start, stop or restart services.",
     "manage_bg_jobs": "Inspect and control detached background `bash` jobs (the ones started with a `#!bg` marker). action='list' shows this chat's jobs (id/status/age/command); action='output' returns a job's captured output so far (check on a long-running job, or re-read a finished one); action='kill' stops a runaway job by id. Use for 'is the background job done', 'check on that job', 'show the build output', 'kill the background job', 'stop the bg task'. output/kill need a job_id from list.",
 }
 
@@ -347,7 +349,7 @@ class ToolIndex:
         # whole email toolset and crowding out the relevant tools — the model then
         # believed it had only email tools and refused web/other tasks (#1707).
         frozenset({"email", "emails", "mail", "mails", "gmail", "googlemail", "message", "messages", "send", "reply", "replies", "inbox", "unread"}):
-            {"list_email_accounts", "list_emails", "read_email", "send_email", "reply_to_email", "bulk_email", "delete_email", "archive_email", "mark_email_read", "resolve_contact", "ui_control"},
+            {"list_email_accounts", "list_emails", "read_email", "search_emails", "send_email", "reply_to_email", "bulk_email", "delete_email", "archive_email", "mark_email_read", "resolve_contact", "ui_control"},
         frozenset({"calendar", "event", "meeting", "schedule", "appointment"}):
             {"manage_calendar"},
         # Detached background `bash` jobs (#!bg): check on / read output / kill.

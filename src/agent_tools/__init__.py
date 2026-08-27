@@ -27,6 +27,7 @@ from .interaction_tools import AskUserTool, UpdatePlanTool
 from .model_interaction_tools import ChatWithModelTool, AskTeacherTool, ListModelsTool
 from .bg_job_tools import ManageBgJobsTool
 from .session_tools import CreateSessionTool, ListSessionsTool, SendToSessionTool, ManageSessionTool
+from .homelab_tools import HomelabTool
 from .admin_tools import (
     ADMIN_TOOL_HANDLERS,
     do_manage_endpoints, do_manage_mcp, do_manage_webhooks,
@@ -56,6 +57,7 @@ TOOL_HANDLERS = {
     "ask_teacher": AskTeacherTool().execute,
     "list_models": ListModelsTool().execute,
     "manage_bg_jobs": ManageBgJobsTool().execute,
+    "homelab": HomelabTool().execute,
     "create_session": CreateSessionTool().execute,
     "list_sessions": ListSessionsTool().execute,
     "send_to_session": SendToSessionTool().execute,
@@ -74,7 +76,7 @@ PYTHON_TIMEOUT = 30
 
 # Tool types that trigger execution
 TOOL_TAGS = {"bash", "python", "web_search", "web_fetch", "read_file", "write_file", "edit_file",
-             "grep", "glob", "ls", "get_workspace", "manage_bg_jobs",
+             "grep", "glob", "ls", "get_workspace", "manage_bg_jobs", "homelab",
              "create_document", "update_document", "edit_document",
              "search_chats",
              "chat_with_model", "create_session", "list_sessions",

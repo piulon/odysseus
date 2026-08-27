@@ -12,11 +12,12 @@ def _load_setup_module():
     return module
 
 
-def test_create_default_admin_normalizes_env_username(tmp_path, monkeypatch):
+def test_create_default_admin_normalizes_env_username(tmp_path, monkeypatch, capsys):
     setup_module = _load_setup_module()
     monkeypatch.setattr(setup_module, "AUTH_FILE", str(tmp_path / "auth.json"))
     monkeypatch.setenv("ODYSSEUS_ADMIN_USER", " AdminUser ")
-    monkeypatch.setenv("ODYSSEUS_ADMIN_PASSWORD", "temporary-password")
+    secret = "temporary-password"
+    monkeypatch.setenv("ODYSSEUS_ADMIN_PASSWORD", secret)
 
     assert setup_module.create_default_admin() == "created"
 
@@ -25,13 +26,17 @@ def test_create_default_admin_normalizes_env_username(tmp_path, monkeypatch):
     assert "adminuser" in data["users"]
     assert "AdminUser" not in data["users"]
 
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert "Temporary password" not in captured.out
+
 
 def test_main_loads_admin_password_from_env_file(tmp_path, monkeypatch):
     """Regression: setup.py must honor an admin password pre-seeded in .env on
     native installs, even when the var is not exported into the shell
     (docs/setup.md documents this). Previously setup.py never called
-    load_dotenv(), so os.getenv() saw nothing and a random password was
-    generated instead."""
+    load_dotenv(), so os.getenv() could not see the deployment credential."""
     import bcrypt
 
     setup_module = _load_setup_module()
@@ -58,7 +63,7 @@ def test_main_loads_admin_password_from_env_file(tmp_path, monkeypatch):
     monkeypatch.setenv("ODYSSEUS_SKIP_ADMIN_PROMPT", "1")
 
     try:
-        setup_module.main()
+        assert setup_module.main() == 0
     finally:
         # load_dotenv writes real os.environ entries; undo so sibling tests
         # don't inherit them.
@@ -70,3 +75,148 @@ def test_main_loads_admin_password_from_env_file(tmp_path, monkeypatch):
     assert bcrypt.checkpw(
         b"fromenvfile12345", data["users"]["presetuser"]["password_hash"].encode()
     ), "admin password from .env was ignored; a random one was generated"
+
+
+def test_create_default_admin_fails_closed_without_noninteractive_password(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    setup_module = _load_setup_module()
+    auth_path = tmp_path / "auth.json"
+
+    monkeypatch.setattr(
+        setup_module,
+        "AUTH_FILE",
+        str(auth_path),
+    )
+    monkeypatch.delenv(
+        "ODYSSEUS_ADMIN_USER",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "ODYSSEUS_ADMIN_PASSWORD",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "ODYSSEUS_SKIP_ADMIN_PROMPT",
+        "1",
+    )
+
+    assert setup_module.create_default_admin() == "failed"
+    assert not auth_path.exists()
+
+    captured = capsys.readouterr()
+
+    assert (
+        "ODYSSEUS_ADMIN_PASSWORD is required"
+        in captured.out
+    )
+    assert "Temporary password" not in captured.out
+
+
+def test_create_default_admin_rejects_short_env_password(
+    tmp_path,
+    monkeypatch,
+):
+    setup_module = _load_setup_module()
+    auth_path = tmp_path / "auth.json"
+
+    monkeypatch.setattr(
+        setup_module,
+        "AUTH_FILE",
+        str(auth_path),
+    )
+    monkeypatch.setenv(
+        "ODYSSEUS_ADMIN_USER",
+        "admin",
+    )
+    monkeypatch.setenv(
+        "ODYSSEUS_ADMIN_PASSWORD",
+        "short",
+    )
+    monkeypatch.setenv(
+        "ODYSSEUS_SKIP_ADMIN_PROMPT",
+        "1",
+    )
+
+    assert setup_module.create_default_admin() == "failed"
+    assert not auth_path.exists()
+
+
+def test_create_default_admin_rejects_reserved_env_username(
+    tmp_path,
+    monkeypatch,
+):
+    setup_module = _load_setup_module()
+    auth_path = tmp_path / "auth.json"
+
+    reserved = sorted(
+        setup_module.RESERVED_USERNAMES
+    )[0]
+
+    monkeypatch.setattr(
+        setup_module,
+        "AUTH_FILE",
+        str(auth_path),
+    )
+    monkeypatch.setenv(
+        "ODYSSEUS_ADMIN_USER",
+        reserved,
+    )
+    monkeypatch.setenv(
+        "ODYSSEUS_ADMIN_PASSWORD",
+        "valid-bootstrap-password",
+    )
+
+    assert setup_module.create_default_admin() == "failed"
+    assert not auth_path.exists()
+
+
+def test_main_returns_nonzero_when_admin_creation_fails(
+    tmp_path,
+    monkeypatch,
+):
+    setup_module = _load_setup_module()
+
+    monkeypatch.setattr(
+        setup_module,
+        "BASE_DIR",
+        str(tmp_path),
+    )
+    monkeypatch.setattr(
+        setup_module,
+        "check_arch",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        setup_module,
+        "create_dirs",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        setup_module,
+        "create_env",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        setup_module,
+        "check_deps",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        setup_module,
+        "init_database",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        setup_module,
+        "create_default_admin",
+        lambda: "failed",
+    )
+    monkeypatch.setenv(
+        "ODYSSEUS_SKIP_RUN_HINT",
+        "1",
+    )
+
+    assert setup_module.main() == 1

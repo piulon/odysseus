@@ -11,9 +11,9 @@ inside **Settings**. Only edit `.env` for deployment-level overrides like
 `APP_BIND`, `APP_PORT`, `AUTH_ENABLED`, `DATABASE_URL`, or a pre-seeded admin password.
 
 On first setup, Odysseus creates an admin account (`admin` unless
-`ODYSSEUS_ADMIN_USER` is set) and prints a temporary password in the terminal.
-For Docker installs, the same line is in `docker compose logs odysseus`.
-Use that for the first login, then change it in **Settings**.
+`ODYSSEUS_ADMIN_USER` is set) and requires `ODYSSEUS_ADMIN_PASSWORD` for non-interactive first-time setup and never prints that password to logs.
+For Docker installs, set `ODYSSEUS_ADMIN_PASSWORD` before the first unattended `docker compose up`.
+After the first successful boot, remove the variable from `.env` and recreate the Odysseus container; the existing `auth.json` remains authoritative.
 
 Contributing? See [CONTRIBUTING.md](../CONTRIBUTING.md) for setup, testing, and
 pull request guidelines.
@@ -371,7 +371,7 @@ Local GPU *serving* of vLLM/SGLang needs Linux/WSL2; for a local model on Window
 [Ollama](https://ollama.com/download) is the easiest path — point Odysseus at
 `http://localhost:11434/v1` in Settings.
 
-Open `http://localhost:7000`, log in with the generated admin password,
+Open `http://localhost:7000`, log in with the admin password you supplied in `ODYSSEUS_ADMIN_PASSWORD`,
 and configure everything else inside **Settings**.
 
 ## Troubleshooting & Advanced Setup
@@ -499,6 +499,8 @@ Key settings:
 | `APP_DATA_DIR` | `./data` | Docker Compose host directory for application data volumes. |
 | `APP_LOGS_DIR` | `./logs` | Docker Compose host directory for application logs. |
 | `AUTH_ENABLED` | `true` | Enable/disable login |
+| `ODYSSEUS_ADMIN_USER` | `admin` | Initial admin username used during first-time unattended setup. |
+| `ODYSSEUS_ADMIN_PASSWORD` | -- | Required only for first-time unattended setup when `auth.json` does not exist. Remove it from `.env` after bootstrap and recreate the container so the bootstrap credential is no longer retained in the container configuration. |
 | `LOCALHOST_BYPASS` | `false` | Development-only auth bypass for loopback requests. Keep false for shared/network deployments. |
 | `ALLOWED_ORIGINS` | `http://localhost,http://127.0.0.1` | Comma-separated exact permitted origins for cross-origin browser/API clients. |
 | `SECURE_COOKIES` | `false` | Set true when serving Odysseus through HTTPS at a trusted proxy or private access gateway. |

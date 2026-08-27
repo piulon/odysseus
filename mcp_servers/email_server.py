@@ -33,6 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 server = Server("email")
 EMAIL_SOCKET_TIMEOUT = float(os.environ.get("EMAIL_SOCKET_TIMEOUT", "20"))
+BATCH_READ_MAX_TARGETS = 20
+BATCH_READ_MAX_BODY_CHARS = 40_000
 from src.constants import DATA_DIR as _DATA_DIR, APP_DB, EMAIL_CACHE_DB, SETTINGS_FILE as _SETTINGS_FILE, MAIL_ATTACHMENTS_DIR
 DATA_DIR = Path(_DATA_DIR)
 
@@ -688,6 +690,21 @@ def _fixture_search_emails(query, folders=None, max_results=20, account=None) ->
     return out[: int(max_results or 20)]
 
 
+class EmailSearchResults(list):
+    """List-compatible search results with per-folder diagnostics."""
+
+    def __init__(self, values=(), *, folder_diagnostics=None):
+        super().__init__(values)
+        self.folder_diagnostics = folder_diagnostics or []
+
+
+def _resolve_search_folder(conn, logical_folder: str) -> str:
+    """Resolve a logical search folder through provider-aware helpers."""
+    if (logical_folder or "").strip().lower() == "sent":
+        return _detect_sent_folder(conn)
+    return _resolve_folder(conn, logical_folder, _folder_role_from_name(logical_folder))
+
+
 def _fixture_read_email(uid=None, message_id=None, folder="INBOX", account=None) -> dict | None:
     if not _fixture_email_enabled():
         return None
@@ -842,18 +859,33 @@ def _search_emails(query, folders=None, max_results=20, account=None):
         folders = ["INBOX", "Sent", "Archive"]
     cache = _get_cached_summaries()
     out = []
+    folder_diagnostics = []
     conn = _imap_connect(account)
-    touched = []
     try:
-        for folder in folders:
+        for logical_folder in folders:
+            resolved_folder = logical_folder
+            diagnostic = {
+                "logical_folder": logical_folder,
+                "resolved_folder": resolved_folder,
+                "status": "error",
+                "match_count": None,
+                "error": None,
+            }
             try:
-                status, _ = conn.select(_q(folder), readonly=True)
+                resolved_folder = _resolve_search_folder(conn, logical_folder)
+                diagnostic["resolved_folder"] = resolved_folder
+                status, select_data = conn.select(_q(resolved_folder), readonly=True)
                 if status != "OK":
+                    diagnostic["error"] = f"SELECT failed: {select_data!r}"
                     continue
                 status, data = conn.uid("SEARCH", None, search_cmd)
-                if status != "OK" or not data or not data[0]:
+                if status != "OK":
+                    diagnostic["error"] = f"SEARCH failed: {data!r}"
                     continue
-                uid_list = list(reversed(data[0].split()))[:max_results]
+                raw_uids = data[0].split() if data and data[0] else []
+                diagnostic["status"] = "ok"
+                diagnostic["match_count"] = len(raw_uids)
+                uid_list = list(reversed(raw_uids))[:max_results]
                 for uid in uid_list:
                     try:
                         status, msg_data = conn.uid("FETCH", uid, "(RFC822.HEADER)")
@@ -879,18 +911,24 @@ def _search_emails(query, folders=None, max_results=20, account=None):
                             "to": to_str,
                             "cc": cc_str,
                             "date": date_str,
-                            "_folder": folder,
+                            "_folder": logical_folder,
+                            "_resolved_folder": resolved_folder,
                             "summary": cached.get("summary", ""),
                         })
                     except Exception:
                         continue
-            except Exception:
-                continue
+            except Exception as exc:
+                diagnostic["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                folder_diagnostics.append(diagnostic)
     finally:
         try: conn.logout()
         except Exception: pass
     # Cap total across folders.
-    return out[: max_results * len(folders)]
+    return EmailSearchResults(
+        out[: max_results * len(folders)],
+        folder_diagnostics=folder_diagnostics,
+    )
 
 
 def _list_attachments_from_msg(msg):
@@ -991,6 +1029,8 @@ def _read_email(uid=None, message_id=None, folder="INBOX", account=None):
         attachments = _list_attachments_from_msg(msg)
 
         sender_name, sender_addr = email.utils.parseaddr(sender)
+        to_str = _decode_header(msg.get("To", ""))
+        cc_str = _decode_header(msg.get("Cc", ""))
 
         return {
             "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
@@ -1001,6 +1041,8 @@ def _read_email(uid=None, message_id=None, folder="INBOX", account=None):
             "subject": subject,
             "from": sender_name or sender_addr,
             "from_address": sender_addr,
+            "to": to_str,
+            "cc": cc_str,
             "date": date_str,
             "body": body[:8000],
             "attachments": attachments,
@@ -1850,7 +1892,9 @@ async def list_tools() -> list[Tool]:
             description=(
                 "List the email accounts configured in Odysseus. Returns each account's "
                 "name, email address, and whether it's the default. Use this first when "
-                "the user asks about a specific inbox by name (e.g. 'check work')."
+                "the user explicitly asks about a specific inbox by name (e.g. 'check "
+                "work'). Do not use it merely because the user names the sender of "
+                "messages to search."
             ),
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
@@ -2120,8 +2164,9 @@ async def list_tools() -> list[Tool]:
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Max results per folder (default: 20)",
+                        "description": "Max results per folder (default: 20; bounded ceiling: 100; no cursor/offset pagination)",
                         "default": 20,
+                        "maximum": 100,
                     },
                     **ACCOUNT_PROP,
                 },
@@ -2131,9 +2176,13 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="read_email",
             description=(
-                "Read the full content of a specific email. "
-                "Provide either the UID (from list_emails) or a Message-ID. "
-                "Returns the subject, sender, date, and full body text."
+                "Read email body content. For one message, provide either the UID "
+                "(from list_emails/search_emails) or a Message-ID. When several known "
+                "messages must be read for one downstream task such as a summary or "
+                "document, pass them together in `targets` instead of issuing one "
+                "read_email call per message. Batch targets preserve their own account, "
+                "folder, and UID/Message-ID; at most 20 targets and 40000 aggregate body "
+                "characters are returned."
             ),
             inputSchema={
                 "type": "object",
@@ -2150,6 +2199,29 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "IMAP folder (default: INBOX)",
                         "default": "INBOX",
+                    },
+                    "targets": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": BATCH_READ_MAX_TARGETS,
+                        "description": (
+                            "Ordered messages to read in one bounded batch. Each target "
+                            "must include uid or message_id and may specify its own folder "
+                            "and account. Do not combine this with top-level uid/message_id."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "uid": {"type": "string", "description": "Email UID from search/list results"},
+                                "message_id": {"type": "string", "description": "RFC Message-ID header value"},
+                                "folder": {"type": "string", "description": "IMAP folder for this message (default: INBOX)", "default": "INBOX"},
+                                "account": {"type": "string", "description": "Account name/email/id for this message"},
+                            },
+                            "anyOf": [
+                                {"required": ["uid"]},
+                                {"required": ["message_id"]},
+                            ],
+                        },
                     },
                     **ACCOUNT_PROP,
                 },
@@ -2289,7 +2361,26 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 hits = _search_emails(q, folders=folders, max_results=max_results, account=acct)
             except Exception as e:
                 return [TextContent(type="text", text=f"Search failed: {e}")]
+            folder_errors = [
+                item for item in getattr(hits, "folder_diagnostics", [])
+                if item.get("status") == "error"
+            ]
+            successful_folders = [
+                item for item in getattr(hits, "folder_diagnostics", [])
+                if item.get("status") == "ok"
+            ]
+            error_text = "; ".join(
+                f"{item['logical_folder']} -> {item['resolved_folder']}: {item.get('error') or 'unknown failure'}"
+                for item in folder_errors
+            )
             if not hits:
+                if folder_errors and not successful_folders:
+                    return [TextContent(type="text", text=f"Search failed in all requested folders: {error_text}")]
+                if folder_errors:
+                    return [TextContent(
+                        type="text",
+                        text=f'No emails matched "{q}".\n\n[FOLDER SEARCH ERRORS: {error_text}]',
+                    )]
                 return [TextContent(type="text", text=f'No emails matched "{q}".')]
             lines = [f'Found {len(hits)} email(s) matching "{q}":\n']
             for i, em in enumerate(hits, 1):
@@ -2298,15 +2389,140 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     f"   From: {em['from']} ({em['from_address']})\n"
                     f"   Date: {em['date']}\n"
                     f"   Folder: {em.get('_folder', 'INBOX')}\n"
+                    f"   Resolved Folder: {em.get('_resolved_folder', em.get('_folder', 'INBOX'))}\n"
                     f"   UID: {em['uid']}"
                 )
                 if em.get('to'):
                     lines.append(f"   To: {em['to']}")
                 if em.get('summary'):
                     lines.append(f"   Summary: {em['summary']}")
+            limited_folders = [
+                item for item in getattr(hits, "folder_diagnostics", [])
+                if item.get("status") == "ok"
+                and isinstance(item.get("match_count"), int)
+                and item["match_count"] > max_results
+            ]
+            if limited_folders:
+                detail = "; ".join(
+                    f"{item['logical_folder']} has {item['match_count']} matches"
+                    for item in limited_folders
+                )
+                lines.append(
+                    "\n[DISCOVERY INCOMPLETE: per-folder result limit reached; "
+                    + detail + "]"
+                )
+            if folder_errors:
+                lines.append(f"\n[FOLDER SEARCH ERRORS: {error_text}]")
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "read_email":
+            targets = arguments.get("targets")
+            if targets is not None:
+                if not isinstance(targets, list):
+                    return [TextContent(type="text", text="Error: targets must be an array")]
+                if not targets:
+                    return [TextContent(type="text", text="Error: targets must contain at least one message")]
+                if arguments.get("uid") or arguments.get("message_id"):
+                    return [TextContent(
+                        type="text",
+                        text="Error: use either targets for a batch or top-level uid/message_id for one email, not both",
+                    )]
+
+                items = []
+                body_chars = 0
+                accepted = targets[:BATCH_READ_MAX_TARGETS]
+                for index, raw_target in enumerate(accepted):
+                    target = dict(raw_target) if isinstance(raw_target, dict) else {}
+                    identity = {
+                        "index": index,
+                        "uid": target.get("uid"),
+                        "message_id": target.get("message_id"),
+                        "folder": target.get("folder", "INBOX"),
+                        "account": target.get("account"),
+                    }
+                    if not identity["uid"] and not identity["message_id"]:
+                        items.append({**identity, "status": "error", "error": "uid or message_id is required"})
+                        continue
+                    if body_chars >= BATCH_READ_MAX_BODY_CHARS:
+                        items.append({
+                            **identity,
+                            "status": "omitted",
+                            "truncated": True,
+                            "reason": "aggregate_body_cap_reached",
+                        })
+                        continue
+
+                    try:
+                        target_account = target.get("account")
+                        if len(_list_accounts_raw()) >= 2 and not target_account:
+                            result = _read_email_across_accounts(
+                                uid=identity["uid"],
+                                message_id=identity["message_id"],
+                                folder=identity["folder"],
+                            )
+                        else:
+                            result = _read_email(
+                                uid=identity["uid"],
+                                message_id=identity["message_id"],
+                                folder=identity["folder"],
+                                account=target_account,
+                            )
+                    except Exception as exc:
+                        items.append({**identity, "status": "error", "error": str(exc)})
+                        continue
+                    if "error" in result:
+                        items.append({**identity, "status": "error", "error": result["error"]})
+                        continue
+
+                    body = str(result.get("body") or "")
+                    remaining = BATCH_READ_MAX_BODY_CHARS - body_chars
+                    returned_body = body[:remaining]
+                    was_truncated = len(returned_body) < len(body)
+                    body_chars += len(returned_body)
+                    items.append({
+                        **identity,
+                        "status": "success",
+                        "truncated": was_truncated,
+                        "subject": result.get("subject", ""),
+                        "from": result.get("from", ""),
+                        "from_address": result.get("from_address", ""),
+                        "to": result.get("to", ""),
+                        "cc": result.get("cc", ""),
+                        "date": result.get("date", ""),
+                        "resolved_uid": result.get("uid"),
+                        "resolved_message_id": result.get("message_id", ""),
+                        "resolved_folder": identity["folder"],
+                        "resolved_account": result.get("account", "default"),
+                        "resolved_account_email": result.get("account_email", ""),
+                        "body": returned_body,
+                        "attachments": result.get("attachments", []),
+                    })
+
+                for index, raw_target in enumerate(targets[BATCH_READ_MAX_TARGETS:], start=BATCH_READ_MAX_TARGETS):
+                    target = dict(raw_target) if isinstance(raw_target, dict) else {}
+                    items.append({
+                        "index": index,
+                        "uid": target.get("uid"),
+                        "message_id": target.get("message_id"),
+                        "folder": target.get("folder", "INBOX"),
+                        "account": target.get("account"),
+                        "status": "omitted",
+                        "truncated": True,
+                        "reason": "target_limit_exceeded",
+                    })
+
+                payload = {
+                    "batch": True,
+                    "requested": len(targets),
+                    "processed": len(accepted),
+                    "max_targets": BATCH_READ_MAX_TARGETS,
+                    "body_chars": body_chars,
+                    "max_body_chars": BATCH_READ_MAX_BODY_CHARS,
+                    "truncated": any(item.get("truncated") for item in items),
+                    "items": items,
+                }
+                return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
             all_accounts = _list_accounts_raw()
             if len(all_accounts) >= 2 and not acct:
                 result = _read_email_across_accounts(

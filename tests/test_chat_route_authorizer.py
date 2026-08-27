@@ -444,3 +444,341 @@ def test_reauthorization_detects_change_and_candidates_do_not_share_runtime_stat
             auth=_auth(),
         )
     assert exc.value.code == "endpoint_not_found"
+
+
+@pytest.mark.parametrize(
+    ("lane", "agent_mode"),
+    [("chat", False), ("agent", True)],
+)
+def test_adaptive_runtime_candidate_uses_authoritative_endpoint(
+    authorizer_store,
+    monkeypatch,
+    lane,
+    agent_mode,
+):
+    from routes import chat_routes
+    from src import adaptive_chat_router
+    from src import settings as settings_module
+    from src.adaptive_routing import RoutingCandidate
+    from src.adaptive_routing_snapshot import (
+        clear_adaptive_routing_snapshot,
+        publish_adaptive_routing_snapshot,
+    )
+
+    _factory, add_endpoint = authorizer_store
+
+    add_endpoint(
+        endpoint_id="adaptive-endpoint",
+        owner="alice",
+        base_url="http://authoritative.internal/v1",
+    )
+
+    legacy = _auto_route(
+        endpoint_id=f"legacy-{lane}",
+        model=f"legacy-{lane}-model",
+        lane=lane,
+    )
+
+    monkeypatch.setattr(
+        adaptive_chat_router,
+        "resolve_chat_route",
+        lambda *a, **k: legacy,
+    )
+    monkeypatch.setattr(
+        settings_module,
+        "get_setting",
+        lambda key, default=None: {
+            "adaptive_routing_enabled": True,
+            "adaptive_routing_snapshot_ttl_seconds": 60,
+        }.get(key, default),
+    )
+
+    publish_adaptive_routing_snapshot(
+        "alice",
+        [
+            RoutingCandidate(
+                endpoint_id="adaptive-endpoint",
+                endpoint_url="http://snapshot-must-not-win.invalid/v1/chat/completions",
+                model="adaptive-model",
+                node="tower",
+                scope="local",
+                reachable=True,
+                capabilities=("tool_call",) if agent_mode else (),
+            )
+        ],
+    )
+
+    session = _session()
+    before = _snapshot(session)
+
+    try:
+        selector = (
+            chat_routes._select_auto_agent_context_candidate
+            if agent_mode
+            else chat_routes._select_auto_stream_context_candidate
+        )
+
+        (
+            selected_primary,
+            requested_model,
+            manual_fallback,
+            context_route,
+            context_candidate,
+        ) = selector(
+            session,
+            owner="alice",
+            auth=_auth(),
+        )
+
+        assert selected_primary.reason == f"adaptive_{lane}"
+        assert selected_primary.target.endpoint_id == "adaptive-endpoint"
+        assert selected_primary.target.model == "adaptive-model"
+        assert selected_primary.target.endpoint_url is None
+
+        assert requested_model == "adaptive-model"
+        assert context_route is selected_primary
+
+        assert context_candidate.endpoint_id == "adaptive-endpoint"
+        assert context_candidate.model == "adaptive-model"
+        assert (
+            context_candidate.endpoint_url
+            == "http://authoritative.internal/v1/chat/completions"
+        )
+        assert (
+            context_candidate.headers["Authorization"]
+            == "Bearer secret-adaptive-endpoint"
+        )
+
+        assert "snapshot-must-not-win" not in context_candidate.endpoint_url
+        assert manual_fallback is not None
+        assert _snapshot(session) == before
+    finally:
+        clear_adaptive_routing_snapshot("alice")
+
+
+@pytest.mark.parametrize(
+    ("lane", "agent_mode"),
+    [("chat", False), ("agent", True)],
+)
+def test_adaptive_foreign_endpoint_falls_back_without_leaking_owner_data(
+    authorizer_store,
+    monkeypatch,
+    lane,
+    agent_mode,
+):
+    from routes import chat_routes
+    from src import adaptive_chat_router
+    from src import settings as settings_module
+    from src.adaptive_routing import RoutingCandidate
+    from src.adaptive_routing_snapshot import (
+        clear_adaptive_routing_snapshot,
+        publish_adaptive_routing_snapshot,
+    )
+
+    _factory, add_endpoint = authorizer_store
+
+    # Endpoint que Alice pot utilitzar com a fallback manual.
+    add_endpoint(
+        endpoint_id="manual-endpoint",
+        owner="alice",
+        base_url="http://manual.internal/v1",
+    )
+
+    # Endpoint existent però propietat de Bob.
+    add_endpoint(
+        endpoint_id="foreign-endpoint",
+        owner="bob",
+        base_url="http://bob-secret.internal/v1",
+    )
+
+    legacy = _auto_route(
+        endpoint_id=f"legacy-{lane}",
+        model=f"legacy-{lane}-model",
+        lane=lane,
+    )
+
+    monkeypatch.setattr(
+        adaptive_chat_router,
+        "resolve_chat_route",
+        lambda *a, **k: legacy,
+    )
+    monkeypatch.setattr(
+        settings_module,
+        "get_setting",
+        lambda key, default=None: {
+            "adaptive_routing_enabled": True,
+            "adaptive_routing_snapshot_ttl_seconds": 60,
+        }.get(key, default),
+    )
+
+    publish_adaptive_routing_snapshot(
+        "alice",
+        [
+            RoutingCandidate(
+                endpoint_id="foreign-endpoint",
+                endpoint_url="http://snapshot-bob.invalid/v1/chat/completions",
+                model="foreign-model",
+                node="foreign-node",
+                scope="local",
+                reachable=True,
+                capabilities=("tool_call",) if agent_mode else (),
+            )
+        ],
+    )
+
+    session = _session()
+    before = _snapshot(session)
+
+    try:
+        selector = (
+            chat_routes._select_auto_agent_context_candidate
+            if agent_mode
+            else chat_routes._select_auto_stream_context_candidate
+        )
+
+        (
+            selected_primary,
+            requested_model,
+            manual_fallback,
+            context_route,
+            context_candidate,
+        ) = selector(
+            session,
+            owner="alice",
+            auth=_auth(),
+        )
+
+        # Adaptive pot proposar la identitat, però no autoritzar-la.
+        assert selected_primary.reason == f"adaptive_{lane}"
+        assert selected_primary.target.endpoint_id == "foreign-endpoint"
+        assert selected_primary.target.model == "foreign-model"
+        assert selected_primary.target.endpoint_url is None
+        assert requested_model == "foreign-model"
+
+        # endpoint_not_found és recoverable: es passa al fallback manual.
+        assert manual_fallback is not None
+        assert context_route is manual_fallback
+        assert context_route.auto is False
+        assert context_route.reason == "manual_fallback"
+
+        # El fallback es rehidrata exclusivament amb dades autoritzades d'Alice.
+        assert context_candidate.endpoint_id == "manual-endpoint"
+        assert context_candidate.model == "manual-model"
+        assert (
+            context_candidate.endpoint_url
+            == "http://manual.internal/v1/chat/completions"
+        )
+        assert (
+            context_candidate.headers["Authorization"]
+            == "Bearer secret-manual-endpoint"
+        )
+
+        # Cap dada executable de Bob ni del snapshot pot travessar la frontera.
+        assert "bob-secret" not in context_candidate.endpoint_url
+        assert "snapshot-bob" not in context_candidate.endpoint_url
+        assert "foreign-endpoint" not in context_candidate.headers["Authorization"]
+
+        assert _snapshot(session) == before
+    finally:
+        clear_adaptive_routing_snapshot("alice")
+
+
+@pytest.mark.parametrize(
+    ("lane", "agent_mode"),
+    [("chat", False), ("agent", True)],
+)
+def test_adaptive_model_policy_denial_is_terminal(
+    authorizer_store,
+    monkeypatch,
+    lane,
+    agent_mode,
+):
+    from routes import chat_routes
+    from src import adaptive_chat_router
+    from src import settings as settings_module
+    from src.adaptive_routing import RoutingCandidate
+    from src.adaptive_routing_snapshot import (
+        clear_adaptive_routing_snapshot,
+        publish_adaptive_routing_snapshot,
+    )
+
+    _factory, add_endpoint = authorizer_store
+
+    add_endpoint(
+        endpoint_id="adaptive-endpoint",
+        owner="alice",
+        base_url="http://adaptive.internal/v1",
+    )
+
+    # També existeix un fallback manual vàlid.
+    add_endpoint(
+        endpoint_id="manual-endpoint",
+        owner="alice",
+        base_url="http://manual.internal/v1",
+    )
+
+    legacy = _auto_route(
+        endpoint_id=f"legacy-{lane}",
+        model=f"legacy-{lane}-model",
+        lane=lane,
+    )
+
+    monkeypatch.setattr(
+        adaptive_chat_router,
+        "resolve_chat_route",
+        lambda *a, **k: legacy,
+    )
+    monkeypatch.setattr(
+        settings_module,
+        "get_setting",
+        lambda key, default=None: {
+            "adaptive_routing_enabled": True,
+            "adaptive_routing_snapshot_ttl_seconds": 60,
+        }.get(key, default),
+    )
+
+    publish_adaptive_routing_snapshot(
+        "alice",
+        [
+            RoutingCandidate(
+                endpoint_id="adaptive-endpoint",
+                endpoint_url="http://snapshot.invalid/v1/chat/completions",
+                model="adaptive-model",
+                node="tower",
+                scope="local",
+                reachable=True,
+                capabilities=("tool_call",) if agent_mode else (),
+            )
+        ],
+    )
+
+    session = _session()
+    before = _snapshot(session)
+
+    denied_privileges = {
+        "allowed_models": ["some-other-model"],
+        "allowed_models_restricted": True,
+        "block_all_models": False,
+        "max_messages_per_day": 0,
+    }
+
+    try:
+        selector = (
+            chat_routes._select_auto_agent_context_candidate
+            if agent_mode
+            else chat_routes._select_auto_stream_context_candidate
+        )
+
+        with pytest.raises(ChatRouteAuthorizationError) as exc:
+            selector(
+                session,
+                owner="alice",
+                auth=_auth(privileges=denied_privileges),
+            )
+
+        assert exc.value.code == "model_not_allowed"
+
+        # La política és terminal: el fallback manual no s'ha d'utilitzar.
+        assert _snapshot(session) == before
+    finally:
+        clear_adaptive_routing_snapshot("alice")

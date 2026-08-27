@@ -993,6 +993,26 @@ async def runtime_info() -> Dict[str, object]:
 
 # ========= LIFECYCLE =========
 
+def _adaptive_routing_owner_provider():
+    """Return the owner scope that Adaptive background discovery may inspect."""
+    if not AUTH_ENABLED:
+        # Auth-disabled deployments use the legacy single-user/global scope.
+        return (None,)
+
+    if not auth_manager.is_configured:
+        # During first-run setup there is no authenticated owner to refresh.
+        return ()
+
+    owners = []
+    for entry in auth_manager.list_users():
+        if not isinstance(entry, dict):
+            continue
+        username = str(entry.get("username") or "").strip()
+        if username:
+            owners.append(username)
+    return tuple(owners)
+
+
 @asynccontextmanager
 async def _lifespan(app):
     """Modern lifespan context manager replacing deprecated @app.on_event."""
@@ -1030,6 +1050,19 @@ async def _startup_event():
     # GC tasks created with `asyncio.create_task(...)` before they finish.
     _startup_tasks: list[asyncio.Task] = getattr(app.state, "_startup_tasks", [])
     app.state._startup_tasks = _startup_tasks
+
+    # Adaptive discovery is lifecycle-managed and never runs from a chat request.
+    # The worker itself checks the global feature gate before enumerating owners
+    # or performing any network discovery.
+    try:
+        from src.adaptive_routing_worker import start_adaptive_routing_worker
+        start_adaptive_routing_worker(_adaptive_routing_owner_provider)
+    except Exception as _e:
+        logger.warning(
+            "Failed to start Adaptive routing refresh worker: %s",
+            type(_e).__name__,
+        )
+
     if upload_cleanup_func:
         upload_cleanup_task = asyncio.create_task(upload_cleanup_func())
     # Always-on monitor that auto-continues the agent when a background bash
@@ -1208,8 +1241,9 @@ async def _startup_event():
     # Nightly skill audit — at ~02:00 local, test + judge a batch of the
     # least-recently-checked skills, auto-fixing/escalating weak ones (never
     # deletes). Rotates through the library so each night covers different
-    # skills. Gated by the `skill_audit_nightly` setting (default on); hour via
-    # `skill_audit_hour` (default 2), batch size via `skill_audit_batch` (8).
+    # skills. This autonomous LLM work is opt-in: `skill_audit_nightly`
+    # defaults off. Hour via `skill_audit_hour` (default 2), batch size via
+    # `skill_audit_batch` (8).
     async def _skill_audit_nightly_loop():
         from datetime import timedelta
         while True:
@@ -1225,7 +1259,7 @@ async def _startup_event():
             await asyncio.sleep(max(60, (nxt - now).total_seconds()))
             try:
                 from src.settings import get_setting
-                if not get_setting("skill_audit_nightly", True):
+                if not get_setting("skill_audit_nightly", False):
                     continue
                 batch = int(get_setting("skill_audit_batch", 8) or 8)
                 from routes.skills_routes import run_scheduled_skill_audit
@@ -1254,6 +1288,16 @@ async def _shutdown_event():
             await upload_cleanup_task
         except asyncio.CancelledError:
             pass
+    # Stop Adaptive discovery before the rest of application services shut down.
+    try:
+        from src.adaptive_routing_worker import stop_adaptive_routing_worker
+        await stop_adaptive_routing_worker()
+    except Exception as e:
+        logger.warning(
+            "Adaptive routing refresh worker shutdown error: %s",
+            type(e).__name__,
+        )
+
     # Stop task scheduler (no-op if it never started under the gate)
     try:
         await task_scheduler.stop()

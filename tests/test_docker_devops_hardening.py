@@ -100,6 +100,38 @@ def test_docker_entrypoint_does_not_resolve_root_commands_from_app_local_path():
     assert final_exec > path_export
 
 
+def test_docker_entrypoint_fails_closed_when_setup_fails():
+    script = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+
+    setup_guard = (
+        'if ! "$GOSU_BIN" "$ODY_USER" "$PYTHON_BIN" /app/setup.py; then'
+    )
+
+    assert setup_guard in script
+    assert "/app/setup.py || true" not in script
+
+    start = script.index(setup_guard)
+    end = script.index(
+        'exec "$GOSU_BIN" "$ODY_USER" "$@"',
+        start,
+    )
+    setup_block = script[start:end]
+
+    assert 'exit 1' in setup_block
+    assert (
+        "refusing to start the application"
+        in setup_block
+    )
+    assert "unset ODYSSEUS_ADMIN_PASSWORD" in setup_block
+
+    unset_pos = setup_block.index(
+        "unset ODYSSEUS_ADMIN_PASSWORD"
+    )
+    guard_pos = setup_block.index(setup_guard)
+
+    assert guard_pos < unset_pos
+
+
 def test_docker_entrypoint_ownership_repair_stays_inside_expected_mounts():
     script = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
     assert "find /app -xdev" in script
@@ -121,6 +153,446 @@ def test_dockerignore_excludes_secrets_editor_backups():
         "**/#secrets.env#",
     } <= patterns
     assert "!secrets.env.example" in patterns
+
+
+def test_admin_bootstrap_docs_never_direct_users_to_password_logs():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    setup_doc = (ROOT / "docs" / "setup.md").read_text(encoding="utf-8")
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    docs = (readme + "\n" + setup_doc).lower()
+
+    stale_phrases = (
+        "first admin password is printed",
+        "prints a temporary password",
+        "generated admin password",
+        "for docker installs, the same line is in `docker compose logs odysseus`",
+        "use that for the first login",
+    )
+
+    for phrase in stale_phrases:
+        assert phrase not in docs
+
+    assert "odysseus_admin_password" in docs
+    assert "refuses to start" in readme.lower()
+    assert "never printed to logs" in readme.lower()
+
+    # Generic container-log inspection is legitimate operational
+    # troubleshooting. Only password-retrieval instructions are forbidden.
+    assert (
+        "docker compose logs odysseus | grep"
+        in setup_doc.lower()
+    )
+
+    assert (
+        "required if data/auth.json does not exist"
+        in env_example.lower()
+    )
+    assert "remove this variable from .env" in env_example.lower()
+
+
+def test_nightly_skill_audit_is_opt_in_by_default():
+    import ast
+
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    calls = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        if not isinstance(node.func, ast.Name):
+            continue
+
+        if node.func.id != "get_setting":
+            continue
+
+        if not node.args:
+            continue
+
+        first = node.args[0]
+
+        if (
+            isinstance(first, ast.Constant)
+            and first.value == "skill_audit_nightly"
+        ):
+            calls.append(node)
+
+    assert len(calls) == 1
+
+    call = calls[0]
+
+    assert len(call.args) >= 2
+    assert isinstance(call.args[1], ast.Constant)
+    assert call.args[1].value is False
+
+    # Preserve the execution gate: false/default skips the autonomous
+    # nightly call; an explicitly truthy setting allows execution.
+    assert (
+        'if not get_setting("skill_audit_nightly", False):'
+        in source
+    )
+    assert (
+        'get_setting("skill_audit_nightly", True)'
+        not in source
+    )
+
+
+def test_manual_skill_audit_is_independent_of_nightly_gate():
+    import ast
+
+    source = (
+        ROOT / "routes" / "skills_routes.py"
+    ).read_text(encoding="utf-8")
+
+    tree = ast.parse(source)
+
+    functions = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "run_scheduled_skill_audit"
+        )
+    ]
+
+    assert len(functions) == 1
+
+    function = functions[0]
+
+    nightly_gate_calls = []
+
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+
+        if not isinstance(node.func, ast.Name):
+            continue
+
+        if node.func.id != "get_setting":
+            continue
+
+        if not node.args:
+            continue
+
+        first = node.args[0]
+
+        if (
+            isinstance(first, ast.Constant)
+            and first.value == "skill_audit_nightly"
+        ):
+            nightly_gate_calls.append(node)
+
+    assert nightly_gate_calls == []
+
+
+def test_gallery_background_removal_never_executes_remote_model_code():
+    source = (
+        ROOT
+        / "routes"
+        / "gallery"
+        / "gallery_routes.py"
+    ).read_text(encoding="utf-8")
+
+    # Background removal may use the explicitly installed rembg
+    # dependency, but must never silently download/execute model
+    # repository code as a fallback.
+    assert "from rembg import remove" in source
+    assert "cut = remove(crop)" in source
+
+    assert "trust_remote_code" not in source
+    assert "briaai/RMBG-1.4" not in source
+    assert "from transformers import pipeline" not in source
+
+    assert (
+        "Install rembg from Cookbook"
+        in source
+    )
+
+
+def test_gallery_realesrgan_uses_only_verified_local_checkpoints():
+    gallery = (
+        ROOT
+        / "routes"
+        / "gallery"
+        / "gallery_routes.py"
+    ).read_text(encoding="utf-8")
+
+    installer = (
+        ROOT
+        / "routes"
+        / "shell_routes.py"
+    ).read_text(encoding="utf-8")
+
+    constants = (
+        ROOT
+        / "src"
+        / "constants.py"
+    ).read_text(encoding="utf-8")
+
+    models = (
+        ROOT
+        / "src"
+        / "realesrgan_models.py"
+    ).read_text(encoding="utf-8")
+
+    # No RealESRGANer call may receive an HTTP(S) model URL.
+    # Other image backends are audited independently.
+    import ast
+
+    assert "Real-ESRGAN/releases/download" not in gallery
+
+    tree = ast.parse(gallery)
+
+    realesrgan_calls = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        name = None
+
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+
+        if name == "RealESRGANer":
+            realesrgan_calls.append(node)
+
+    assert len(realesrgan_calls) == 2
+
+    for call in realesrgan_calls:
+        model_path_args = [
+            keyword
+            for keyword in call.keywords
+            if keyword.arg == "model_path"
+        ]
+
+        assert len(model_path_args) == 1
+
+        expression = ast.get_source_segment(
+            gallery,
+            model_path_args[0].value,
+        )
+
+        assert expression
+        assert "http://" not in expression
+        assert "https://" not in expression
+
+    assert (
+        'verified_realesrgan_model('
+        in gallery
+    )
+
+    assert (
+        '"RealESRGAN_x4plus.pth"'
+        in gallery
+    )
+
+    assert (
+        '"realesr-general-x4v3.pth"'
+        in gallery
+    )
+
+    assert (
+        '"realesr-general-wdn-x4v3.pth"'
+        in gallery
+    )
+
+    # DNI requires both local checkpoints.
+    assert "model_path=[" in gallery
+    assert "str(general_path)" in gallery
+    assert "str(weak_path)" in gallery
+    assert (
+        "dni_weight=[strength, 1.0 - strength]"
+        in gallery
+    )
+
+    # Checkpoints belong to the existing persistent DATA_DIR hierarchy.
+    assert (
+        'REALESRGAN_MODELS_DIR = '
+        'os.path.join(DATA_DIR, "models", "realesrgan")'
+        in constants
+    )
+
+    # Provisioning is explicit administrative installation work.
+    assert (
+        'if pip_name == "realesrgan":'
+        in installer
+    )
+
+    assert (
+        "provision_realesrgan_models"
+        in installer
+    )
+
+    # Integrity enforcement exists in the model store.
+    assert "sha256" in models
+    assert "compare_digest" in models
+    assert "os.replace" in models
+
+
+def test_realesrgan_main_package_is_pinned_in_local_wheelhouse():
+    dockerfile = (
+        ROOT
+        / "Dockerfile"
+    ).read_text(encoding="utf-8")
+
+    builder = (
+        ROOT
+        / "docker"
+        / "build-realesrgan-wheels.sh"
+    ).read_text(encoding="utf-8")
+
+    shell = (
+        ROOT
+        / "routes"
+        / "shell_routes.py"
+    ).read_text(encoding="utf-8")
+
+    wheel = (
+        "realesrgan-0.3.0-py3-none-any.whl"
+    )
+
+    sha256 = (
+        "59336c16c30dd5130eff350dd27424ac"
+        "b9b7281d18a6810130e265606c9a6088"
+    )
+
+    assert wheel in builder
+    assert sha256 in builder
+
+    assert (
+        "https://files.pythonhosted.org/"
+        in builder
+    )
+
+    assert wheel in dockerfile
+    assert (
+        """-name '*.whl' | wc -l)" -eq 4"""
+        in dockerfile
+    )
+
+    assert wheel in shell
+
+    assert (
+        "RealESRGAN remains index-resolved"
+        not in shell
+    )
+
+    assert (
+        "Required audited local wheelhouse "
+        "is incomplete"
+        in shell
+    )
+
+    # `realesrgan` itself must never be appended by package name in the
+    # special Real-ESRGAN branch. Other ordinary allowlisted packages may
+    # still use the generic cmd.append(pip_name) path.
+    assert (
+        'if pip_name == "realesrgan":'
+        in shell
+    )
+
+
+def test_gallery_gfpgan_uses_only_verified_local_checkpoint():
+    import ast
+
+    gallery = (
+        ROOT
+        / "routes"
+        / "gallery"
+        / "gallery_routes.py"
+    ).read_text(encoding="utf-8")
+
+    constants = (
+        ROOT
+        / "src"
+        / "constants.py"
+    ).read_text(encoding="utf-8")
+
+    models = (
+        ROOT
+        / "src"
+        / "realesrgan_models.py"
+    ).read_text(encoding="utf-8")
+
+    installer = (
+        ROOT
+        / "routes"
+        / "shell_routes.py"
+    ).read_text(encoding="utf-8")
+
+    tree = ast.parse(gallery)
+
+    calls = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+        else:
+            continue
+
+        if name == "GFPGANer":
+            calls.append(node)
+
+    assert len(calls) == 1
+
+    model_args = [
+        keyword
+        for keyword in calls[0].keywords
+        if keyword.arg == "model_path"
+    ]
+
+    assert len(model_args) == 1
+
+    expression = ast.get_source_segment(
+        gallery,
+        model_args[0].value,
+    )
+
+    assert expression
+    assert "http://" not in expression
+    assert "https://" not in expression
+
+    assert (
+        "TencentARC/GFPGAN/releases/download"
+        not in gallery
+    )
+
+    assert "verified_gfpgan_model" in gallery
+
+    assert (
+        'GFPGAN_MODELS_DIR = '
+        'os.path.join(DATA_DIR, "models", "gfpgan")'
+        in constants
+    )
+
+    # The production SHA-256 is split across adjacent Python string
+    # literals in the model spec, so source-text checks verify both halves.
+    # Runtime tests independently assert the exact concatenated digest.
+    assert (
+        "e2cd4703ab14f4d01fd1383a8a8b266f"
+        in models
+    )
+
+    assert (
+        "9a5833dacee8e6a79d3bf21a1b6be5ad"
+        in models
+    )
+
+    assert (
+        "provision_gfpgan_model"
+        in installer
+    )
 
 
 def test_cors_allow_methods_include_patch():
@@ -164,3 +636,245 @@ def test_testing_docs_use_project_venv_for_python_validation():
         text = path.read_text(encoding="utf-8")
         for stale in stale_patterns:
             assert stale not in text, f"{path.name} still contains {stale!r}"
+
+def test_facexlib_gfpgan_runtime_models_are_fail_closed():
+    repo = Path(
+        __file__
+    ).resolve().parents[1]
+
+    builder = (
+        repo
+        / "docker"
+        / "build-realesrgan-wheels.sh"
+    ).read_text()
+
+    assert (
+        "29cc2a9055d7859e38364c5c5868012"
+        "d93b419e342b947d37288406857dc2ec7"
+        in builder
+    )
+
+    assert (
+        "4b8ac56147daaa226c9def62fa65ac972"
+        "7f608c1aef4af02bace4b943a256f27"
+        in builder
+    )
+
+    assert (
+        "facexlib model is not provisioned locally"
+        in builder
+    )
+
+    assert (
+        "remote GFPGAN model paths are disabled"
+        in builder
+    )
+
+    assert (
+        "model_rootpath is required for verified local facexlib models"
+        in builder
+    )
+
+    constants = (
+        repo
+        / "src"
+        / "constants.py"
+    ).read_text()
+
+    assert (
+        'FACEXLIB_MODELS_DIR = os.path.join(DATA_DIR, "models", "facexlib")'
+        in constants
+    )
+
+    models = (
+        repo
+        / "src"
+        / "realesrgan_models.py"
+    ).read_text()
+
+    assert (
+        "detection_Resnet50_Final.pth"
+        in models
+    )
+
+    assert (
+        "parsing_parsenet.pth"
+        in models
+    )
+
+    assert (
+        "verified_facexlib_model_root"
+        in models
+    )
+
+    assert (
+        "provision_facexlib_models"
+        in models
+    )
+
+    gallery = (
+        repo
+        / "routes"
+        / "gallery"
+        / "gallery_routes.py"
+    ).read_text()
+
+    assert (
+        "verified_facexlib_model_root()"
+        in gallery
+    )
+
+    assert (
+        "model_rootpath=str("
+        in gallery
+    )
+
+    assert (
+        '"gfpgan_models"'
+        not in gallery
+    )
+
+    shell = (
+        repo
+        / "routes"
+        / "shell_routes.py"
+    ).read_text()
+
+    assert (
+        "provision_facexlib_models"
+        in shell
+    )
+
+def test_realesrgan_wheels_are_normalized_for_inference():
+    from pathlib import Path
+
+    repo = Path(
+        __file__
+    ).resolve().parents[1]
+
+    builder = (
+        repo
+        / "docker"
+        / "build-realesrgan-wheels.sh"
+    ).read_text(
+        encoding="utf-8"
+    )
+
+    dockerfile = (
+        repo
+        / "Dockerfile"
+    ).read_text(
+        encoding="utf-8"
+    )
+
+    final_hashes = {
+        "BASICSR_WHEEL_SHA256":
+            "783bc54ecc749073ba4df9b37559a36e6e25d8bd14831b7763d8ca92d5021fe9",
+
+        "FACEXLIB_WHEEL_SHA256":
+            "29cc2a9055d7859e38364c5c5868012d93b419e342b947d37288406857dc2ec7",
+
+        "GFPGAN_WHEEL_SHA256":
+            "4b8ac56147daaa226c9def62fa65ac9727f608c1aef4af02bace4b943a256f27",
+
+        "REALESRGAN_WHEEL_SHA256":
+            "45331f0447ae90355a70872c13b114e640c17200255ff0b2607a0a0f03e60ad4",
+    }
+
+    for variable, digest in final_hashes.items():
+        assert (
+            f"{variable}='{digest}'"
+            in builder
+        )
+
+        # Wheel identities live in one place: the builder.
+        assert digest not in dockerfile
+
+    upstream_realesrgan = (
+        "59336c16c30dd5130eff350dd27424ac"
+        "b9b7281d18a6810130e265606c9a6088"
+    )
+
+    assert (
+        "REALESRGAN_UPSTREAM_WHEEL_SHA256="
+        f"'{upstream_realesrgan}'"
+        in builder
+    )
+
+    assert (
+        '"$REALESRGAN_UPSTREAM_WHEEL_SHA256"'
+        in builder
+    )
+
+    assert (
+        '"$input/realesrgan-0.3.0-py3-none-any.whl"'
+        in builder
+    )
+
+    assert (
+        "inference_only_wheel_normalization = 1"
+        in builder
+    )
+
+    assert (
+        "Architecture modules are imported explicitly"
+        in builder
+    )
+
+    assert (
+        "from .utils import GFPGANer"
+        in builder
+    )
+
+    assert (
+        "from .utils import RealESRGANer"
+        in builder
+    )
+
+    for dependency in (
+        '"addict"',
+        '"filterpy"',
+        '"future"',
+        '"lmdb"',
+        '"numba"',
+        '"scikit-image"',
+        '"scipy"',
+        '"tb-nightly"',
+        '"yapf"',
+    ):
+        assert dependency in builder
+
+    assert (
+        "os.chmod("
+        in builder
+    )
+
+    assert "0o644" in builder
+
+    # The production builder must fail closed on final artifact drift.
+    assert (
+        'sha256sum -c "$work/wheels.sha256"'
+        in builder
+    )
+
+    assert (
+        "disposable normalized output hashes"
+        not in builder
+    )
+
+    # Docker delegates wheel production/integrity to the single builder.
+    assert (
+        "RUN bash /usr/local/bin/build-realesrgan-wheels.sh /wheels"
+        in dockerfile
+    )
+
+    assert (
+        "COPY --from=realesrgan-wheels /wheels/ "
+        "/opt/odysseus-wheelhouse/"
+        in dockerfile
+    )
+
+    assert (
+        "chmod -R a+rX /opt/odysseus-wheelhouse"
+        in dockerfile
+    )

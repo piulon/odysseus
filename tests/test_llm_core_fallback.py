@@ -13,6 +13,154 @@ import pytest
 from src import llm_core
 
 
+@pytest.mark.asyncio
+async def test_async_fallback_result_identifies_successful_primary(monkeypatch):
+    async def fake_llm_call(url, model, messages, **kwargs):
+        return "primary response"
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+
+    result = await llm_core.llm_call_async_with_fallback_result(
+        [("u1", "primary", {"Authorization": "secret"})],
+        [{"role": "user", "content": "hi"}],
+    )
+
+    assert result == llm_core.LLMFallbackResult(
+        response="primary response",
+        model="primary",
+        endpoint_url="u1",
+        candidate_index=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_fallback_result_identifies_successful_fallback(monkeypatch):
+    calls = []
+
+    async def fake_llm_call(url, model, messages, **kwargs):
+        calls.append((url, model))
+        if model == "primary":
+            raise RuntimeError("primary unavailable")
+        return "fallback response"
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+
+    result = await llm_core.llm_call_async_with_fallback_result(
+        [("u1", "primary", {}), ("u2", "backup", {})],
+        [{"role": "user", "content": "hi"}],
+    )
+
+    assert calls == [("u1", "primary"), ("u2", "backup")]
+    assert result == llm_core.LLMFallbackResult(
+        response="fallback response",
+        model="backup",
+        endpoint_url="u2",
+        candidate_index=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_fallback_result_dedupes_in_order_and_indexes_effective_chain(monkeypatch):
+    calls = []
+
+    async def fake_llm_call(url, model, messages, **kwargs):
+        calls.append((url, model, kwargs["headers"]))
+        if model == "primary":
+            raise RuntimeError("primary unavailable")
+        return "deduped fallback"
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+
+    result = await llm_core.llm_call_async_with_fallback_result(
+        [
+            ("u1", "primary", {"X-Route": "first"}),
+            ("u1", "primary", {"X-Route": "duplicate"}),
+            ("u2", "backup", {"X-Route": "fallback"}),
+        ],
+        [{"role": "user", "content": "hi"}],
+    )
+
+    assert calls == [
+        ("u1", "primary", {"X-Route": "first"}),
+        ("u2", "backup", {"X-Route": "fallback"}),
+    ]
+    assert result.candidate_index == 1
+    assert result.model == "backup"
+
+
+@pytest.mark.asyncio
+async def test_async_fallback_legacy_helper_still_returns_string(monkeypatch):
+    async def fake_llm_call(url, model, messages, **kwargs):
+        return "legacy response"
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+
+    response = await llm_core.llm_call_async_with_fallback(
+        [("u1", "primary", {})],
+        [{"role": "user", "content": "hi"}],
+    )
+
+    assert response == "legacy response"
+    assert isinstance(response, str)
+
+
+@pytest.mark.asyncio
+async def test_async_fallback_result_raises_last_candidate_error(monkeypatch):
+    first_error = RuntimeError("primary unavailable")
+    final_error = ValueError("fallback unavailable")
+
+    async def fake_llm_call(url, model, messages, **kwargs):
+        if model == "primary":
+            raise first_error
+        raise final_error
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+
+    with pytest.raises(ValueError) as exc:
+        await llm_core.llm_call_async_with_fallback_result(
+            [("u1", "primary", {}), ("u2", "backup", {})],
+            [{"role": "user", "content": "hi"}],
+        )
+
+    assert exc.value is final_error
+
+
+@pytest.mark.asyncio
+async def test_async_fallback_result_propagates_headers_and_kwargs(monkeypatch):
+    observed = []
+    messages = [{"role": "user", "content": "hi"}]
+
+    async def fake_llm_call(url, model, received_messages, **kwargs):
+        observed.append((url, model, received_messages, kwargs))
+        return "response"
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call)
+
+    await llm_core.llm_call_async_with_fallback_result(
+        [("u1", "primary", {"X-Test": "header"})],
+        messages,
+        timeout=37,
+        workload="background",
+        temperature=0.25,
+        max_retries=2,
+    )
+
+    assert observed == [
+        (
+            "u1",
+            "primary",
+            messages,
+            {
+                "headers": {"X-Test": "header"},
+                "timeout": 37,
+                "workload": "background",
+                "temperature": 0.25,
+                "max_retries": 2,
+            },
+        )
+    ]
+
+
 def _run_fallback(monkeypatch, per_model):
     """Drive stream_llm_with_fallback with a stubbed stream_llm that returns a
     canned SSE line list per candidate model. Returns the emitted chunks."""

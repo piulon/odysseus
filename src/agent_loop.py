@@ -8,10 +8,15 @@ The LLM decides when to use tools by writing fenced code blocks.
 
 import asyncio
 import collections
+import datetime
+import hashlib
 import json
 import re
 import time
 import logging
+import unicodedata
+from email.utils import parsedate_to_datetime
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable, List, Dict, Optional, Set
 from urllib.parse import urlparse
@@ -29,6 +34,11 @@ from src.settings import get_setting
 from src.prompt_security import untrusted_context_message
 from src.tool_security import blocked_tools_for_owner, plan_mode_disabled_tools
 from src.tool_policy import GUIDE_ONLY_DIRECTIVE, WEB_TOOL_NAMES, ToolPolicy
+from src.routing_observability import (
+    log_llm_dispatch,
+    log_routing_authorized,
+    log_routing_fallback,
+)
 from src.tool_utils import _truncate, get_mcp_manager
 from src.agent_tools import (
     parse_tool_blocks,
@@ -64,6 +74,7 @@ class AgentRouteState:
     manual_fallback_route: Any = field(default=None, repr=False)
     active_route: Any = field(default=None, repr=False)
     authorize_route: Callable[[Any], Any] = field(default=None, repr=False)
+    routing_trace: Optional[str] = None
     winner_model: Optional[str] = None
     committed: bool = False
     commit_reason: Optional[str] = None
@@ -209,6 +220,7 @@ async def _stream_auto_agent_round(
     while True:
         try:
             candidate = state.authorize_route(state.active_route)
+            log_routing_authorized(state.routing_trace, candidate)
         except (asyncio.CancelledError, GeneratorExit):
             raise
         except ChatRouteAuthorizationError as exc:
@@ -218,6 +230,12 @@ async def _stream_auto_agent_round(
                 and exc.code in _AUTO_AGENT_CANDIDATE_UNAVAILABLE
                 and state.switch_to_manual_fallback()
             ):
+                log_routing_fallback(
+                    state.routing_trace,
+                    from_model=state.current_candidate_model or state.requested_model,
+                    to_model=state.active_route.target.model,
+                    reason="authorization_unavailable",
+                )
                 continue
             state.fail(403 if exc.code in {
                 "invalid_auth_context", "privileges_unavailable",
@@ -239,6 +257,13 @@ async def _stream_auto_agent_round(
         completed = False
         failure: Optional[Exception] = None
         try:
+            log_llm_dispatch(
+                state.routing_trace,
+                lane="agent",
+                endpoint_id=candidate.endpoint_id,
+                model=candidate.model,
+                endpoint_url=candidate.endpoint_url,
+            )
             async for chunk in stream_llm(
                 candidate.endpoint_url,
                 candidate.model,
@@ -306,6 +331,12 @@ async def _stream_auto_agent_round(
                 and is_recoverable_chat_dispatch_error(failure)
                 and state.switch_to_manual_fallback()
             ):
+                log_routing_fallback(
+                    state.routing_trace,
+                    from_model=candidate.model,
+                    to_model=state.active_route.target.model,
+                    reason="dispatch_failed_before_output",
+                )
                 continue
             status = failure.status_code if isinstance(failure, ChatDispatchError) else 500
             state.fail(status)
@@ -315,6 +346,12 @@ async def _stream_auto_agent_round(
         if state.committed or has_tool_proposal:
             return
         if completed and state.fallback_available and state.switch_to_manual_fallback():
+            log_routing_fallback(
+                state.routing_trace,
+                from_model=candidate.model,
+                to_model=state.active_route.target.model,
+                reason="empty_completion",
+            )
             continue
         state.fail(502)
         yield _sanitized_auto_agent_error(502)
@@ -552,6 +589,7 @@ _DOMAIN_RULES = {
     "email": """\
 ## Email rules
 - Email UIDs are the values after `UID:` in tool output, never list row numbers.
+- To find/search messages in the user's mailbox by sender, person, subject, topic, or content, use `search_emails` (not `web_search`).
 - For latest/newest email, list with `max_results: 1`, `unread_only: false`, then read the returned UID if needed.
 - For named mailboxes/accounts, call `list_email_accounts` if needed and pass the exact `account` value.
 - Bulk email actions use `bulk_email` once with explicit UIDs; do not loop one message at a time.
@@ -601,12 +639,12 @@ _DOMAIN_RULES = {
 _DOMAIN_TOOL_MAP = {
     "web": set(WEB_TOOL_NAMES),
     "documents": {"create_document", "edit_document", "update_document", "suggest_document", "manage_documents"},
-    "email": {"list_email_accounts", "list_emails", "read_email", "send_email", "reply_to_email", "bulk_email", "archive_email", "delete_email", "mark_email_read", "resolve_contact", "manage_contact"},
+    "email": {"list_email_accounts", "list_emails", "read_email", "search_emails", "send_email", "reply_to_email", "bulk_email", "archive_email", "delete_email", "mark_email_read", "resolve_contact", "manage_contact"},
     "cookbook": {"download_model", "serve_model", "serve_preset", "list_serve_presets", "list_served_models", "stop_served_model", "tail_serve_output", "list_downloads", "cancel_download", "search_hf_models", "list_cached_models", "list_cookbook_servers", "adopt_served_model"},
     "notes_calendar_tasks": {"manage_notes", "manage_calendar", "manage_tasks"},
     "ui": {"ui_control"},
     "sessions": {"create_session", "list_sessions", "manage_session", "send_to_session", "search_chats"},
-    "files": {"bash", "python", "read_file", "write_file", "edit_file", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs"},
+    "files": {"bash", "python", "read_file", "write_file", "edit_file", "grep", "glob", "ls", "get_workspace", "manage_bg_jobs", "homelab"},
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
     "contacts": {"resolve_contact", "manage_contact"},
     "integrations": {"api_call"},
@@ -754,7 +792,7 @@ Generate an image. Line 1 = description, line 2 = model name, line 3 = WxH (e.g.
 {"action": "add", "title": "<short todo>", "due_date": "<natural language or ISO datetime>"}
 ```
 Notes, checklists, AND user reminders. Use this for "create/add/write a note", todos, checklists, and "remind me to X at <time>" — never use memory for note content. For reminders, pair a short `title` (what to do) with a `due_date` (when). `due_date` accepts natural language ("tomorrow at 1pm", "in 2 hours", "next monday 9am") or ISO ("2026-05-12T13:00:00"). Actions: `list`, `add` (title, content OR items:[{text,done}], note_type, color, label, due_date), `update`, `delete`, `toggle_item`.""",
-    "list_email_accounts": "- ```list_email_accounts``` — List configured email accounts. Use this before reading/sending when the user says Gmail, work mail, custom domain mail, or any non-default mailbox; pass the returned account name/email/id as `account` to email tools.",
+    "list_email_accounts": "- ```list_email_accounts``` — List configured email accounts. Use this before reading/sending when the user explicitly names Gmail, work mail, a custom domain mailbox, or another non-default mailbox; pass the returned account name/email/id as `account` to email tools. An address in `emails/correos/correus from/de sender@example.com` is a sender filter, not a mailbox name: use search_emails directly. After account discovery, continue the original task; do not infer that the user wants to send email.",
     "send_email": """\
 ```send_email
 {"to": "recipient@example.com", "subject": "Re: Your question", "body": "Hi, ...", "account": "gmail"}
@@ -767,7 +805,7 @@ CRITICAL — signatures: DO NOT invent a sign-off name. End the body with just `
 {"folder": "INBOX", "max_results": 20, "unread_only": false, "account": "gmail"}
 ```
 List recent emails from a folder, newest first, including read messages by default. Use `list_email_accounts` first when the user names a mailbox/account, then pass `account`. For "last/latest/newest email", call with `max_results: 1` and `unread_only: false`.""",
-    "read_email": "- ```read_email``` — Read a specific email by UID. Args (JSON): {\"uid\": \"...\", \"folder\": \"INBOX\", \"account\": \"gmail\"}. Include `account` when the UID came from a named/non-default mailbox.",
+    "read_email": "- ```read_email``` — Read one email with {\"uid\": \"...\", \"folder\": \"INBOX\", \"account\": \"gmail\"}. When several known emails are needed for one summary/document/task, batch them in ONE call with {\"targets\":[{\"uid\":\"...\",\"folder\":\"INBOX\",\"account\":\"gmail\"}, ...]}; preserve each result's folder/account and at most 20 targets are accepted. Do not spend one model round per email.",
     "reply_to_email": """\
 ```reply_to_email
 {"uid": "1234", "body": "Sounds good — talk Friday.", "account": "gmail"}
@@ -1262,29 +1300,738 @@ def _assistant_requested_followup(messages: List[Dict]) -> bool:
     return False
 
 
-def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, object]:
+def _answered_ask_user_payload(messages: List[Dict]) -> Optional[Dict]:
+    """Return the persisted ask_user payload answered by the latest user turn.
+
+    ``ask_user`` ends the agent turn and stores its structured payload in the
+    preceding assistant message's ``metadata.tool_events``. The next user
+    message is therefore a continuation by construction, regardless of its
+    language or wording.
+
+    Ignore non-conversational context messages between the latest user turn and
+    the preceding assistant turn, but never cross an older user turn.
+    """
+    seen_latest_user = False
+
+    for msg in reversed(messages):
+        role = msg.get("role")
+
+        if not seen_latest_user:
+            if role == "user":
+                seen_latest_user = True
+            continue
+
+        if role == "user":
+            return False
+
+        if role != "assistant":
+            continue
+
+        metadata = msg.get("metadata") or {}
+        tool_events = metadata.get("tool_events") or []
+
+        for event in reversed(tool_events):
+            if (
+                isinstance(event, dict)
+                and event.get("tool") == "ask_user"
+                and isinstance(event.get("ask_user"), dict)
+                and str(event["ask_user"].get("question") or "").strip()
+            ):
+                return event["ask_user"]
+        return None
+
+    return None
+
+
+def _is_ask_user_followup(messages: List[Dict]) -> bool:
+    """True when the latest user turn directly answers a persisted ask_user."""
+    return _answered_ask_user_payload(messages) is not None
+
+
+def _answered_ask_user_latest_user_answer(messages: List[Dict]) -> Optional[object]:
+    """Return the latest user value only when it directly answers ask_user."""
+    seen_latest_user = False
+    latest_user_answer: Optional[object] = None
+
+    for msg in reversed(messages):
+        role = msg.get("role")
+
+        if not seen_latest_user:
+            if role == "user":
+                seen_latest_user = True
+                latest_user_answer = msg.get("content", "")
+            continue
+
+        if role == "user":
+            return None
+
+        if role != "assistant":
+            continue
+
+        metadata = msg.get("metadata") or {}
+        tool_events = metadata.get("tool_events") or []
+        if any(
+            isinstance(event, dict)
+            and event.get("tool") == "ask_user"
+            and isinstance(event.get("ask_user"), dict)
+            for event in tool_events
+        ):
+            return latest_user_answer
+        return None
+
+    return None
+
+
+def _normalize_question_for_comparison(value: object) -> str:
+    """Normalize an ask_user question for deterministic duplicate detection."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    text = "".join(" " if unicodedata.category(ch)[0] in {"P", "S"} else ch for ch in text)
+    return " ".join(text.split())
+
+
+def _is_answered_ask_user_answer_echo(
+    latest_user_answer: object,
+    response_text: object,
+) -> bool:
+    """Detect only a tiny exact normalized echo of an ask_user answer."""
+    response = _strip_think_blocks(str(response_text or "")).strip()
+    if not response or len(response) > 80 or "```" in response:
+        return False
+
+    normalized_answer = _normalize_question_for_comparison(latest_user_answer)
+    normalized_response = _normalize_question_for_comparison(response)
+    return bool(normalized_answer and normalized_response == normalized_answer)
+
+
+def _questions_are_near_duplicates(first: object, second: object) -> bool:
+    """Conservatively match the same question with small wording changes."""
+    a = _normalize_question_for_comparison(first)
+    b = _normalize_question_for_comparison(second)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    token_overlap = len(a_tokens & b_tokens) / max(len(a_tokens), len(b_tokens))
+    return token_overlap >= 0.8 and SequenceMatcher(None, a, b).ratio() >= 0.86
+
+
+def _is_textual_answered_ask_user_reconfirmation(
+    answered_question: object,
+    response_text: object,
+) -> bool:
+    """Conservatively detect a short textual re-ask of an answered question."""
+    response = _strip_think_blocks(str(response_text or "")).strip()
+    if not response or len(response) > 320 or "```" in response:
+        return False
+
+    if _questions_are_near_duplicates(answered_question, response):
+        return True
+
+    # Acknowledgement text can make the whole strings look different while the
+    # response still embeds most of the old question. Require both strong token
+    # coverage and explicit interrogative punctuation for this broader match.
+    question = _normalize_question_for_comparison(answered_question)
+    normalized_response = _normalize_question_for_comparison(response)
+    question_tokens = set(question.split())
+    response_tokens = set(normalized_response.split())
+    if "?" not in response or len(question_tokens) < 6:
+        return False
+    shared = question_tokens & response_tokens
+    return (
+        len(shared) >= 6
+        and len(shared) / len(question_tokens) >= 0.72
+        and len(shared) / len(response_tokens) >= 0.55
+    )
+
+
+def _ask_user_question_from_block(block: ToolBlock) -> str:
+    try:
+        payload = json.loads(block.content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    return str(payload.get("question") or "") if isinstance(payload, dict) else ""
+
+
+def _pending_available_tool_action(text: str, available_tools: Set[str]) -> Optional[str]:
+    """Find an explicitly named available tool described as a pending action."""
+    clean = _strip_think_blocks(text or "")
+    if not clean or not available_tools:
+        return None
+    pending_prefix = (
+        r"(?:the\s+)?next\s+step\s+is|the\s+tool\s+call\s+would\s+be|"
+        r"i\s+need\s+to|i\s+(?:should|will)\s+|let\s+me\s+"
+    )
+    for tool_name in sorted(available_tools, key=len, reverse=True):
+        if not tool_name:
+            continue
+        tool_pattern = re.escape(tool_name)
+        match = re.search(
+            rf"(?:{pending_prefix})\b[^\n]{{0,220}}\b{tool_pattern}\b",
+            clean,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        sentence_start = max(clean.rfind("\n", 0, match.start()), clean.rfind(".", 0, match.start())) + 1
+        sentence_end_candidates = [
+            pos for pos in (clean.find("\n", match.end()), clean.find(".", match.end()))
+            if pos >= 0
+        ]
+        sentence_end = min(sentence_end_candidates) if sentence_end_candidates else min(len(clean), match.end() + 180)
+        sentence = clean[sentence_start:sentence_end]
+        if re.search(
+            rf"\b(?:cannot|can't|can\s+not|unable\s+to|not\s+able\s+to|should\s+not|will\s+not|do\s+not|don't)\b[^\n]{{0,120}}\b{tool_pattern}\b|"
+            rf"\b{tool_pattern}\b[^\n]{{0,80}}\b(?:unavailable|disabled|not\s+available)\b",
+            sentence,
+            re.IGNORECASE,
+        ):
+            continue
+        return tool_name
+    return None
+
+
+def _email_retrieval_target_key(
+    *,
+    uid: Any = None,
+    message_id: Any = None,
+    folder: Any = None,
+    account: Any = None,
+) -> tuple[str, str, str, str]:
+    """Stable request-local identity for one searched/read email."""
+    return (
+        str(uid or "").strip(),
+        str(message_id or "").strip(),
+        str(folder or "INBOX").strip() or "INBOX",
+        str(account or "").strip(),
+    )
+
+
+_EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS = 100
+
+
+def _has_exhaustive_email_intent(text: str) -> bool:
+    """Recognize explicit, multilingual requests for the complete email set."""
+    normalized = unicodedata.normalize("NFKD", str(text or "").lower())
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    return bool(re.search(
+        r"\b(?:"
+        r"(?:all|every)\s+(?:the\s+)?(?:e-?mails?|messages?)|"
+        r"tots?\s+(?:els?\s+)?(?:correus|e-?mails?)|"
+        r"todos?\s+(?:los\s+)?(?:correos|e-?mails?)|"
+        r"(?:complete|full)\s+(?:e-?mail\s+)?history"
+        r")\b",
+        normalized,
+    ))
+
+
+def _email_search_arguments_for_intent(
+    block_content: str,
+    *,
+    exhaustive: bool,
+) -> str:
+    """Raise only the supported per-folder limit for explicit exhaustive work.
+
+    The email MCP has no pagination contract. Its only discovery control is
+    ``max_results`` per folder, so exhaustive requests use a documented bounded
+    ceiling instead of inventing cursor/offset arguments. Ordinary searches
+    retain the model's exact arguments and legacy default.
+    """
+    if not exhaustive:
+        return block_content
+    try:
+        arguments = json.loads(block_content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return block_content
+    if not isinstance(arguments, dict):
+        return block_content
+    arguments["max_results"] = _EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS
+    return json.dumps(arguments, ensure_ascii=False)
+
+
+def _email_canonical_identity(item: Dict[str, Any]) -> tuple[str, ...]:
+    """Return RFC Message-ID identity, or a conservative content fallback."""
+    message_id = str(
+        item.get("resolved_message_id") or item.get("message_id") or ""
+    ).strip()
+    if message_id:
+        return "message-id", message_id.casefold()
+    # Without an RFC identity, only collapse records whose stable retrieved
+    # envelope and exact body all agree. Folder and UID are deliberately not
+    # included because Gmail exposes one RFC message through several folders.
+    return (
+        "fallback",
+        str(item.get("resolved_account_email") or item.get("account_email") or "").strip().casefold(),
+        str(item.get("subject") or "").strip(),
+        str(item.get("from_address") or item.get("from") or "").strip().casefold(),
+        str(item.get("to") or item.get("recipients") or "").strip().casefold(),
+        str(item.get("cc") or "").strip().casefold(),
+        str(item.get("date") or "").strip(),
+        str(item.get("body") or item.get("content") or ""),
+    )
+
+
+_EMAIL_READ_BATCH_MAX_TARGETS = 20
+
+
+def _email_pending_read_batch(
+    expected: Set[tuple[str, str, str, str]],
+    terminal: Set[tuple[str, str, str, str]],
+) -> tuple[tuple[str, str, str, str], ...]:
+    """Return the next stable batch of searched targets still requiring a read."""
+    return tuple(sorted(expected - terminal)[:_EMAIL_READ_BATCH_MAX_TARGETS])
+
+
+def _email_read_batch_arguments(
+    batch: tuple[tuple[str, str, str, str], ...],
+) -> Dict[str, list[Dict[str, str]]]:
+    """Render canonical retrieval identities as the existing read_email payload."""
+    targets = []
+    for uid, message_id, folder, account in batch:
+        target = {"folder": folder}
+        if uid:
+            target["uid"] = uid
+        if message_id:
+            target["message_id"] = message_id
+        if account:
+            target["account"] = account
+        targets.append(target)
+    return {"targets": targets}
+
+
+def _email_search_targets_from_result(block_content: str, result: Dict) -> Set[tuple[str, str, str, str]]:
+    """Extract only the explicit UID/folder set returned by search_emails."""
+    try:
+        arguments = json.loads(block_content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    account = arguments.get("account")
+    # MCPManager returns TextContent as stdout, while direct/synthetic tool
+    # handlers commonly use output/content/results. Parse the full execution
+    # result here, before the separate UI/persistence truncation path.
+    raw = str(
+        result.get("stdout")
+        or result.get("output")
+        or result.get("content")
+        or result.get("results")
+        or ""
+    )
+    targets: Set[tuple[str, str, str, str]] = set()
+    for match in re.finditer(
+        r"(?ms)^\s*\d+\.\s+.*?(?=^\s*\d+\.\s+|\Z)",
+        raw,
+    ):
+        item = match.group(0)
+        uid_match = re.search(r"(?m)^\s*UID:\s*(\S+)\s*$", item)
+        if not uid_match:
+            continue
+        resolved_folder_match = re.search(
+            r"(?m)^\s*Resolved Folder:\s*(.+?)\s*$",
+            item,
+        )
+        folder_match = re.search(r"(?m)^\s*Folder:\s*(.+?)\s*$", item)
+        targets.add(_email_retrieval_target_key(
+            uid=uid_match.group(1),
+            folder=(
+                resolved_folder_match.group(1)
+                if resolved_folder_match
+                else folder_match.group(1)
+                if folder_match
+                else str(arguments.get("folder") or "INBOX")
+            ),
+            account=account,
+        ))
+    return targets
+
+
+def _email_search_result_is_incomplete(result: Dict) -> bool:
+    """Detect the email MCP's explicit per-folder discovery ceiling marker."""
+    raw = str(
+        result.get("stdout")
+        or result.get("output")
+        or result.get("content")
+        or result.get("results")
+        or ""
+    )
+    return "[DISCOVERY INCOMPLETE:" in raw
+
+
+def _email_read_progress_from_result(
+    block_content: str,
+    result: Dict,
+) -> tuple[Set[tuple[str, str, str, str]], Set[tuple[str, str, str, str]]]:
+    """Return terminal and usable searched-target identities from one read."""
+    try:
+        arguments = json.loads(block_content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return set(), set()
+
+    raw_targets = arguments.get("targets")
+    if isinstance(raw_targets, list):
+        requested = [target if isinstance(target, dict) else {} for target in raw_targets]
+    else:
+        requested = [arguments]
+    requested_keys = [
+        _email_retrieval_target_key(
+            uid=target.get("uid"),
+            message_id=target.get("message_id"),
+            folder=target.get("folder"),
+            account=target.get("account"),
+        )
+        for target in requested
+    ]
+
+    raw = str(
+        result.get("stdout")
+        or result.get("output")
+        or result.get("content")
+        or result.get("results")
+        or ""
+    )
+    terminal: Set[tuple[str, str, str, str]] = set()
+    usable: Set[tuple[str, str, str, str]] = set()
+    if isinstance(raw_targets, list):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return terminal, usable
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return terminal, usable
+        for fallback_index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            index = item.get("index", fallback_index)
+            if not isinstance(index, int) or index < 0 or index >= len(requested_keys):
+                continue
+            if item.get("status") not in {"success", "error", "omitted"}:
+                continue
+            # These omissions mean the message body was not returned. Keep the
+            # target pending so a later bounded batch can attempt it.
+            if (
+                item.get("status") == "omitted"
+                and item.get("reason") in {
+                    "target_limit_exceeded",
+                    "aggregate_body_cap_reached",
+                }
+            ):
+                continue
+            key = requested_keys[index]
+            terminal.add(key)
+            if item.get("status") == "success" and str(item.get("body") or "").strip():
+                usable.add(key)
+        return terminal, usable
+
+    if requested_keys and raw and not raw.lstrip().lower().startswith("error:") and not result.get("error"):
+        terminal.add(requested_keys[0])
+        # Legacy read_email emits headers plus the full body. Treat a non-error
+        # result as usable; batch mode remains the preferred bounded path.
+        usable.add(requested_keys[0])
+    elif requested_keys and (result.get("error") or raw.lstrip().lower().startswith("error:")):
+        terminal.add(requested_keys[0])
+    return terminal, usable
+
+
+def _email_document_items_from_result(block_content: str, result: Dict) -> list[Dict[str, str]]:
+    """Return structured successful messages from one completed read call."""
+    try:
+        arguments = json.loads(block_content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return []
+
+    raw = str(
+        result.get("stdout")
+        or result.get("output")
+        or result.get("content")
+        or result.get("results")
+        or ""
+    )
+    targets = arguments.get("targets")
+    if isinstance(targets, list):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [
+            {
+                "uid": str(item.get("uid") or ""),
+                "message_id": str(item.get("message_id") or ""),
+                "folder": str(item.get("folder") or ""),
+                "account": str(item.get("account") or ""),
+                "resolved_uid": str(item.get("resolved_uid") or ""),
+                "resolved_message_id": str(item.get("resolved_message_id") or ""),
+                "resolved_folder": str(item.get("resolved_folder") or item.get("folder") or ""),
+                "resolved_account": str(item.get("resolved_account") or ""),
+                "resolved_account_email": str(item.get("resolved_account_email") or ""),
+                "subject": str(item.get("subject") or "(No subject)"),
+                "from": str(item.get("from") or item.get("from_address") or ""),
+                "from_address": str(item.get("from_address") or ""),
+                "to": str(item.get("to") or item.get("recipients") or ""),
+                "cc": str(item.get("cc") or ""),
+                "date": str(item.get("date") or ""),
+                "body": str(item.get("body") or ""),
+                "attachments": item.get("attachments") if isinstance(item.get("attachments"), list) else [],
+            }
+            for item in items
+            if isinstance(item, dict)
+            and item.get("status") == "success"
+        ]
+
+    if not raw or result.get("error") or raw.lstrip().lower().startswith("error:"):
+        return []
+
+    def _header(name: str) -> str:
+        match = re.search(rf"(?mi)^\*\*{name}:\*\*\s*(.*?)\s*$", raw)
+        return match.group(1) if match else ""
+
+    body = raw.split("\n---\n", 1)[-1].strip()
+    if not body:
+        return []
+    return [{
+        "subject": _header("Subject") or "(No subject)",
+        "from": _header("From"),
+        "date": _header("Date"),
+        "body": body,
+    }]
+
+
+def _requires_lossless_email_document(text: str) -> bool:
+    """Limit deterministic corpus assembly to explicit exhaustive artifacts."""
+    if not _has_exhaustive_email_intent(text):
+        return False
+    normalized = unicodedata.normalize("NFKD", str(text or "").lower())
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    return bool(re.search(
+        r"\b(?:document|doc|word|list|listing|archive|history|"
+        r"documento|document|llista|lista|arxiu|archivo|historial)\b",
+        normalized,
+    ))
+
+
+def _deduplicate_email_document_items(items: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """Keep the first retrieved representation of each canonical RFC message."""
+    unique: list[Dict[str, Any]] = []
+    seen: Set[tuple[str, ...]] = set()
+    for item in items:
+        identity = _email_canonical_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(item)
+    return unique
+
+
+def _email_document_sort_key(item: Dict[str, Any]) -> tuple[Any, ...]:
+    """Sort valid RFC dates ascending; malformed/missing dates last, stably."""
+    original = str(item.get("date") or "").strip()
+    try:
+        parsed = parsedate_to_datetime(original)
+        if parsed is None:
+            raise ValueError("missing parsed date")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        timestamp = parsed.astimezone(datetime.timezone.utc)
+        return 0, timestamp, _email_canonical_identity(item)
+    except (TypeError, ValueError, OverflowError):
+        return (
+            1,
+            datetime.datetime.max.replace(tzinfo=datetime.timezone.utc),
+            original,
+            _email_canonical_identity(item),
+        )
+
+
+def _render_lossless_email_document(
+    items: list[Dict[str, Any]], *, discovery_complete: bool = True,
+) -> str:
+    """Render exactly one deterministic section per canonical retrieved email."""
+    unique = sorted(_deduplicate_email_document_items(items), key=_email_document_sort_key)
+    sections = []
+    for item in unique:
+        identity = _email_canonical_identity(item)
+        identity_text = (
+            identity[1]
+            if identity[0] == "message-id"
+            else "fallback-sha256:" + hashlib.sha256(
+                repr(identity).encode("utf-8")
+            ).hexdigest()
+        )
+        metadata = [f"**Canonical identity:** {identity_text}"]
+        for label, field in (
+            ("Folder", "resolved_folder"),
+            ("UID", "resolved_uid"),
+            ("Subject", "subject"),
+            ("From", "from"),
+            ("From address", "from_address"),
+            ("To", "to"),
+            ("Cc", "cc"),
+            ("Date", "date"),
+        ):
+            value = str(item.get(field) or "")
+            if value:
+                metadata.append(f"**{label}:** {value}")
+        attachments = item.get("attachments")
+        if isinstance(attachments, list) and attachments:
+            metadata.append("**Attachments:**")
+            for attachment in attachments:
+                if isinstance(attachment, dict):
+                    metadata.append(
+                        "- " + json.dumps(attachment, ensure_ascii=False, sort_keys=True)
+                    )
+        sections.append(
+            "<!-- odysseus-email-entry -->\n"
+            + "\n\n".join(metadata)
+            + "\n\n**Body:**\n\n"
+            + str(item.get("body") or "")
+        )
+    notice = ""
+    if not discovery_complete:
+        notice = (
+            "Discovery reached the email backend's bounded per-folder limit. "
+            "This document contains every unique successfully retrieved message, "
+            "but is not guaranteed to contain every mailbox match.\n\n"
+        )
+    return "# Retrieved emails\n\n" + notice + "\n\n---\n\n".join(sections)
+
+
+def _required_email_document_block(
+    items: list[Dict[str, str]], user_request: str, *, title: Optional[str] = None,
+    lossless: bool = False, discovery_complete: bool = True,
+) -> Optional[ToolBlock]:
+    """Build the required artifact directly from already retrieved email bodies."""
+    if lossless:
+        unique = _deduplicate_email_document_items(items)
+        if not unique:
+            return None
+        content = _render_lossless_email_document(
+            unique,
+            discovery_complete=discovery_complete,
+        )
+        document_title = title or "Retrieved emails"
+        if not discovery_complete:
+            document_title = "Retrieved email subset"
+        return function_call_to_tool_block("create_document", json.dumps({
+            "title": document_title,
+            "language": "markdown",
+            "content": content,
+        }, ensure_ascii=False))
+
+    substantive = [item for item in items if str(item.get("body") or "").strip()]
+    if not substantive:
+        return None
+
+    request_lc = str(user_request or "").lower()
+    if "date" in request_lc and re.search(r"\b(?:sort|order|ordered|chronolog)", request_lc):
+        def _date_key(item: Dict[str, str]) -> tuple[int, datetime.datetime]:
+            try:
+                parsed = parsedate_to_datetime(str(item.get("date") or "").strip())
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+                return 0, parsed.astimezone(datetime.timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                return 1, datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+
+        reverse = bool(re.search(r"\b(?:newest|latest|descending|reverse)\b", request_lc))
+        substantive = sorted(substantive, key=_date_key, reverse=reverse)
+
+    sections = []
+    for item in substantive:
+        metadata = []
+        if item.get("from"):
+            metadata.append(f"**From:** {item['from']}")
+        if item.get("date"):
+            metadata.append(f"**Date:** {item['date']}")
+        sections.append(
+            "## " + str(item.get("subject") or "(No subject)")
+            + ("\n\n" + "\n\n".join(metadata) if metadata else "")
+            + "\n\n" + str(item["body"]).strip()
+        )
+    content = "# Retrieved emails\n\n" + "\n\n---\n\n".join(sections)
+    return function_call_to_tool_block("create_document", json.dumps({
+        "title": "Retrieved emails",
+        "language": "markdown",
+        "content": content,
+    }, ensure_ascii=False))
+
+
+_EXPLICIT_EMAIL_SENDER_RE = re.compile(
+    r"\b(?:e-?mails?|correos?|correus)\s+(?:from|de)\s+"
+    r"(?P<address>[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+    r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+)",
+    re.IGNORECASE,
+)
+
+
+def _explicit_email_sender_address(text: str) -> Optional[str]:
+    """Return an address explicitly used as an email sender constraint."""
+    match = _EXPLICIT_EMAIL_SENDER_RE.search(str(text or ""))
+    return match.group("address") if match else None
+
+
+def _classify_agent_request(
+    messages: List[Dict],
+    last_user: str,
+    *,
+    conversation_messages: Optional[List[Dict]] = None,
+) -> Dict[str, object]:
     """Classify only whether this turn deserves domain tool retrieval.
 
     Normal chat should not inherit old Cookbook/email/document context. Recent
-    context is used only for explicit continuations ("yes", "do it", "1").
+    context is used for explicit continuations ("yes", "do it", "1") and for
+    replies to a structured ``ask_user`` interaction.
     This function does not inject tools directly; selected tools later decide
     which domain rule packs get appended to the system prompt.
     """
     text = str(last_user or "").strip()
-    retry_continuation = _is_contextual_retry_continuation(messages, text)
-    continuation = _is_explicit_continuation(text) or _assistant_requested_followup(messages) or retry_continuation
-    retrieval_query = _recent_context_for_retrieval(messages) if continuation else text
+    conversation = messages if conversation_messages is None else conversation_messages
+    ask_user_followup = _is_ask_user_followup(conversation)
+    retry_continuation = _is_contextual_retry_continuation(conversation, text)
+    continuation = (
+        ask_user_followup
+        or _is_explicit_continuation(text)
+        or _assistant_requested_followup(conversation)
+        or retry_continuation
+    )
+    retrieval_query = _recent_context_for_retrieval(conversation) if continuation else text
     q = retrieval_query.lower()
+    explicit_email_sender = _explicit_email_sender_address(retrieval_query)
 
-    if not text or bool(_LOW_SIGNAL_RE.match(text)) or _is_casual_low_signal(text):
+    if (
+        not text
+        or (
+            not ask_user_followup
+            and (
+                bool(_LOW_SIGNAL_RE.match(text))
+                or _is_casual_low_signal(text)
+            )
+        )
+    ):
         return {
             "low_signal": True,
             "continuation": False,
             "domains": set(),
             "retrieval_query": text,
+            "explicit_email_sender": None,
         }
 
     domains: Set[str] = set()
+
+    # An explicit multilingual "emails from <address>" construction is
+    # sufficient email intent even when the address is not a Gmail domain and
+    # the surrounding mailbox noun is outside the older English keyword set.
+    if explicit_email_sender:
+        domains.add("email")
 
     def has(*patterns: str) -> bool:
         return any(re.search(p, q) for p in patterns)
@@ -1304,11 +2051,17 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
         r"ruby|php|swift|kotlin|bash|shell|html|css|sql)\b",
         r"\b(?:code|script|program|game|function|class|module|app)\b",
     )
-    if has(r"\b(documents?|docs?|draft|compose|poem|story|essay|outline|letter|edit|rewrite|proofread|suggest|feedback|review this|make a file)\b"):
+    if has(r"\b(documents?|documentos?|docs?|draft|compose|poem|story|essay|outline|letter|edit|rewrite|proofread|suggest|feedback|review this|make a file)\b"):
         domains.add("documents")
     if "notes_calendar_tasks" not in domains and has(r"\bwrite\b"):
         domains.add("documents")
-    if has(r"\b(search|web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b"):
+    if has(
+        r"\b(web|google|look up|latest|news|current|weather|forecast|stock price|price of|website|url|https?://|www\.)\b",
+        r"\b(noticias|actualidad)\b",
+        r"\b(?:buscar|busca|busque)\b.*\b(?:internet|web|online|noticias|actualidad|informaci[oó]n\s+actual|últimas?|ultimas?|últimos?|ultimos?)\b",
+        r"\b(notícies|noticies|actualitat)\b",
+        r"\b(?:cercar|cerca|buscar|busca)\b.*\b(?:internet|web|online|notícies|noticies|actualitat|informació\s+actual|últimes?|ultimes?|darreres?)\b",
+    ) or ("email" not in domains and has(r"\bsearch\b")):
         domains.add("web")
     if has(
         r"\b(wyszukaj|wyszukać|wyszukac)\b.*\b(internet|internecie|online|web)\b",
@@ -1355,12 +2108,28 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
            r"\b(?:home ?assistant|miniflux|gitea|linkding|jellyfin)\b"):
         domains.add("integrations")
 
+    # Deterministic read-only homelab inspection intent.
+    # Keep this narrower than generic Docker/GPU discussion: both a homelab
+    # subject and an inspection/status expression must be present.
+    _homelab_subject = has(
+        r"\b(homelab|home\s*lab|docker|containers?|contenedores?|gpu|vram|"
+        r"palworld|services?|servicios?)\b"
+    )
+    _homelab_inspection = has(
+        r"\b(status|state|health|check|inspect|running|active|usage|temperature|"
+        r"how many|estado|estat|com\\s+est[aà]|comprueba|comprobar|revisa|revisar|funcionando|"
+        r"activos?|uso|temperatura|cu[aá]ntos?)\b"
+    )
+    if _homelab_subject and _homelab_inspection:
+        domains.add("homelab")
+
     low_signal = not continuation and not domains
     return {
         "low_signal": low_signal,
         "continuation": continuation,
         "domains": domains,
         "retrieval_query": retrieval_query,
+        "explicit_email_sender": explicit_email_sender,
     }
 
 
@@ -2101,12 +2870,13 @@ def _build_system_prompt(
     # or ui_control open_email_reply after the first tool round.
     _inject_style = False
     _EMAIL_TOOL_HINTS = {
-        "list_email_accounts", "send_email", "reply_to_email", "list_emails", "read_email",
+        "list_email_accounts", "send_email", "reply_to_email", "list_emails", "read_email", "search_emails",
         "bulk_email", "archive_email", "delete_email", "mark_email_read",
         "resolve_contact", "ui_control",
         "mcp__email__list_email_accounts",
         "mcp__email__send_email", "mcp__email__reply_to_email",
         "mcp__email__list_emails", "mcp__email__read_email",
+        "mcp__email__search_emails",
         "mcp__email__bulk_email", "mcp__email__archive_email",
         "mcp__email__delete_email", "mcp__email__mark_email_read",
     }
@@ -2816,6 +3586,210 @@ def _detect_runaway_call(call_freq, threshold=15):
     return sig.split(":", 1)[0] if sig else None
 
 
+def _homelab_doctor_response(
+    output: str,
+    user_text: str,
+) -> str | None:
+    """Render authoritative whole-homelab doctor JSON without an LLM."""
+    raw = str(output or "").strip()
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    required = {
+        "ok",
+        "errors",
+        "warnings",
+        "issues",
+        "checked_services",
+        "observed_containers",
+    }
+    if not required.issubset(data):
+        return None
+
+    try:
+        errors = int(data.get("errors") or 0)
+        warnings = int(data.get("warnings") or 0)
+        checked = int(data.get("checked_services") or 0)
+        observed = int(data.get("observed_containers") or 0)
+    except (TypeError, ValueError):
+        return None
+
+    issues = data.get("issues") or []
+    if not isinstance(issues, list):
+        return None
+
+    latest = str(user_text or "").casefold()
+
+    if any(x in latest for x in ("diagnòst", "meu homelab", "fes un")):
+        title = "## Diagnòstic del homelab"
+        state = "**correcte**" if data.get("ok") else "**amb incidències**"
+        labels = ("Estat", "Errors", "Avisos", "Serveis comprovats", "Contenidors observats")
+        issues_title = "### Incidències"
+        no_issues = "No s'han detectat incidències."
+        warning_word = "AVÍS"
+    elif any(x in latest for x in ("diagnose", "diagnostic", "my homelab")):
+        title = "## Homelab diagnostic"
+        state = "**healthy**" if data.get("ok") else "**issues detected**"
+        labels = ("Status", "Errors", "Warnings", "Services checked", "Containers observed")
+        issues_title = "### Issues"
+        no_issues = "No issues were detected."
+        warning_word = "WARNING"
+    else:
+        title = "## Diagnóstico del homelab"
+        state = "**correcto**" if data.get("ok") else "**con incidencias**"
+        labels = ("Estado", "Errores", "Avisos", "Servicios comprobados", "Contenedores observados")
+        issues_title = "### Incidencias"
+        no_issues = "No se han detectado incidencias."
+        warning_word = "AVISO"
+
+    lines = [
+        title,
+        "",
+        f"- {labels[0]}: {state}",
+        f"- {labels[1]}: **{errors}**",
+        f"- {labels[2]}: **{warnings}**",
+        f"- {labels[3]}: **{checked}**",
+        f"- {labels[4]}: **{observed}**",
+    ]
+
+    if not issues:
+        return "\n".join(lines + ["", no_issues])
+
+    lines += ["", issues_title]
+
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+
+        severity = str(issue.get("severity") or "issue").lower()
+        label = warning_word if severity == "warning" else severity.upper()
+        service = str(issue.get("service") or "homelab")
+        code = str(issue.get("code") or "unknown")
+        message = str(issue.get("message") or "").strip()
+
+        line = f"- [{label}] **{service}** · `{code}`"
+        if message:
+            line += f": {message}"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def _healthy_homelab_diagnostic_response(
+    output: str,
+    user_text: str,
+) -> str | None:
+    """Return a factual terminal reply for an unequivocally healthy service."""
+    rendered = str(output or "").strip()
+
+    if not rendered:
+        return None
+
+    folded = rendered.casefold()
+
+    if (
+        "- estado: **ok**" not in folded
+        or "- runtime: `running`" not in folded
+    ):
+        return None
+
+    match = re.search(
+        r"(?mi)^##\s+estado de\s+(.+?)\s*$",
+        rendered,
+    )
+
+    service = (
+        match.group(1).strip()
+        if match
+        else "El servicio"
+    )
+
+    health_unavailable = bool(
+        re.search(
+            r"(?mi)^-\s*salud:\s*`?n/d`?\s*$",
+            rendered,
+        )
+    )
+
+    latest = str(user_text or "").casefold()
+
+    is_catalan = any(
+        token in latest
+        for token in (
+            "per què",
+            "per que",
+            "caigut",
+            "caiguda",
+            "estat de",
+            "està caigut",
+            "esta caigut",
+        )
+    )
+
+    is_english = bool(
+        re.search(
+            r"\bwhy\b|\bdown\b|\bstatus\b",
+            latest,
+        )
+    )
+
+    if is_catalan:
+        response = (
+            f"{service} no està caigut: "
+            "l'operador informa d'un estat **OK** "
+            "i el contenidor està en execució "
+            "(`running`)."
+        )
+
+        if health_unavailable:
+            response += (
+                " `Salut: n/d` significa que no hi "
+                "ha dades de healthcheck disponibles; "
+                "no indica una fallada."
+            )
+
+        return response
+
+    if is_english:
+        response = (
+            f"{service} is not down: the operator "
+            "reports **OK** and the container is "
+            "running (`running`)."
+        )
+
+        if health_unavailable:
+            response += (
+                " `Health: n/a` means no health-check "
+                "data is available; it is not evidence "
+                "of a failure."
+            )
+
+        return response
+
+    response = (
+        f"{service} no está caído: el operador "
+        "informa de un estado **OK** y el "
+        "contenedor está en ejecución (`running`)."
+    )
+
+    if health_unavailable:
+        response += (
+            " `Salud: n/d` significa que no hay "
+            "datos de healthcheck disponibles; "
+            "no indica un fallo."
+        )
+
+    return response
+
+
 async def stream_agent_loop(
     endpoint_url: str,
     model: str,
@@ -2839,10 +3813,13 @@ async def stream_agent_loop(
     tool_policy: Optional[ToolPolicy] = None,
     workspace: Optional[str] = None,
     forced_tools: Optional[Set[str]] = None,
+    exclusive_tools: Optional[Set[str]] = None,
     uploaded_files: Optional[List[Dict]] = None,
     workload: str = "foreground",
     _is_teacher_run: bool = False,
     route_state: Optional[AgentRouteState] = None,
+    routing_trace: Optional[str] = None,
+    conversation_history: Optional[List[Dict]] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
 
@@ -2887,16 +3864,40 @@ async def stream_agent_loop(
     _last_user = _extract_last_user_message(messages)
     _ody_qwen_finetune_model = (model or "").lower().startswith("odysseus-qwen3")
     _ody_memory_identity_turn = _looks_like_memory_identity_turn(_last_user)
-    _intent = _classify_agent_request(messages, _last_user)
+    # The model prompt may contain recalled/RAG/synthetic context. Only the
+    # route-owned session history can establish conversational adjacency.
+    _conversation_messages = (
+        messages if conversation_history is None else conversation_history
+    )
+    _intent = _classify_agent_request(
+        messages,
+        _last_user,
+        conversation_messages=_conversation_messages,
+    )
+    _explicit_email_sender = str(
+        _intent.get("explicit_email_sender") or ""
+    ).strip()
+    _ask_user_followup_turn = _is_ask_user_followup(_conversation_messages)
+    _answered_ask_user = (
+        _answered_ask_user_payload(_conversation_messages)
+        if _ask_user_followup_turn
+        else None
+    )
+    _answered_ask_user_answer = (
+        _answered_ask_user_latest_user_answer(_conversation_messages)
+        if _ask_user_followup_turn
+        else None
+    )
     _low_signal_turn = bool(_intent.get("low_signal"))
     _casual_low_signal_turn = _is_casual_low_signal(_last_user)
-    _existing_conversation = _user_turn_count(messages) > 1
+    _existing_conversation = _user_turn_count(_conversation_messages) > 1
     _active_document_relevant = _turn_targets_active_document(_intent, _last_user, active_document)
     _active_email_draft_relevant = _active_document_relevant and _is_email_document_obj(active_document)
     if _active_email_draft_relevant:
         disabled_tools.update({
-            "list_email_accounts", "list_emails", "read_email",
+            "list_email_accounts", "list_emails", "read_email", "search_emails",
             "mcp__email__list_emails", "mcp__email__read_email",
+            "mcp__email__search_emails",
         })
     _prompt_active_document = active_document if _active_document_relevant else None
     _direct_low_signal = (
@@ -2916,6 +3917,8 @@ async def stream_agent_loop(
     # Tool retrieval uses the latest message by default. It may inherit recent
     # user turns only for explicit continuations ("yes", "do it", "1").
     _retrieval_query = str(_intent.get("retrieval_query") or _last_user)
+    _exhaustive_email_intent = _has_exhaustive_email_intent(_retrieval_query)
+    _lossless_email_document = _requires_lossless_email_document(_retrieval_query)
     logger.info(
         "[agent-intent] latest=%r continuation=%s low_signal=%s domains=%s active_doc_relevant=%s retrieval_query=%r",
         _last_user[:120],
@@ -2931,6 +3934,1148 @@ async def stream_agent_loop(
             _last_user[:80],
         )
     _mcp_disabled_map = _load_mcp_disabled_map() if mcp_mgr else {}
+
+    # Explicit Palworld start and confirmed stop requests are deterministic.
+    # Start is immediate for administrators. Stop requires a short-lived
+    # owner/session authorization and always creates a verified backup first.
+    try:
+        from src.services.homelab.palworld_lifecycle import (
+            classify_palworld_lifecycle_turn
+            as _classify_palworld_lifecycle_turn,
+        )
+
+        _palworld_lifecycle_turn = (
+            _classify_palworld_lifecycle_turn(
+                _last_user,
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+    except Exception as _lifecycle_classify_error:
+        logger.warning(
+            "[agent-action] Palworld lifecycle "
+            "classification failed: %s",
+            _lifecycle_classify_error,
+        )
+        _palworld_lifecycle_turn = None
+
+    _palworld_lifecycle_plain_context = (
+        _palworld_lifecycle_turn is not None
+        and not guide_only
+        and not plan_mode
+        and not approved_plan
+        and not workspace
+        and not active_email
+        and not uploaded_files
+        and not _active_document_relevant
+        and (
+            not forced_tools
+            or set(forced_tools).issubset({
+                "homelab",
+                "web_fetch",
+                "web_search",
+            })
+        )
+        and (
+            not relevant_tools
+            or set(relevant_tools) == {"homelab"}
+        )
+        and (
+            not exclusive_tools
+            or set(exclusive_tools) == {"homelab"}
+        )
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    )
+
+    if _palworld_lifecycle_plain_context:
+        from src.tool_security import (
+            owner_is_admin_or_single_user
+            as _owner_can_control_palworld,
+        )
+
+        _lifecycle_started = time.time()
+
+        _lifecycle_action = str(
+            _palworld_lifecycle_turn.get(
+                "action"
+            )
+            or ""
+        )
+
+        _lifecycle_kind = str(
+            _palworld_lifecycle_turn.get(
+                "kind"
+            )
+            or ""
+        )
+
+        _lifecycle_effectful = (
+            _lifecycle_action == "start"
+            or (
+                _lifecycle_action == "stop"
+                and _lifecycle_kind
+                == "confirmation"
+            )
+        )
+
+        _lifecycle_command_action = (
+            "palworld_start"
+            if _lifecycle_action == "start"
+            else "palworld_stop_confirmed"
+        )
+
+        _lifecycle_command = json.dumps(
+            {
+                "action":
+                    _lifecycle_command_action,
+            },
+            ensure_ascii=False,
+        )
+
+        if _lifecycle_effectful:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_start",
+                    "tool": "homelab",
+                    "command": _lifecycle_command,
+                    "full_command":
+                        _lifecycle_command,
+                    "round": 0,
+                })
+                + "\n\n"
+            )
+
+        _lifecycle_confirmation_required = False
+
+        try:
+            if not _owner_can_control_palworld(
+                owner
+            ):
+                raise PermissionError(
+                    "Esta acción requiere una "
+                    "sesión de administrador"
+                )
+
+            if (
+                _lifecycle_action == "stop"
+                and not str(
+                    session_id or ""
+                ).strip()
+            ):
+                raise PermissionError(
+                    "La parada requiere una "
+                    "sesión persistente"
+                )
+
+            if _lifecycle_action == "start":
+                from src.services.homelab.palworld_lifecycle import (
+                    format_start_result
+                    as _format_start_result,
+                    start_palworld_verified
+                    as _start_palworld_verified,
+                )
+
+                _lifecycle_result = (
+                    await asyncio.to_thread(
+                        _start_palworld_verified
+                    )
+                )
+
+                _lifecycle_text = (
+                    _format_start_result(
+                        _lifecycle_result,
+                        _last_user,
+                    )
+                )
+
+            elif (
+                _lifecycle_action == "stop"
+                and _lifecycle_kind == "request"
+            ):
+                from src.services.homelab.palworld_lifecycle import (
+                    format_stop_confirmation
+                    as _format_stop_confirmation,
+                    prepare_palworld_stop_confirmation
+                    as _prepare_palworld_stop_confirmation,
+                )
+
+                _lifecycle_result = (
+                    await asyncio.to_thread(
+                        _prepare_palworld_stop_confirmation,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                    )
+                )
+
+                _lifecycle_text = (
+                    _format_stop_confirmation(
+                        _lifecycle_result,
+                        _last_user,
+                    )
+                )
+
+                _lifecycle_confirmation_required = True
+
+            elif (
+                _lifecycle_action == "stop"
+                and _lifecycle_kind
+                == "confirmation"
+            ):
+                from src.services.homelab.palworld_lifecycle import (
+                    execute_confirmed_palworld_stop
+                    as _execute_confirmed_palworld_stop,
+                    format_stop_result
+                    as _format_stop_result,
+                )
+
+                _lifecycle_result = (
+                    await asyncio.to_thread(
+                        _execute_confirmed_palworld_stop,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                        code=str(
+                            _palworld_lifecycle_turn.get(
+                                "code"
+                            )
+                            or ""
+                        ),
+                    )
+                )
+
+                _lifecycle_text = (
+                    _format_stop_result(
+                        _lifecycle_result,
+                        _last_user,
+                    )
+                )
+
+            else:
+                raise RuntimeError(
+                    "Acción de ciclo de vida "
+                    "no permitida"
+                )
+
+            _lifecycle_exit_code = 0
+
+        except Exception as _lifecycle_error:
+            _safe_lifecycle_error = (
+                str(_lifecycle_error)
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .strip()[:400]
+            )
+
+            _lifecycle_text = (
+                "No se pudo completar la "
+                "solicitud sobre Palworld"
+                + (
+                    f": {_safe_lifecycle_error}"
+                    if _safe_lifecycle_error
+                    else "."
+                )
+            )
+
+            _lifecycle_exit_code = 1
+
+            logger.warning(
+                "[agent-action] Palworld lifecycle "
+                "failed closed action=%s kind=%s: %s",
+                _lifecycle_action,
+                _lifecycle_kind,
+                _safe_lifecycle_error,
+            )
+
+        _lifecycle_duration = (
+            time.time() - _lifecycle_started
+        )
+
+        if _lifecycle_effectful:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_output",
+                    "tool": "homelab",
+                    "command": _lifecycle_command,
+                    "output": _lifecycle_text,
+                    "exit_code":
+                        _lifecycle_exit_code,
+                })
+                + "\n\n"
+            )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "delta": _lifecycle_text,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "metrics",
+                "data": {
+                    "model": model,
+                    "requested_model": model,
+                    "input_tokens": estimate_tokens([{
+                        "role": "user",
+                        "content": _last_user,
+                    }]),
+                    "output_tokens": max(
+                        len(_lifecycle_text) // 4,
+                        1,
+                    ),
+                    "total_time": round(
+                        _lifecycle_duration,
+                        3,
+                    ),
+                    "response_time": round(
+                        _lifecycle_duration,
+                        3,
+                    ),
+                    "agent_rounds": 0,
+                    "tool_calls": (
+                        1
+                        if _lifecycle_effectful
+                        else 0
+                    ),
+                    "direct_palworld_lifecycle": True,
+                    "lifecycle_action":
+                        _lifecycle_action,
+                    "confirmation_required":
+                        _lifecycle_confirmation_required,
+                    "action_succeeded": (
+                        _lifecycle_effectful
+                        and _lifecycle_exit_code == 0
+                    ),
+                },
+            })
+            + "\n\n"
+        )
+
+        logger.info(
+            "[agent-action] Palworld lifecycle "
+            "completed action=%s kind=%s "
+            "exit=%s duration=%.3fs",
+            _lifecycle_action,
+            _lifecycle_kind,
+            _lifecycle_exit_code,
+            _lifecycle_duration,
+        )
+
+        yield "data: [DONE]\n\n"
+        return
+
+    # Explicit confirmed Palworld restart requests are deterministic and session-bound.
+    # The first turn only creates a short-lived authorization. The second turn
+    # must provide its exact code from the same owner and session.
+    try:
+        from src.services.homelab.palworld_restart import (
+            classify_palworld_restart_turn
+            as _classify_palworld_restart_turn,
+        )
+
+        _palworld_restart_turn = (
+            _classify_palworld_restart_turn(
+                _last_user,
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+    except Exception as _restart_classify_error:
+        logger.warning(
+            "[agent-action] Palworld restart "
+            "classification failed: %s",
+            _restart_classify_error,
+        )
+        _palworld_restart_turn = None
+
+    _palworld_restart_plain_context = (
+        _palworld_restart_turn is not None
+        and not guide_only
+        and not plan_mode
+        and not approved_plan
+        and not workspace
+        and not active_email
+        and not uploaded_files
+        and not _active_document_relevant
+        and (
+            not forced_tools
+            or set(forced_tools).issubset({
+                "homelab",
+                "web_fetch",
+                "web_search",
+            })
+        )
+        and (
+            not relevant_tools
+            or set(relevant_tools) == {"homelab"}
+        )
+        and (
+            not exclusive_tools
+            or set(exclusive_tools) == {"homelab"}
+        )
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    )
+
+    if _palworld_restart_plain_context:
+        from src.tool_security import (
+            owner_is_admin_or_single_user
+            as _owner_can_restart_palworld,
+        )
+
+        _restart_started = time.time()
+
+        _restart_kind = str(
+            _palworld_restart_turn.get("kind")
+            or ""
+        )
+
+        _restart_action_attempted = (
+            _restart_kind == "confirmation"
+        )
+
+        _restart_command = json.dumps(
+            {
+                "action":
+                    "palworld_restart_confirmed",
+            },
+            ensure_ascii=False,
+        )
+
+        if _restart_action_attempted:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_start",
+                    "tool": "homelab",
+                    "command": _restart_command,
+                    "full_command": _restart_command,
+                    "round": 0,
+                })
+                + "\n\n"
+            )
+
+        _restart_confirmation_required = False
+
+        try:
+            if not _owner_can_restart_palworld(
+                owner
+            ):
+                raise PermissionError(
+                    "Esta acción requiere una "
+                    "sesión de administrador"
+                )
+
+            if not str(session_id or "").strip():
+                raise PermissionError(
+                    "El reinicio requiere una "
+                    "sesión persistente"
+                )
+
+            if _restart_kind == "request":
+                from src.services.homelab.palworld_restart import (
+                    format_restart_confirmation
+                    as _format_restart_confirmation,
+                    prepare_palworld_restart_confirmation
+                    as _prepare_palworld_restart_confirmation,
+                )
+
+                _restart_result = (
+                    await asyncio.to_thread(
+                        _prepare_palworld_restart_confirmation,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                    )
+                )
+
+                _restart_text = (
+                    _format_restart_confirmation(
+                        _restart_result,
+                        _last_user,
+                    )
+                )
+
+                _restart_confirmation_required = True
+
+            elif _restart_kind == "confirmation":
+                from src.services.homelab.palworld_restart import (
+                    execute_confirmed_palworld_restart
+                    as _execute_confirmed_palworld_restart,
+                    format_verified_palworld_restart
+                    as _format_verified_palworld_restart,
+                )
+
+                _restart_result = (
+                    await asyncio.to_thread(
+                        _execute_confirmed_palworld_restart,
+                        owner=str(owner),
+                        session_id=str(session_id),
+                        code=str(
+                            _palworld_restart_turn.get(
+                                "code"
+                            )
+                            or ""
+                        ),
+                    )
+                )
+
+                _restart_text = (
+                    _format_verified_palworld_restart(
+                        _restart_result,
+                        _last_user,
+                    )
+                )
+
+            else:
+                raise RuntimeError(
+                    "Tipo de reinicio no permitido"
+                )
+
+            _restart_exit_code = 0
+
+        except Exception as _restart_error:
+            _safe_restart_error = (
+                str(_restart_error)
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .strip()[:400]
+            )
+
+            _restart_text = (
+                "No se pudo completar la "
+                "solicitud de reinicio de Palworld"
+                + (
+                    f": {_safe_restart_error}"
+                    if _safe_restart_error
+                    else "."
+                )
+            )
+
+            _restart_exit_code = 1
+
+            logger.warning(
+                "[agent-action] Palworld restart "
+                "failed closed kind=%s: %s",
+                _restart_kind,
+                _safe_restart_error,
+            )
+
+        _restart_duration = (
+            time.time() - _restart_started
+        )
+
+        if _restart_action_attempted:
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "tool_output",
+                    "tool": "homelab",
+                    "command": _restart_command,
+                    "output": _restart_text,
+                    "exit_code":
+                        _restart_exit_code,
+                })
+                + "\n\n"
+            )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "delta": _restart_text,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "metrics",
+                "data": {
+                    "model": model,
+                    "requested_model": model,
+                    "input_tokens": estimate_tokens([{
+                        "role": "user",
+                        "content": _last_user,
+                    }]),
+                    "output_tokens": max(
+                        len(_restart_text) // 4,
+                        1,
+                    ),
+                    "total_time": round(
+                        _restart_duration,
+                        3,
+                    ),
+                    "response_time": round(
+                        _restart_duration,
+                        3,
+                    ),
+                    "agent_rounds": 0,
+                    "tool_calls": (
+                        1
+                        if _restart_action_attempted
+                        else 0
+                    ),
+                    "direct_palworld_restart": True,
+                    "confirmation_required":
+                        _restart_confirmation_required,
+                    "confirmed_restart_attempt":
+                        _restart_action_attempted,
+                    "action_succeeded": (
+                        _restart_action_attempted
+                        and _restart_exit_code == 0
+                    ),
+                },
+            })
+            + "\n\n"
+        )
+
+        logger.info(
+            "[agent-action] Palworld restart "
+            "turn completed kind=%s exit=%s "
+            "duration=%.3fs",
+            _restart_kind,
+            _restart_exit_code,
+            _restart_duration,
+        )
+
+        yield "data: [DONE]\n\n"
+        return
+
+    # Explicit Palworld backup actions are deterministic and fail closed.
+    # They are not exposed in the LLM tool schema: only a complete command in
+    # the current user turn can reach the restricted action client.
+    try:
+        from src.services.homelab.palworld_backup import (
+            classify_explicit_palworld_backup_request
+            as _classify_explicit_palworld_backup_request,
+        )
+
+        _explicit_palworld_backup = (
+            _classify_explicit_palworld_backup_request(
+                _last_user,
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+    except Exception as _backup_classify_error:
+        logger.warning(
+            "[agent-action] Palworld backup "
+            "classification failed: %s",
+            _backup_classify_error,
+        )
+        _explicit_palworld_backup = False
+
+    _palworld_backup_plain_context = (
+        _explicit_palworld_backup
+        and not guide_only
+        and not plan_mode
+        and not approved_plan
+        and not workspace
+        and not active_email
+        and not uploaded_files
+        and not _active_document_relevant
+        and (
+            not forced_tools
+            or set(forced_tools).issubset({
+                "homelab",
+                "web_fetch",
+                "web_search",
+            })
+        )
+        and (
+            not relevant_tools
+            or set(relevant_tools) == {"homelab"}
+        )
+        and (
+            not exclusive_tools
+            or set(exclusive_tools) == {"homelab"}
+        )
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    )
+
+    if _palworld_backup_plain_context:
+        from src.tool_security import (
+            owner_is_admin_or_single_user
+            as _owner_can_run_homelab_action,
+        )
+
+        if not _owner_can_run_homelab_action(owner):
+            _denied_text = (
+                "Esta acción requiere una sesión "
+                "de administrador."
+            )
+
+            yield (
+                "data: "
+                + json.dumps({
+                    "delta": _denied_text,
+                })
+                + "\n\n"
+            )
+
+            yield (
+                "data: "
+                + json.dumps({
+                    "type": "metrics",
+                    "data": {
+                        "model": model,
+                        "requested_model": model,
+                        "input_tokens": estimate_tokens([{
+                            "role": "user",
+                            "content": _last_user,
+                        }]),
+                        "output_tokens": max(
+                            len(_denied_text) // 4,
+                            1,
+                        ),
+                        "agent_rounds": 0,
+                        "tool_calls": 0,
+                        "direct_palworld_backup": True,
+                        "action_authorized": False,
+                    },
+                })
+                + "\n\n"
+            )
+
+            logger.warning(
+                "[agent-action] denied Palworld "
+                "backup owner=%r",
+                owner,
+            )
+
+            yield "data: [DONE]\n\n"
+            return
+
+        _backup_started = time.time()
+
+        _backup_command = json.dumps(
+            {
+                "action":
+                    "palworld_backup_create",
+            },
+            ensure_ascii=False,
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "tool_start",
+                "tool": "homelab",
+                "command": _backup_command,
+                "full_command": _backup_command,
+                "round": 0,
+            })
+            + "\n\n"
+        )
+
+        try:
+            from src.services.homelab.palworld_backup import (
+                create_verified_palworld_backup
+                as _create_verified_palworld_backup,
+                format_verified_palworld_backup
+                as _format_verified_palworld_backup,
+            )
+
+            _verified_backup = await asyncio.to_thread(
+                _create_verified_palworld_backup
+            )
+
+            _backup_text = (
+                _format_verified_palworld_backup(
+                    _verified_backup,
+                    _last_user,
+                )
+            )
+
+            _backup_exit_code = 0
+
+        except Exception as _backup_error:
+            _safe_backup_error = (
+                str(_backup_error)
+                .replace("\r", " ")
+                .replace("\n", " ")
+                .strip()[:400]
+            )
+
+            _backup_text = (
+                "No se pudo completar el backup "
+                "de Palworld"
+                + (
+                    f": {_safe_backup_error}"
+                    if _safe_backup_error
+                    else "."
+                )
+            )
+
+            _backup_exit_code = 1
+
+            logger.warning(
+                "[agent-action] Palworld backup "
+                "failed closed: %s",
+                _safe_backup_error,
+            )
+
+        _backup_duration = (
+            time.time() - _backup_started
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "tool_output",
+                "tool": "homelab",
+                "command": _backup_command,
+                "output": _backup_text,
+                "exit_code": _backup_exit_code,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "delta": _backup_text,
+            })
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps({
+                "type": "metrics",
+                "data": {
+                    "model": model,
+                    "requested_model": model,
+                    "input_tokens": estimate_tokens([{
+                        "role": "user",
+                        "content": _last_user,
+                    }]),
+                    "output_tokens": max(
+                        len(_backup_text) // 4,
+                        1,
+                    ),
+                    "total_time": round(
+                        _backup_duration,
+                        3,
+                    ),
+                    "response_time": round(
+                        _backup_duration,
+                        3,
+                    ),
+                    "agent_rounds": 0,
+                    "tool_calls": 1,
+                    "direct_palworld_backup": True,
+                    "action_authorized": True,
+                    "action_succeeded":
+                        _backup_exit_code == 0,
+                },
+            })
+            + "\n\n"
+        )
+
+        logger.info(
+            "[agent-action] Palworld backup "
+            "completed exit=%s duration=%.3fs",
+            _backup_exit_code,
+            _backup_duration,
+        )
+
+        yield "data: [DONE]\n\n"
+        return
+
+    # Deterministic homelab read-only requests do not need an LLM round.
+    # The classifier returns the canonical tool command; this loop contains
+    # no service-specific linguistic routing rules.
+    try:
+        from src.agent_tools.homelab_tools import (
+            HomelabTool as _FastHomelabTool,
+            classify_direct_homelab_request
+            as _classify_direct_homelab_request,
+            should_include_homelab_tool
+            as _should_include_homelab_tool,
+        )
+
+        _fast_command_args = (
+            _classify_direct_homelab_request(
+                _last_user,
+                _intent.get("domains") or set(),
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+        _homelab_agent_tool_required = (
+            _should_include_homelab_tool(
+                _last_user,
+                _intent.get("domains") or set(),
+                continuation=bool(
+                    _intent.get("continuation")
+                ),
+            )
+        )
+
+        if _fast_command_args is not None:
+            _intent["domains"] = {"homelab"}
+            _low_signal_turn = False
+            _direct_low_signal = False
+
+        _direct_homelab_request = (
+            _fast_command_args is not None
+            and not guide_only
+            and not plan_mode
+            and not approved_plan
+            and (
+                not forced_tools
+                or set(forced_tools).issubset(
+                    {
+                        "homelab",
+                        "web_fetch",
+                        "web_search",
+                    }
+                )
+            )
+            and (
+                not relevant_tools
+                or set(relevant_tools) == {"homelab"}
+            )
+            and not uploaded_files
+            and not _active_document_relevant
+            and "homelab" not in disabled_tools
+            and (
+                not exclusive_tools
+                or set(exclusive_tools) == {"homelab"}
+            )
+            and not (
+                tool_policy
+                and tool_policy.blocks("homelab")
+            )
+        )
+
+    except Exception as _fast_classify_err:
+        logger.warning(
+            "[agent-fastpath] classification failed: %s",
+            _fast_classify_err,
+        )
+
+        _fast_command_args = None
+        _direct_homelab_request = False
+        _homelab_agent_tool_required = False
+
+    if (
+        _fast_command_args is not None
+        or set(
+            _intent.get("domains") or set()
+        ) == {"homelab"}
+    ):
+        logger.info(
+            "[agent-fastpath] eligibility=%s "
+            "action=%s service=%s "
+            "workspace=%s active_email=%s "
+            "forced=%s relevant=%s uploads=%s "
+            "active_doc=%s guide_only=%s "
+            "plan_mode=%s",
+            _direct_homelab_request,
+            (
+                _fast_command_args.get("action")
+                if _fast_command_args
+                else None
+            ),
+            (
+                _fast_command_args.get("service")
+                if _fast_command_args
+                else None
+            ),
+            bool(workspace),
+            bool(active_email),
+            sorted(forced_tools or []),
+            sorted(relevant_tools or []),
+            bool(uploaded_files),
+            bool(_active_document_relevant),
+            guide_only,
+            plan_mode,
+        )
+
+    if _direct_homelab_request:
+        _fast_start = time.time()
+
+        _fast_command = json.dumps(
+            _fast_command_args,
+            ensure_ascii=False,
+        )
+
+        _fast_action = str(
+            _fast_command_args.get("action")
+            or ""
+        )
+
+        try:
+            _fast_result = await _FastHomelabTool().execute(
+                _fast_command,
+                {},
+            )
+
+            _fast_text = str(
+                _fast_result.get("direct_response")
+                or _fast_result.get("output")
+                or ""
+            ).strip()
+
+            if (
+                _fast_action == "doctor"
+                and _fast_text
+            ):
+                _fast_doctor_reply = (
+                    _homelab_doctor_response(
+                        _fast_text,
+                        _last_user,
+                    )
+                )
+                if _fast_doctor_reply:
+                    _fast_text = _fast_doctor_reply
+
+            if (
+                _fast_result.get("error")
+                or _fast_result.get("exit_code") != 0
+                or (
+                    _fast_action != "doctor"
+                    and not _fast_result.get(
+                        "terminal_response"
+                    )
+                )
+                or not _fast_text
+            ):
+                raise RuntimeError(
+                    _fast_result.get("error")
+                    or (
+                        "invalid deterministic "
+                        "homelab result"
+                    )
+                )
+
+        except Exception as _fast_exec_err:
+            logger.warning(
+                "[agent-fastpath] homelab request failed; "
+                "continuing through normal agent path: %s",
+                _fast_exec_err,
+            )
+
+        else:
+            _fast_duration = (
+                time.time() - _fast_start
+            )
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "tool_start",
+                        "tool": "homelab",
+                        "command": _fast_command,
+                        "full_command": _fast_command,
+                        "round": 0,
+                    }
+                )
+                + "\n\n"
+            )
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "tool_output",
+                        "tool": "homelab",
+                        "command": _fast_command,
+                        "output": _fast_text,
+                        "exit_code": 0,
+                    }
+                )
+                + "\n\n"
+            )
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {"delta": _fast_text}
+                )
+                + "\n\n"
+            )
+
+            _fast_metrics = {
+                "model": model,
+                "requested_model": model,
+                "input_tokens": estimate_tokens(
+                    [
+                        {
+                            "role": "user",
+                            "content": _last_user,
+                        }
+                    ]
+                ),
+                "output_tokens": max(
+                    len(_fast_text) // 4,
+                    1,
+                ),
+                "total_time": round(
+                    _fast_duration,
+                    3,
+                ),
+                "response_time": round(
+                    _fast_duration,
+                    3,
+                ),
+                "agent_rounds": 0,
+                "tool_calls": 1,
+                "direct_homelab_request": True,
+                "direct_homelab_status": (
+                    _fast_action == "status"
+                ),
+                "direct_homelab_action": _fast_action,
+            }
+
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "metrics",
+                        "data": _fast_metrics,
+                    }
+                )
+                + "\n\n"
+            )
+
+            logger.info(
+                "[agent-fastpath] homelab request "
+                "completed without LLM "
+                "action=%s in %.3fs",
+                _fast_action,
+                _fast_duration,
+            )
+
+            yield "data: [DONE]\n\n"
+            return
+
     if _direct_low_signal:
         logger.info("[agent] direct low-signal reply path for latest=%r", _last_user[:80])
         direct_messages = (
@@ -3149,8 +5294,9 @@ async def stream_agent_loop(
             # the same email again through IMAP/MCP is slow, token-heavy, and
             # can hang. Keep draft editing tools, drop email fetch tools.
             _email_fetch_tools = {
-                "list_email_accounts", "list_emails", "read_email",
+                "list_email_accounts", "list_emails", "read_email", "search_emails",
                 "mcp__email__list_emails", "mcp__email__read_email",
+                "mcp__email__search_emails",
             }
             removed = sorted(_relevant_tools & _email_fetch_tools)
             if removed:
@@ -3214,7 +5360,18 @@ async def stream_agent_loop(
         except Exception as _e:
             logger.debug(f"[tool-rag] skill-aware tool include skipped: {_e}")
 
+    # Mailbox-only turns must not expose web tools that arrived through RAG or
+    # forced_tools. Keep genuine combined email+web requests unchanged.
     _intent_domains = set(_intent.get("domains") or set())
+    if (
+        not guide_only
+        and _relevant_tools is not None
+        and "email" in _intent_domains
+        and "web" not in _intent_domains
+    ):
+        _relevant_tools.difference_update(WEB_TOOL_NAMES)
+        logger.info("[agent-intent] mailbox-only turn removed web tools")
+
     _ody_doc_finetune_mode = (
         _ody_qwen_finetune_model
         and (
@@ -3273,6 +5430,58 @@ async def stream_agent_loop(
                 "[agent-intent] active document turn removed file tools=%s",
                 _removed_doc_file_tools,
             )
+
+    # Read-only homelab investigations must start with real operator data.
+    # Clamp the first-round schema to homelab so smaller local models cannot
+    # substitute ask_teacher, web search, or unrelated administration tools.
+    if (
+        _homelab_agent_tool_required
+        and not guide_only
+        and not exclusive_tools
+        and "homelab" not in disabled_tools
+        and not (
+            tool_policy
+            and tool_policy.blocks("homelab")
+        )
+    ):
+        exclusive_tools = {"homelab"}
+
+        logger.info(
+            "[agent-intent] forced read-only "
+            "homelab diagnostic tool=%s",
+            sorted(exclusive_tools),
+        )
+
+    # A deterministic, read-only homelab status request has one unambiguous
+    # implementation. Clamp it before generic/admin tool expansion so smaller
+    # local models cannot substitute Cookbook or server-management tools.
+    if (
+        not guide_only
+        and not exclusive_tools
+        and set(_intent.get("domains") or set()) == {"homelab"}
+    ):
+        exclusive_tools = {"homelab"}
+        logger.info(
+            "[agent-intent] deterministic homelab exclusive=%s",
+            sorted(exclusive_tools),
+        )
+
+    # Explicit per-request exclusive tools override retrieval and all
+    # automatic tool expansions. Disabled tools remain unavailable.
+    if not guide_only and exclusive_tools:
+        _exclusive_set = {
+            t for t in exclusive_tools
+            if t not in disabled_tools
+        }
+        _relevant_tools = _exclusive_set
+        logger.info(
+            "[agent-intent] exclusive tool clamp=%s",
+            sorted(_relevant_tools),
+        )
+
+    # Exclusive requests must remain exclusive in both prompt construction
+    # and schema construction, even if generic admin intent also matched.
+    _effective_needs_admin = _needs_admin and not bool(exclusive_tools)
 
     if _relevant_tools is not None:
         logger.info("[agent-intent] selected_tools=%s", sorted(_relevant_tools)[:50])
@@ -3351,9 +5560,39 @@ async def stream_agent_loop(
     else:
         _is_api_model = any(h in endpoint_url for h in _API_HOSTS) or _model_supports_tools
     _compact_agent_prompt = _is_api_model or _is_ollama_native or _ollama_openai_compat
+    _email_document_retrieval_state = "not_applicable"
+    _required_first_retrieval_tool: Optional[str] = None
+    _email_retrieval_expected: Set[tuple[str, str, str, str]] = set()
+    _email_retrieval_terminal: Set[tuple[str, str, str, str]] = set()
+    _email_retrieval_usable: Set[tuple[str, str, str, str]] = set()
+    _email_document_items: list[Dict[str, str]] = []
+    _email_discovery_complete = True
+    # An email-backed document request remains incomplete until the model has
+    # successfully called create_document after retrieval becomes ready.
+    _email_document_creation_pending = False
+    _email_document_creation_retry_done = False
+    if (
+        not guide_only
+        and not _active_document_relevant
+        and {"email", "documents"}.issubset(_intent_domains)
+        and _relevant_tools is not None
+        and "create_document" in _relevant_tools
+        and "read_email" in _relevant_tools
+        and bool({"search_emails", "list_emails"} & _relevant_tools)
+    ):
+        _email_document_retrieval_state = "retrieval_pending"
+        logger.info("[agent] email document retrieval gate active state=retrieval_pending")
+        if _explicit_email_sender and "search_emails" in _relevant_tools:
+            _required_first_retrieval_tool = "search_emails"
+            logger.info(
+                "[agent-intent] explicit email sender requires first retrieval "
+                "tool=search_emails sender=%s",
+                _explicit_email_sender,
+            )
+
     messages, mcp_schemas = _build_system_prompt(
         messages, model, _prompt_active_document, mcp_mgr, disabled_tools,
-        needs_admin=_needs_admin, relevant_tools=_relevant_tools,
+        needs_admin=_effective_needs_admin, relevant_tools=_relevant_tools,
         mcp_disabled_map=_mcp_disabled_map,
         compact=_compact_agent_prompt,
         owner=owner,
@@ -3361,6 +5600,58 @@ async def stream_agent_loop(
         suppress_skills=_low_signal_turn,
         active_email=active_email,
     )
+    if _email_document_retrieval_state == "retrieval_pending":
+        _retrieval_gate_directive = (
+            "EMAIL DOCUMENT RETRIEVAL GATE: This document must be based on mailbox "
+            "content. `create_document` is intentionally unavailable until retrieval "
+            "is complete. First call `search_emails` or `list_emails`, then retrieve "
+            "every returned message with `read_email`. Batch known targets in ordered "
+            "`targets` arrays of at most 20, repeating bounded batches until every "
+            "returned target has a body or a terminal error/omission. Do not create a "
+            "placeholder document and do not announce `create_document` as the next "
+            "action while retrieval is incomplete. Once retrieval is ready, create the "
+            "document once with its substantive final content."
+        )
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = (
+                _retrieval_gate_directive + "\n\n" + (messages[0].get("content") or "")
+            )
+        else:
+            messages.insert(0, {"role": "system", "content": _retrieval_gate_directive})
+        if _required_first_retrieval_tool:
+            _sender_search_directive = (
+                "EXPLICIT EMAIL SENDER: The address "
+                f"`{_explicit_email_sender}` identifies the sender of messages to "
+                "retrieve, not one of the user's configured mailbox accounts. "
+                "Your first action must be `search_emails` with that exact address "
+                "as `query`. Do not call `list_email_accounts` or `send_email` first."
+            )
+            messages[0]["content"] = (
+                _sender_search_directive + "\n\n" + (messages[0].get("content") or "")
+            )
+    if _ask_user_followup_turn and not guide_only:
+        _ask_user_resume_directive = (
+            "The user's latest message is the answer to the immediately preceding "
+            "`ask_user` interaction. Interpret it as that answer and continue the "
+            "underlying task from the point where you paused. If the answer "
+            "authorizes the requested action or supplies the missing information, "
+            "proceed with the appropriate available tools now. If it rejects, "
+            "narrows, or changes the action, respect that answer. Do not merely "
+            "echo or acknowledge the user's answer, and do not ask the same "
+            "question again unless new ambiguity genuinely requires it."
+        )
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = (
+                _ask_user_resume_directive
+                + "\n\n"
+                + (messages[0].get("content") or "")
+            )
+        else:
+            messages.insert(
+                0,
+                {"role": "system", "content": _ask_user_resume_directive},
+            )
+        logger.info("[agent-intent] injected ask_user resume directive")
     if _ody_doc_finetune_mode and not plan_mode and not approved_plan and not guide_only:
         messages = _minimal_odysseus_doc_messages(
             messages,
@@ -3509,6 +5800,7 @@ async def stream_agent_loop(
     actual_model = model
     total_tool_calls = 0  # for budget enforcement
     _ody_notes_tool_completed = False
+    _ody_homelab_status_completed = False
 
     # Loop-breaker state. Small models (e.g. deepseek-v4-flash) can get
     # stuck firing the same tool call over and over with no text — burns
@@ -3526,6 +5818,27 @@ async def stream_agent_loop(
     # that *can't* call the tool from looping forever.
     _intent_nudge_count = 0
     _MAX_INTENT_NUDGES = 2
+    _ask_user_resume_retry_done = False
+    _textual_ask_user_reconfirmation_retries = 0
+    _MAX_TEXTUAL_ASK_USER_RECONFIRMATION_RETRIES = 2
+    _answered_ask_user_answer_echo_retries = 0
+    _MAX_ANSWERED_ASK_USER_ANSWER_ECHO_RETRIES = 1
+    _substantive_progress = False
+    _duplicate_ask_user_retries = 0
+    _MAX_DUPLICATE_ASK_USER_RETRIES = 2
+    _exclude_ask_user_next_round = False
+    _pending_tool_nudges = 0
+    _MAX_PENDING_TOOL_NUDGES = 1
+    _required_first_retrieval_retry_done = False
+    _required_first_retrieval_satisfied = False
+    _required_email_read_batch: tuple[tuple[str, str, str, str], ...] = ()
+    _required_email_read_retry_done = False
+    _deterministic_email_read_no_progress = False
+    _next_round_tool_restriction: Optional[Set[str]] = (
+        {_required_first_retrieval_tool}
+        if _required_first_retrieval_tool
+        else None
+    )
 
     # "I said I would, then didn't" detector. The pattern that breaks debug
     # loops on weak models (deepseek-v4-flash mid-2026): the model writes
@@ -3559,6 +5872,13 @@ async def stream_agent_loop(
     _exhausted_rounds = False
 
     for round_num in range(1, max_rounds + 1):
+        # A pending-tool-action retry may narrow exactly one model request. Consume
+        # the marker before building this round's schemas so it cannot leak into
+        # any later round, including the synthesis round after a successful tool.
+        _round_tool_restriction = _next_round_tool_restriction
+        _next_round_tool_restriction = None
+        _exclude_ask_user_this_round = _exclude_ask_user_next_round
+        _exclude_ask_user_next_round = False
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling
@@ -3580,7 +5900,9 @@ async def stream_agent_loop(
             # calling tools. Send NO tools this round so it's forced to
             # write the answer instead of flailing further.
             all_tool_schemas = []
-        elif _is_api_model:
+        elif _is_api_model or _is_ollama_native or _ollama_openai_compat:
+            # Send native function schemas to API models and Ollama.
+            # Ollama's /api/chat supports structured tool calling.
             # Filter schemas by RAG-selected tools (if available)
             if _relevant_tools:
                 # _build_base_prompt unions _ADMIN_TOOLS into the prompt
@@ -3589,7 +5911,7 @@ async def stream_agent_loop(
                 # tools it cannot call and substitutes the nearest schema
                 # it does have (e.g. manage_memory for manage_skills).
                 _schema_names = set(_relevant_tools)
-                if _needs_admin:
+                if _effective_needs_admin:
                     _schema_names |= _ADMIN_TOOLS
                 base_schemas = [
                     s for s in FUNCTION_TOOL_SCHEMAS
@@ -3601,7 +5923,7 @@ async def stream_agent_loop(
                 ]
                 all_tool_schemas = base_schemas + _mcp_filtered
             else:
-                base_schemas = FUNCTION_TOOL_SCHEMAS if _needs_admin else [
+                base_schemas = FUNCTION_TOOL_SCHEMAS if _effective_needs_admin else [
                     s for s in FUNCTION_TOOL_SCHEMAS
                     if s.get("function", {}).get("name") not in _ADMIN_SCHEMA_NAMES
                 ]
@@ -3619,10 +5941,65 @@ async def stream_agent_loop(
             _last_content = _last_user.lower()
             _wants_mcp = any(kw in _last_content for kw in _MCP_KEYWORDS)
             all_tool_schemas = mcp_schemas if (_wants_mcp and mcp_schemas) else []
+
+        if _email_document_retrieval_state == "retrieval_pending":
+            all_tool_schemas = [
+                schema for schema in (all_tool_schemas or [])
+                if schema.get("function", {}).get("name") != "create_document"
+                and schema.get("name") != "create_document"
+            ]
+
+        # Retrieval is complete, but the explicit artifact request is not.
+        # Keep synthesis model-mediated while making create_document the only
+        # available action for this bounded progression round.
+        if _email_document_creation_pending:
+            _document_schemas = [
+                schema for schema in (all_tool_schemas or [])
+                if schema.get("function", {}).get("name") == "create_document"
+                or schema.get("name") == "create_document"
+            ]
+            if _document_schemas:
+                all_tool_schemas = _document_schemas
+                logger.info(
+                    "[agent] requiring post-readiness document creation round=%d",
+                    round_num,
+                )
+
+        if _exclude_ask_user_this_round:
+            all_tool_schemas = [
+                schema for schema in (all_tool_schemas or [])
+                if schema.get("function", {}).get("name") != "ask_user"
+                and schema.get("name") != "ask_user"
+            ]
+            logger.info(
+                "[agent] excluding ask_user from corrective continuation round %d",
+                round_num,
+            )
+
+        if _round_tool_restriction:
+            _restricted_schemas = [
+                schema for schema in (all_tool_schemas or [])
+                if schema.get("function", {}).get("name") in _round_tool_restriction
+            ]
+            if _restricted_schemas:
+                all_tool_schemas = _restricted_schemas
+                logger.info(
+                    "[agent] restricting round %d tools to pending action: %s",
+                    round_num,
+                    ", ".join(sorted(_round_tool_restriction)),
+                )
+            else:
+                logger.warning(
+                    "[agent] pending tool restriction unavailable on round %d: %s; "
+                    "using normal schemas",
+                    round_num,
+                    ", ".join(sorted(_round_tool_restriction)),
+                )
         agent_stream_timeout = int(get_setting("agent_stream_timeout_seconds", 300) or 300)
 
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
-        logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent[:15]} relevant_tools={sorted(_relevant_tools)[:15] if _relevant_tools else 'ALL'}")
+        _available_tool_names = {name for name in _tool_names_sent if name}
+        logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent} relevant_tools={sorted(_relevant_tools) if _relevant_tools else 'ALL'}")
 
         # Legacy rebuilds its configured fallback chain per round. Auto uses a
         # request-global route state instead: one JIT-authorized candidate at a
@@ -3646,17 +6023,72 @@ async def stream_agent_loop(
             bool(all_tool_schemas),
             agent_stream_timeout,
         )
+        # Force an explicitly exclusive single tool on the first round.
+        # Later rounds normally remain automatic so the model can turn tool
+        # results into a final response. Exception: an email-backed document
+        # request that has completed retrieval but still requires create_document.
+        _forced_tool_name = (
+            _tool_names_sent[0]
+            if len(_tool_names_sent) == 1
+            and (
+                (round_num == 1 and exclusive_tools)
+                or (
+                    _email_document_creation_pending
+                    and _tool_names_sent[0] == "create_document"
+                )
+            )
+            else None
+        )
+
         _round_stream_kwargs = {
             "temperature": temperature,
             "max_tokens": max_tokens,
             "prompt_type": prompt_type if round_num == 1 else None,
             "tools": all_tool_schemas if all_tool_schemas else None,
             "tool_choice_none": _ody_doc_finetune_mode,
+            "tool_choice_name": _forced_tool_name,
             "timeout": agent_stream_timeout,
             "session_id": session_id,
             "workload": workload,
         }
-        if route_state is not None:
+
+        _deterministic_read_batch = (
+            _required_email_read_batch
+            if (
+                _email_document_retrieval_state == "retrieval_pending"
+                and _required_email_read_batch
+                and _round_tool_restriction == {"read_email"}
+                and not guide_only
+                and not _force_answer
+            )
+            else ()
+        )
+        if _deterministic_read_batch:
+            _deterministic_email_read_no_progress = False
+            async def _deterministic_read_stream():
+                yield "data: " + json.dumps({
+                    "type": "tool_calls",
+                    "calls": [{
+                        "id": f"supervisor_read_{round_num}",
+                        "name": "read_email",
+                        "arguments": json.dumps(
+                            _email_read_batch_arguments(_deterministic_read_batch),
+                            separators=(",", ":"),
+                        ),
+                    }],
+                }) + "\n\n"
+                yield "data: [DONE]\n\n"
+
+            _round_stream = _deterministic_read_stream()
+            logger.info(
+                "[agent] supervisor directly executing pending email retrieval "
+                "round=%d batch_size=%d",
+                round_num,
+                len(_deterministic_read_batch),
+            )
+
+
+        elif route_state is not None:
             _round_stream = _stream_auto_agent_round(
                 route_state,
                 messages,
@@ -3666,8 +6098,11 @@ async def stream_agent_loop(
             _round_stream = stream_llm_with_fallback(
                 _candidates,
                 messages,
+                _routing_trace=routing_trace,
+                _routing_lane="agent",
                 **_round_stream_kwargs,
             )
+
         async for chunk in _round_stream:
             if not _round_first_event_logged:
                 _round_first_event_logged = True
@@ -3992,6 +6427,90 @@ async def stream_agent_loop(
                     yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
                     continue
 
+        # Schema filtering is the primary readiness gate. Keep this execution
+        # backstop for fenced/local tool syntax so a hidden create_document can
+        # never open a placeholder before mailbox retrieval is complete.
+        if _email_document_retrieval_state == "retrieval_pending" and tool_blocks:
+            _kept_blocks = []
+            _kept_converted_calls = []
+            _dropped_premature_create = False
+            for _idx, _block in enumerate(tool_blocks):
+                if _block.tool_type == "create_document":
+                    _dropped_premature_create = True
+                    continue
+                _kept_blocks.append(_block)
+                if _idx < len(converted_calls):
+                    _kept_converted_calls.append(converted_calls[_idx])
+            if _dropped_premature_create:
+                logger.warning(
+                    "[agent] blocked premature create_document while email retrieval is pending"
+                )
+                tool_blocks = _kept_blocks
+                converted_calls = _kept_converted_calls
+                if used_native:
+                    native_tool_calls = _kept_converted_calls
+
+        # A resumed ask_user answer is already authoritative. Suppress only an
+        # immediate duplicate question before any substantive action has run;
+        # materially different questions and all later clarifications remain legal.
+        _duplicate_ask_user_suppressed = False
+        if _answered_ask_user and not _substantive_progress and tool_blocks:
+            _answered_question = _answered_ask_user.get("question", "")
+            _kept_blocks = []
+            _kept_calls = []
+            for _idx, _block in enumerate(tool_blocks):
+                _is_duplicate = (
+                    _block.tool_type == "ask_user"
+                    and _questions_are_near_duplicates(
+                        _answered_question,
+                        _ask_user_question_from_block(_block),
+                    )
+                )
+                if _is_duplicate:
+                    _duplicate_ask_user_suppressed = True
+                    continue
+                _kept_blocks.append(_block)
+                if _idx < len(converted_calls):
+                    _kept_calls.append(converted_calls[_idx])
+            if _duplicate_ask_user_suppressed:
+                tool_blocks = _kept_blocks
+                converted_calls = _kept_calls
+                if used_native:
+                    native_tool_calls = _kept_calls
+                _duplicate_ask_user_retries += 1
+                _exclude_ask_user_next_round = True
+                logger.info(
+                    "[agent] suppressed immediate duplicate ask_user on resumed round %d (attempt %d/%d)",
+                    round_num,
+                    _duplicate_ask_user_retries,
+                    _MAX_DUPLICATE_ASK_USER_RETRIES,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The ask_user question you just attempted has already been answered. "
+                        "Do not show or ask it again. Continue the pending task with the "
+                        "available tools, or ask a materially different clarification only "
+                        "if new missing information genuinely requires it."
+                    ),
+                })
+                if not tool_blocks:
+                    if _exclude_ask_user_this_round:
+                        _duplicate_guard_error = (
+                            "The model repeated an already answered question after ask_user "
+                            "was disabled for the corrective continuation."
+                        )
+                        logger.warning(
+                            "[agent] duplicate ask_user emitted while unavailable on corrective "
+                            "round %d; stopping duplicate loop",
+                            round_num,
+                        )
+                        full_response += _duplicate_guard_error
+                        yield f'data: {json.dumps({"delta": _duplicate_guard_error})}\n\n'
+                        break
+                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                    continue
+
         # Force-answer round: we told the model to STOP calling tools and
         # answer. If it ignored that and emitted a (possibly DSML) tool
         # call anyway, discard it — don't execute, don't re-loop. Keep
@@ -4067,6 +6586,30 @@ async def stream_agent_loop(
                 logger.info(f"Auto-created document from {lang_tag} code block ({code_body.count(chr(10))+1} lines)")
                 break  # only auto-create one document per round
 
+        # Some OpenAI-compatible providers accept tools but ignore tool_choice.
+        # Once mailbox retrieval is structurally complete, turn the successful
+        # read results into the one required document call in the supervisor.
+        if (
+            not tool_blocks
+            and _email_document_creation_pending
+            and not guide_only
+            and not _force_answer
+        ):
+            _required_document_block = _required_email_document_block(
+                _email_document_items,
+                _last_user,
+                lossless=_lossless_email_document,
+                discovery_complete=_email_discovery_complete,
+            )
+            if _required_document_block is not None:
+                tool_blocks.append(_required_document_block)
+                logger.info(
+                    "[agent] structurally completing post-readiness "
+                    "create_document round=%d messages=%d",
+                    round_num,
+                    len(_email_document_items),
+                )
+
         # Save cleaned round text for history persistence
         # Keep <think> blocks so they render in the thinking section on reload
         # Mirror the same fenced-pattern gate used to resolve tool_blocks above:
@@ -4080,6 +6623,50 @@ async def stream_agent_loop(
             yield f'data: {json.dumps({"delta": cleaned_round})}\n\n'
 
         if not tool_blocks:
+            # Retrieval readiness is structural workflow state: an explicit
+            # email-backed artifact request cannot be completed by prose while
+            # its document is still missing. Give the model one normal
+            # create-only synthesis round, then exactly one corrective round.
+            if (
+                _email_document_creation_pending
+                and not guide_only
+                and not _force_answer
+            ):
+                if not _email_document_creation_retry_done:
+                    _email_document_creation_retry_done = True
+                    logger.info(
+                        "[agent] required post-readiness create_document was not "
+                        "executed on round %d; retrying once",
+                        round_num,
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "The requested artifact is still missing. Create it now "
+                            "through the native `create_document` tool. This is the "
+                            "one corrective document-creation round: do not answer "
+                            "in prose, do not reopen email retrieval, and preserve "
+                            "the user's original document instructions and the "
+                            "retrieved usable email content already in context."
+                        ),
+                    })
+                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                    continue
+                logger.warning(
+                    "[agent] required artifact creation failed after corrective "
+                    "round %d: create_document was not called",
+                    round_num,
+                )
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "type": "required_artifact_creation_failed",
+                        "reason": "create_document_not_called",
+                        "round": round_num,
+                    })
+                    + "\n\n"
+                )
+                break
             # ── Completion verifier (mechanism 3a) ────────────────────
             # The model is finishing. If this was an effectful agentic turn,
             # have a fresh-context verifier independently check the work
@@ -4122,6 +6709,254 @@ async def stream_agent_loop(
                     # never re-verify an unchanged state in a loop.
                     _effectful_used = False
                     continue
+            # ── Structured ask_user resume retry ──────────────────────
+            # The relationship to ask_user is structured state, so do not depend
+            # on language-specific promise detection here. If the first model
+            # attempt after the user's answer emits no tool call, give it exactly
+            # one chance to reconsider the answer against the pending question.
+            #
+            # This deliberately does NOT force a tool: a rejection/cancellation
+            # must remain a valid no-tool outcome on the retry.
+            if (
+                _ask_user_followup_turn
+                and not _substantive_progress
+                and not guide_only
+                and not _force_answer
+                and not _ask_user_resume_retry_done
+                and not (
+                    _required_first_retrieval_tool
+                    and not _required_first_retrieval_satisfied
+                    and _email_document_retrieval_state == "retrieval_pending"
+                )
+                and not (
+                    _email_document_retrieval_state == "retrieval_pending"
+                    and _required_email_read_batch
+                )
+            ):
+                _ask_user_resume_retry_done = True
+                logger.info(
+                    "[agent] ask_user followup produced no tool call on round %d; "
+                    "retrying once with structural resume guidance",
+                    round_num,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "This turn is resuming immediately after an `ask_user` "
+                        "interaction, and your previous attempt ended without making "
+                        "a tool call. Re-evaluate the user's latest answer against the "
+                        "pending `ask_user` question and the underlying task. "
+                        "If the answer authorizes the action or supplies the missing "
+                        "information, execute the appropriate available tool now "
+                        "instead of merely promising or acknowledging. "
+                        "If the answer rejects, cancels, narrows, or says not to "
+                        "proceed, do not call action tools; give the brief final "
+                        "response that respects that answer. Do not ask the same "
+                        "question again."
+                    ),
+                })
+                yield (
+                    f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                )
+                continue
+
+            # After the structural retry has had its first opportunity, do not
+            # accept another short textual rendering of the already answered
+            # ask_user question as successful completion. This is deliberately
+            # pre-progress only; after a real tool succeeds, the pending-action
+            # supervisor below owns any remaining work.
+            _textual_reconfirmation = (
+                _ask_user_followup_turn
+                and _ask_user_resume_retry_done
+                and not _substantive_progress
+                and not guide_only
+                and not _force_answer
+                and _answered_ask_user
+                and _is_textual_answered_ask_user_reconfirmation(
+                    _answered_ask_user.get("question", ""),
+                    cleaned_round,
+                )
+            )
+            if (
+                _textual_reconfirmation
+                and _textual_ask_user_reconfirmation_retries
+                < _MAX_TEXTUAL_ASK_USER_RECONFIRMATION_RETRIES
+            ):
+                _textual_ask_user_reconfirmation_retries += 1
+                logger.info(
+                    "[agent] textual ask_user reconfirmation detected on round %d; "
+                    "retrying (%d/%d)",
+                    round_num,
+                    _textual_ask_user_reconfirmation_retries,
+                    _MAX_TEXTUAL_ASK_USER_RECONFIRMATION_RETRIES,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Your previous response text repeated or re-asked the "
+                        "ask_user question that the user has already answered. "
+                        "Do not ask for the same authorization again. Continue "
+                        "the pending authorized task using the available tools, "
+                        "or ask only a materially different clarification if "
+                        "genuinely required."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+
+            # A distinct short-response stall is an exact normalized echo of
+            # the value the user already supplied to ask_user. Keep this
+            # language-neutral and independently bounded; rejection remains a
+            # valid outcome and the retry does not force any tool choice.
+            _answered_value_echo = (
+                _ask_user_followup_turn
+                and _answered_ask_user is not None
+                and _ask_user_resume_retry_done
+                and not _substantive_progress
+                and not guide_only
+                and not _force_answer
+                and _answered_ask_user_answer is not None
+                and _is_answered_ask_user_answer_echo(
+                    _answered_ask_user_answer,
+                    cleaned_round,
+                )
+            )
+            if (
+                _answered_value_echo
+                and _answered_ask_user_answer_echo_retries
+                < _MAX_ANSWERED_ASK_USER_ANSWER_ECHO_RETRIES
+            ):
+                _answered_ask_user_answer_echo_retries += 1
+                logger.info(
+                    "[agent] answered ask_user value echoed on round %d; retrying once",
+                    round_num,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Your previous response only echoed the user's answer to "
+                        "the already completed ask_user interaction. Do not repeat "
+                        "the user's answer. Resolve the answered interaction now: "
+                        "if the answer authorizes the pending task, continue it "
+                        "using the available tools; if it declines or cancels, "
+                        "acknowledge that and stop. Ask another question only if "
+                        "a materially different clarification is genuinely required."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+
+            # The first retrieval action is deterministic request state, not
+            # prose intent. Give a model that describes instead of calling the
+            # required tool exactly one more round with that same sole schema.
+            if (
+                _required_first_retrieval_tool
+                and not _required_first_retrieval_satisfied
+                and _email_document_retrieval_state == "retrieval_pending"
+                and not guide_only
+                and not _force_answer
+            ):
+                if not _required_first_retrieval_retry_done:
+                    _required_first_retrieval_retry_done = True
+                    _next_round_tool_restriction = {
+                        _required_first_retrieval_tool
+                    }
+                    logger.info(
+                        "[agent] required first retrieval tool was not executed "
+                        "on round %d; retrying once with tool=%s",
+                        round_num,
+                        _required_first_retrieval_tool,
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "The required first retrieval action has not been "
+                            "executed. Call the available `"
+                            f"{_required_first_retrieval_tool}` native tool now. "
+                            "Do not describe or announce the action in prose."
+                        ),
+                    })
+                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                    continue
+                logger.warning(
+                    "[agent] required first retrieval tool still not executed "
+                    "after corrective round %d; stopping tool=%s",
+                    round_num,
+                    _required_first_retrieval_tool,
+                )
+                break
+
+            # Search/list results are already the canonical retrieval plan.
+            # While any of those targets remain unread, ordinary prose cannot
+            # complete the document workflow. Give each unchanged pending batch
+            # one structural corrective attempt with the same sole schema.
+            if (
+                _email_document_retrieval_state == "retrieval_pending"
+                and _required_email_read_batch
+                and not guide_only
+                and not _force_answer
+            ):
+                if not _required_email_read_retry_done:
+                    _required_email_read_retry_done = True
+                    _next_round_tool_restriction = {"read_email"}
+                    logger.info(
+                        "[agent] required pending email retrieval was not executed "
+                        "on round %d; retrying once batch_size=%d",
+                        round_num,
+                        len(_required_email_read_batch),
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "Required mailbox retrieval remains pending. Call the "
+                            "available `read_email` native tool now with exactly this "
+                            "bounded batch; do not describe the action in prose: `"
+                            + json.dumps(
+                                _email_read_batch_arguments(_required_email_read_batch),
+                                separators=(",", ":"),
+                            )
+                            + "`."
+                        ),
+                    })
+                    yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                    continue
+                logger.warning(
+                    "[agent] deterministic pending email retrieval failed after "
+                    "corrective round %d; stopping batch_size=%d",
+                    round_num,
+                    len(_required_email_read_batch),
+                )
+                break
+
+            # A long response can still be an unfinished plan. Unlike the
+            # generic short-promise detector, this requires an exact callable
+            # name from this round's schemas plus explicit pending-action prose.
+            _pending_tool = _pending_available_tool_action(
+                _strip_think_blocks(cleaned_round).strip(),
+                _available_tool_names,
+            )
+            if _pending_tool and _pending_tool_nudges < _MAX_PENDING_TOOL_NUDGES:
+                _pending_tool_nudges += 1
+                _next_round_tool_restriction = {_pending_tool}
+                logger.info(
+                    "[agent] pending-tool-action nudge #%d on round %d: %s",
+                    _pending_tool_nudges,
+                    round_num,
+                    _pending_tool,
+                )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"Your previous response explicitly identified `{_pending_tool}` "
+                        "as a pending action but made no tool call. If that action is "
+                        "still required, call the available tool now. Otherwise give a "
+                        "concise final explanation of why the requested task cannot or "
+                        "should not be completed."
+                    ),
+                })
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+
             # ── Intent-without-action supervisor ─────────────────────
             # Catch "Let me tail the output" / "I'll check the logs" /
             # "Let me investigate" patterns where the model announces an
@@ -4198,6 +7033,39 @@ async def stream_agent_loop(
                 )
                 break
             break  # no tools — done
+
+        if _exhaustive_email_intent:
+            for _index, _block in enumerate(tool_blocks):
+                if _block.tool_type in {"mcp__email__search_emails", "search_emails"}:
+                    tool_blocks[_index] = ToolBlock(
+                        _block.tool_type,
+                        _email_search_arguments_for_intent(
+                            _block.content,
+                            exhaustive=True,
+                        ),
+                    )
+
+        if _email_document_creation_pending and _lossless_email_document:
+            for _index, _block in enumerate(tool_blocks):
+                if _block.tool_type != "create_document":
+                    continue
+                _model_title = (_block.content.split("\n", 1)[0] or "").strip()
+                _lossless_block = _required_email_document_block(
+                    _email_document_items,
+                    _retrieval_query,
+                    title=_model_title or None,
+                    lossless=True,
+                    discovery_complete=_email_discovery_complete,
+                )
+                if _lossless_block is not None:
+                    tool_blocks[_index] = _lossless_block
+                    logger.info(
+                        "[agent] replaced model document body with deterministic "
+                        "email corpus retrieved=%d unique=%d",
+                        len(_email_document_items),
+                        len(_deduplicate_email_document_items(_email_document_items)),
+                    )
+                break
 
         # ── Loop-breaker (Terminus-style stall detector) ──────────────
         # Stall detector for repeated no-progress tool loops.
@@ -4311,6 +7179,7 @@ async def stream_agent_loop(
         tool_results = []
         tool_result_texts = []  # plain text for native tool role messages
         budget_hit = False
+        _email_retrieval_became_ready = False
         for i, block in enumerate(tool_blocks):
             # --- Tool budget check ---
             if max_tool_calls > 0 and total_tool_calls >= max_tool_calls:
@@ -4407,6 +7276,93 @@ async def stream_agent_loop(
                             await _tool_task
                         except (asyncio.CancelledError, Exception):
                             pass
+
+            if block.tool_type != "ask_user" and not result.get("blocked"):
+                _substantive_progress = True
+
+            if (
+                _required_first_retrieval_tool
+                and not result.get("blocked")
+                and (
+                    block.tool_type == _required_first_retrieval_tool
+                    or block.tool_type.endswith(
+                        f"__{_required_first_retrieval_tool}"
+                    )
+                )
+            ):
+                _required_first_retrieval_satisfied = True
+                logger.info(
+                    "[agent] required first retrieval tool executed tool=%s round=%d",
+                    _required_first_retrieval_tool,
+                    round_num,
+                )
+
+            if _email_document_retrieval_state == "retrieval_pending":
+                if block.tool_type in {
+                    "mcp__email__list_email_accounts", "list_email_accounts",
+                } and not result.get("error"):
+                    # Account discovery is context for the original retrieval
+                    # task, never a replacement for it. Keep the next model
+                    # round on retrieval tools so account output cannot drift
+                    # into unrelated send-email composition.
+                    _next_round_tool_restriction = (
+                        {"search_emails"}
+                        if _explicit_email_sender
+                        else {"search_emails", "list_emails"}
+                    )
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "The email-account result only identifies which mailbox "
+                            "to use. Continue the user's original email retrieval and "
+                            "document task now. Do not reinterpret it as a request to "
+                            "list accounts or send an email."
+                        ),
+                    })
+                if block.tool_type in {
+                    "mcp__email__search_emails", "mcp__email__list_emails",
+                    "search_emails", "list_emails",
+                } and not result.get("error"):
+                    _found_targets = _email_search_targets_from_result(block.content, result)
+                    if _email_search_result_is_incomplete(result):
+                        _email_discovery_complete = False
+                    if _found_targets:
+                        _email_retrieval_expected.update(_found_targets)
+                        logger.info(
+                            "[agent] email retrieval targets discovered=%d total=%d",
+                            len(_found_targets), len(_email_retrieval_expected),
+                        )
+                elif block.tool_type in {"mcp__email__read_email", "read_email"}:
+                    _resolved_before_read = len(_email_retrieval_terminal)
+                    _terminal, _usable = _email_read_progress_from_result(block.content, result)
+                    _email_document_items.extend(
+                        _email_document_items_from_result(block.content, result)
+                    )
+                    _email_retrieval_terminal.update(_terminal & _email_retrieval_expected)
+                    _email_retrieval_usable.update(_usable & _email_retrieval_expected)
+                    if _deterministic_read_batch:
+                        _deterministic_email_read_no_progress = (
+                            len(_email_retrieval_terminal) == _resolved_before_read
+                        )
+                    logger.info(
+                        "[agent] email retrieval progress resolved=%d/%d usable=%d",
+                        len(_email_retrieval_terminal),
+                        len(_email_retrieval_expected),
+                        len(_email_retrieval_usable),
+                    )
+                    if (
+                        _email_retrieval_expected
+                        and _email_retrieval_expected.issubset(_email_retrieval_terminal)
+                        and _email_retrieval_usable
+                    ):
+                        _email_document_retrieval_state = "retrieval_ready"
+                        _email_document_creation_pending = True
+                        _email_retrieval_became_ready = True
+                        logger.info(
+                            "[agent] email document retrieval gate state=retrieval_ready targets=%d usable=%d",
+                            len(_email_retrieval_expected),
+                            len(_email_retrieval_usable),
+                        )
 
             # A skill the model just loaded can prescribe tools that weren't
             # RAG-selected this turn (declared via requires_toolsets in its
@@ -4609,6 +7565,48 @@ async def stream_agent_loop(
                 tool_output_data["diff"] = result["diff"]
             yield f'data: {json.dumps(tool_output_data)}\n\n'
 
+            if (
+                block.tool_type == "homelab"
+                and result.get("terminal_response")
+                and not result.get("error")
+                and not _homelab_agent_tool_required
+            ):
+                _homelab_text = str(
+                    result.get("direct_response")
+                    or result.get("output")
+                    or ""
+                ).strip()
+
+                if _homelab_text:
+                    if not _ody_homelab_status_completed:
+                        _clean_current = strip_tool_blocks(
+                            full_response
+                        ).strip()
+
+                        _prefix = (
+                            "\n\n"
+                            if _clean_current
+                            else ""
+                        )
+
+                        full_response = (
+                            _clean_current
+                            + _prefix
+                            + _homelab_text
+                        ).strip()
+
+                        yield (
+                            "data: "
+                            + json.dumps({
+                                "delta":
+                                    _prefix
+                                    + _homelab_text
+                            })
+                            + "\n\n"
+                        )
+
+                    _ody_homelab_status_completed = True
+
             if block.tool_type == "manage_notes":
                 _notes_action = ""
                 try:
@@ -4732,6 +7730,63 @@ async def stream_agent_loop(
                 and not result.get("error")
             ):
                 _ody_doc_tool_completed = True
+            if (
+                _email_document_creation_pending
+                and block.tool_type == "create_document"
+                and not result.get("error")
+                and not result.get("blocked")
+                and (result.get("doc_id") or result.get("action") == "create")
+            ):
+                _email_document_creation_pending = False
+                logger.info(
+                    "[agent] required post-readiness artifact created round=%d",
+                    round_num,
+                )
+
+        # Healthy diagnostic results are factual and need no probabilistic
+        # second-round synthesis. This also prevents unsupported remediation
+        # advice when the operator reports that the service is running.
+        if _homelab_agent_tool_required:
+            _healthy_homelab_output = ""
+
+            for _event in reversed(tool_events):
+                if (
+                    _event.get("tool") == "homelab"
+                    and _event.get("exit_code") == 0
+                ):
+                    _healthy_homelab_output = str(
+                        _event.get("output") or ""
+                    )
+                    break
+
+            _healthy_homelab_reply = (
+                _healthy_homelab_diagnostic_response(
+                    _healthy_homelab_output,
+                    _last_user,
+                )
+            )
+
+            if _healthy_homelab_reply:
+                full_response = (
+                    _healthy_homelab_reply
+                )
+
+                yield (
+                    "data: "
+                    + json.dumps({
+                        "delta":
+                            _healthy_homelab_reply
+                    })
+                    + "\n\n"
+                )
+
+                _ody_homelab_status_completed = True
+
+                logger.info(
+                    "[agent] healthy homelab "
+                    "diagnostic completed from "
+                    "authoritative operator state"
+                )
 
         # If budget was hit, stop the loop
         if budget_hit:
@@ -4742,6 +7797,13 @@ async def stream_agent_loop(
         # arrives as the next message and the agent resumes from there. The
         # question text is already in the streamed response, so it persists.
         if _awaiting_user:
+            break
+
+        if _ody_homelab_status_completed:
+            logger.info(
+                "[agent] homelab status completed "
+                "from deterministic tool output"
+            )
             break
 
         if _doc_stream_create_completed:
@@ -4771,6 +7833,85 @@ async def stream_agent_loop(
         _append_tool_results(messages, round_response, converted_calls,
                              tool_results, tool_result_texts, used_native, round_num,
                              round_reasoning=round_reasoning)
+
+        if _deterministic_email_read_no_progress:
+            logger.warning(
+                "[agent] deterministic pending email retrieval made no progress; "
+                "stopping batch_size=%d",
+                len(_deterministic_read_batch),
+            )
+            break
+
+        if _email_retrieval_became_ready:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Email retrieval is now complete for the explicit result set. "
+                    "`create_document` is available again. Create exactly one document "
+                    "with substantive final content derived from the retrieved email "
+                    "bodies and terminal read outcomes; do not create a placeholder."
+                ),
+            })
+        elif (
+            _email_document_retrieval_state == "retrieval_pending"
+            and _email_retrieval_expected
+        ):
+            _next_required_email_read_batch = _email_pending_read_batch(
+                _email_retrieval_expected,
+                _email_retrieval_terminal,
+            )
+            if _next_required_email_read_batch:
+                if _next_required_email_read_batch != _required_email_read_batch:
+                    _required_email_read_retry_done = False
+                _required_email_read_batch = _next_required_email_read_batch
+                _next_round_tool_restriction = {"read_email"}
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Continue the required mailbox retrieval now. Call `read_email` "
+                        "with exactly this next bounded batch: `"
+                        + json.dumps(
+                            _email_read_batch_arguments(_required_email_read_batch),
+                            separators=(",", ":"),
+                        )
+                        + "`. Do not answer in prose while these targets remain unread."
+                    ),
+                })
+                logger.info(
+                    "[agent] requiring pending email retrieval batch_size=%d "
+                    "remaining=%d",
+                    len(_required_email_read_batch),
+                    len(_email_retrieval_expected - _email_retrieval_terminal),
+                )
+
+        if (
+            _homelab_agent_tool_required
+            and any(
+                event.get("tool") == "homelab"
+                and event.get("exit_code") == 0
+                for event in tool_events
+            )
+        ):
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Treat the Homelab Operator result "
+                    "as authoritative. Synthesize it "
+                    "conservatively and in the user's "
+                    "language. If Estado is OK and Runtime "
+                    "is running, the first sentence must "
+                    "explicitly state that the service is "
+                    "not down. Salud n/d means that no "
+                    "health-check data is available; it is "
+                    "not evidence of failure. Do not invent "
+                    "possible causes or recommend restart, "
+                    "configuration changes, network fixes, "
+                    "or log inspection unless the tool "
+                    "result contains evidence of a problem "
+                    "or the user explicitly requested that "
+                    "next step. Keep the answer concise."
+                ),
+            })
 
         # Emit agent_step event
         yield (
