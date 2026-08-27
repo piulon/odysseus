@@ -2160,8 +2160,9 @@ async def list_tools() -> list[Tool]:
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Max results per folder (default: 20)",
+                        "description": "Max results per folder (default: 20; bounded ceiling: 100; no cursor/offset pagination)",
                         "default": 20,
+                        "maximum": 100,
                     },
                     **ACCOUNT_PROP,
                 },
@@ -2391,6 +2392,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     lines.append(f"   To: {em['to']}")
                 if em.get('summary'):
                     lines.append(f"   Summary: {em['summary']}")
+            limited_folders = [
+                item for item in getattr(hits, "folder_diagnostics", [])
+                if item.get("status") == "ok"
+                and isinstance(item.get("match_count"), int)
+                and item["match_count"] > max_results
+            ]
+            if limited_folders:
+                detail = "; ".join(
+                    f"{item['logical_folder']} has {item['match_count']} matches"
+                    for item in limited_folders
+                )
+                lines.append(
+                    "\n[DISCOVERY INCOMPLETE: per-folder result limit reached; "
+                    + detail + "]"
+                )
             if folder_errors:
                 lines.append(f"\n[FOLDER SEARCH ERRORS: {error_text}]")
             return [TextContent(type="text", text="\n".join(lines))]

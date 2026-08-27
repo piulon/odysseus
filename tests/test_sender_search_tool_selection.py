@@ -93,7 +93,10 @@ def test_explicit_sender_requires_search_as_first_retrieval_action(monkeypatch, 
     assert "send_email" not in model_schemas[0]
     assert "create_document" not in model_schemas[0]
     assert executed == [
-        ("mcp__email__search_emails", {"query": "sender@example.com"}),
+        ("mcp__email__search_emails", {
+            "query": "sender@example.com",
+            "max_results": agent_loop._EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS,
+        }),
     ]
     system_text = "\n".join(
         str(message.get("content") or "")
@@ -284,7 +287,10 @@ def test_required_sender_search_retries_long_prose_once_then_executes(monkeypatc
 
     assert schemas[:2] == [{"search_emails"}, {"search_emails"}]
     assert executed == [
-        ("mcp__email__search_emails", {"query": "sender@example.com"}),
+        ("mcp__email__search_emails", {
+            "query": "sender@example.com",
+            "max_results": agent_loop._EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS,
+        }),
     ]
     assert len(schemas) == 3
     corrective_text = "\n".join(
@@ -467,7 +473,10 @@ def test_new_session_foreign_ask_context_uses_required_search_retry(monkeypatch)
 
     assert schemas[:2] == [{"search_emails"}, {"search_emails"}]
     assert executed == [
-        ("mcp__email__search_emails", {"query": "sender@example.com"}),
+        ("mcp__email__search_emails", {
+            "query": "sender@example.com",
+            "max_results": agent_loop._EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS,
+        }),
     ]
     corrective_system = "\n".join(
         str(message.get("content") or "")

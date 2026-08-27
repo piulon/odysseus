@@ -1507,6 +1507,70 @@ def _email_retrieval_target_key(
     )
 
 
+_EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS = 100
+
+
+def _has_exhaustive_email_intent(text: str) -> bool:
+    """Recognize explicit, multilingual requests for the complete email set."""
+    normalized = unicodedata.normalize("NFKD", str(text or "").lower())
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    return bool(re.search(
+        r"\b(?:"
+        r"(?:all|every)\s+(?:the\s+)?(?:e-?mails?|messages?)|"
+        r"tots?\s+(?:els?\s+)?(?:correus|e-?mails?)|"
+        r"todos?\s+(?:los\s+)?(?:correos|e-?mails?)|"
+        r"(?:complete|full)\s+(?:e-?mail\s+)?history"
+        r")\b",
+        normalized,
+    ))
+
+
+def _email_search_arguments_for_intent(
+    block_content: str,
+    *,
+    exhaustive: bool,
+) -> str:
+    """Raise only the supported per-folder limit for explicit exhaustive work.
+
+    The email MCP has no pagination contract. Its only discovery control is
+    ``max_results`` per folder, so exhaustive requests use a documented bounded
+    ceiling instead of inventing cursor/offset arguments. Ordinary searches
+    retain the model's exact arguments and legacy default.
+    """
+    if not exhaustive:
+        return block_content
+    try:
+        arguments = json.loads(block_content or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return block_content
+    if not isinstance(arguments, dict):
+        return block_content
+    arguments["max_results"] = _EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS
+    return json.dumps(arguments, ensure_ascii=False)
+
+
+def _email_canonical_identity(item: Dict[str, Any]) -> tuple[str, ...]:
+    """Return RFC Message-ID identity, or a conservative content fallback."""
+    message_id = str(
+        item.get("resolved_message_id") or item.get("message_id") or ""
+    ).strip()
+    if message_id:
+        return "message-id", message_id.casefold()
+    # Without an RFC identity, only collapse records whose stable retrieved
+    # envelope and exact body all agree. Folder and UID are deliberately not
+    # included because Gmail exposes one RFC message through several folders.
+    return (
+        "fallback",
+        str(item.get("resolved_account_email") or item.get("account_email") or "").strip().casefold(),
+        str(item.get("subject") or "").strip(),
+        str(item.get("from_address") or item.get("from") or "").strip().casefold(),
+        str(item.get("to") or item.get("recipients") or "").strip().casefold(),
+        str(item.get("cc") or "").strip().casefold(),
+        str(item.get("date") or "").strip(),
+        str(item.get("body") or item.get("content") or ""),
+    )
+
+
 _EMAIL_READ_BATCH_MAX_TARGETS = 20
 
 
@@ -1580,6 +1644,18 @@ def _email_search_targets_from_result(block_content: str, result: Dict) -> Set[t
             account=account,
         ))
     return targets
+
+
+def _email_search_result_is_incomplete(result: Dict) -> bool:
+    """Detect the email MCP's explicit per-folder discovery ceiling marker."""
+    raw = str(
+        result.get("stdout")
+        or result.get("output")
+        or result.get("content")
+        or result.get("results")
+        or ""
+    )
+    return "[DISCOVERY INCOMPLETE:" in raw
 
 
 def _email_read_progress_from_result(
@@ -3711,6 +3787,7 @@ async def stream_agent_loop(
     # Tool retrieval uses the latest message by default. It may inherit recent
     # user turns only for explicit continuations ("yes", "do it", "1").
     _retrieval_query = str(_intent.get("retrieval_query") or _last_user)
+    _exhaustive_email_intent = _has_exhaustive_email_intent(_retrieval_query)
     logger.info(
         "[agent-intent] latest=%r continuation=%s low_signal=%s domains=%s active_doc_relevant=%s retrieval_query=%r",
         _last_user[:120],
@@ -6822,6 +6899,17 @@ async def stream_agent_loop(
                 )
                 break
             break  # no tools — done
+
+        if _exhaustive_email_intent:
+            for _index, _block in enumerate(tool_blocks):
+                if _block.tool_type in {"mcp__email__search_emails", "search_emails"}:
+                    tool_blocks[_index] = ToolBlock(
+                        _block.tool_type,
+                        _email_search_arguments_for_intent(
+                            _block.content,
+                            exhaustive=True,
+                        ),
+                    )
 
         # ── Loop-breaker (Terminus-style stall detector) ──────────────
         # Stall detector for repeated no-progress tool loops.

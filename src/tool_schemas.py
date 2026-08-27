@@ -1175,7 +1175,7 @@ FUNCTION_TOOL_SCHEMAS = [
                 "properties": {
                     "query": {"type": "string", "description": "Free-text query matching sender, subject, and message body"},
                     "folders": {"type": "array", "items": {"type": "string"}, "description": "Folders to search (default: INBOX, Sent, Archive)"},
-                    "max_results": {"type": "integer", "description": "Maximum results per folder (default: 20)"},
+                    "max_results": {"type": "integer", "description": "Maximum results per folder (default: 20; exhaustive artifact workflows use the bounded ceiling of 100 because this tool has no pagination contract)"},
                     "account": {"type": "string", "description": "Optional account name/email/id from list_email_accounts"},
                 },
                 "required": ["query"]

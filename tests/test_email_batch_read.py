@@ -62,6 +62,12 @@ async def test_read_email_schema_exposes_one_ordered_bounded_batch_contract():
         if schema["function"]["name"] == "read_email"
     )["function"]["parameters"]["properties"]
 
+    search_tool = next(tool for tool in await es.list_tools() if tool.name == "search_emails")
+    search_properties = search_tool.inputSchema["properties"]
+    assert search_properties["max_results"]["maximum"] == 100
+    assert "cursor" not in search_properties
+    assert "offset" not in search_properties
+
 
 def test_model_plural_uids_normalize_to_existing_batch_contract():
     block = function_call_to_tool_block(
@@ -81,6 +87,91 @@ def test_model_plural_uids_normalize_to_existing_batch_contract():
             {"uid": "11", "folder": "Archive", "account": "work"},
         ],
     }
+
+
+@pytest.mark.parametrize("user_text", [
+    "Create a document with all emails from alex@example.test",
+    "Archive every email about the project",
+    "Document all messages involving Alex",
+    "Crea un document amb tots els correus de l'Anna",
+    "Documento con todos los emails de Ana",
+    "Create the complete email history with Pat",
+    "Create a full email history for this address",
+])
+def test_exhaustive_email_intent_is_narrowly_recognized(user_text):
+    assert agent_loop._has_exhaustive_email_intent(user_text)
+
+
+@pytest.mark.parametrize("user_text", [
+    "Find emails from alex@example.test",
+    "Summarize the latest 20 emails",
+    "Search messages about the project",
+])
+def test_ordinary_email_search_is_not_exhaustive(user_text):
+    assert not agent_loop._has_exhaustive_email_intent(user_text)
+
+
+def test_exhaustive_search_uses_only_supported_bounded_limit():
+    original = json.dumps({
+        "query": "alex@example.test",
+        "max_results": 20,
+        "folders": ["INBOX", "Sent", "Archive"],
+    })
+    exhaustive = json.loads(agent_loop._email_search_arguments_for_intent(
+        original, exhaustive=True,
+    ))
+    assert exhaustive == {
+        "query": "alex@example.test",
+        "max_results": agent_loop._EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS,
+        "folders": ["INBOX", "Sent", "Archive"],
+    }
+    assert "cursor" not in exhaustive
+    assert "offset" not in exhaustive
+    assert agent_loop._email_search_arguments_for_intent(
+        original, exhaustive=False,
+    ) == original
+
+
+def test_canonical_message_id_deduplicates_provider_folder_overlap():
+    inbox = {
+        "resolved_message_id": "<same@example.test>",
+        "folder": "INBOX",
+        "uid": "2365",
+    }
+    all_mail = {
+        "resolved_message_id": "<SAME@example.test>",
+        "folder": "[Provider]/All Mail",
+        "uid": "3697",
+    }
+    assert agent_loop._email_canonical_identity(inbox) == agent_loop._email_canonical_identity(all_mail)
+
+
+def test_same_subject_and_date_with_distinct_message_ids_remain_distinct():
+    common = {"subject": "Re: Euro", "date": "3 May 2023", "body": "same"}
+    first = {**common, "resolved_message_id": "<first@example.test>"}
+    second = {**common, "resolved_message_id": "<second@example.test>"}
+    assert agent_loop._email_canonical_identity(first) != agent_loop._email_canonical_identity(second)
+
+
+def test_missing_message_id_fallback_is_deterministic_and_conservative():
+    first = {
+        "subject": "No RFC identity", "from_address": "a@example.test",
+        "to": "b@example.test", "date": "Tue, 1 Jan 2030 10:00:00 +0000",
+        "body": "Exact retrieved body", "folder": "INBOX", "uid": "1",
+    }
+    overlap = {**first, "folder": "[Provider]/All Mail", "uid": "99"}
+    distinct = {**overlap, "body": "A legitimately different body"}
+    assert agent_loop._email_canonical_identity(first) == agent_loop._email_canonical_identity(overlap)
+    assert agent_loop._email_canonical_identity(first) != agent_loop._email_canonical_identity(distinct)
+
+
+def test_discovery_incomplete_marker_is_structural():
+    assert agent_loop._email_search_result_is_incomplete({
+        "stdout": "Found 100 email(s)\n[DISCOVERY INCOMPLETE: limit reached]",
+    })
+    assert not agent_loop._email_search_result_is_incomplete({
+        "stdout": "Found 60 email(s)",
+    })
 
 
 @pytest.mark.parametrize("uids", [[], "10", None, [{}], [True], [1.5]])
