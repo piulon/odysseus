@@ -207,6 +207,198 @@ def test_sender_search_is_seeded_and_clamped_for_mcp_schemas(monkeypatch):
     ]
 
 
+def test_real_smoke_d_mcp_metadata_only_completion(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas, messages_by_round, executed = [], [], []
+    registered = [
+        {"type": "function", "function": {"name": "mcp__email__search_emails"}},
+        {"type": "function", "function": {"name": "mcp__email__read_email"}},
+        {"type": "function", "function": {"name": "mcp__email__list_emails"}},
+        {"type": "function", "function": {"name": "mcp__email__list_email_accounts"}},
+    ]
+
+    class _FakeMcp:
+        pass
+
+    monkeypatch.setattr(agent_loop, "get_mcp_manager", lambda: _FakeMcp(), raising=False)
+    monkeypatch.setattr(agent_loop, "_load_mcp_disabled_map", lambda: {}, raising=False)
+    monkeypatch.setattr(agent_loop, "FUNCTION_TOOL_SCHEMAS", [], raising=False)
+    monkeypatch.setattr(
+        agent_loop, "_build_system_prompt",
+        lambda messages, *args, **kwargs: (messages, list(registered)), raising=False,
+    )
+    prompt = (
+        "Busca el correu més recent de niniprimer@gmail.com i digues-me "
+        "només la data i l'assumpte."
+    )
+    body_sentinel = "PRIVATE BODY SENTINEL — must never appear"
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        messages_by_round.append(messages)
+        if len(schemas) == 1:
+            yield "data: " + json.dumps({"type": "tool_calls", "calls": [{
+                "name": "mcp__email__search_emails",
+                "arguments": json.dumps({"query": "niniprimer@gmail.com", "max_results": 1}),
+            }]}) + "\n\n"
+        else:
+            yield 'data: {"delta": "Wed, 3 May 2023 16:38:36 +0700 — Re: Euro"}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append((block.tool_type, json.loads(block.content)))
+        return block.tool_type, {"output": "\n".join([
+            "Found 2 email(s):",
+            "1. **Re: Euro**",
+            "From: nini primer (niniprimer@gmail.com)",
+            "Date: Wed, 3 May 2023 16:38:36 +0700",
+            "Folder: INBOX",
+            "UID: 2365",
+            "2. **Re: Euro**",
+            "From: nini primer (niniprimer@gmail.com)",
+            "Date: Wed, 3 May 2023 16:38:36 +0700",
+            "Folder: Archive",
+            "UID: 2365",
+            body_sentinel,
+        ]), "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+    chunks = _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1/chat/completions", "qwen3:14b",
+        [{"role": "user", "content": prompt}],
+        max_rounds=2, relevant_tools=None, owner="admin",
+    ))
+
+    assert schemas[0] == {"mcp__email__search_emails"}
+    assert executed == [
+        ("mcp__email__search_emails", {"query": "niniprimer@gmail.com", "max_results": 1}),
+    ]
+    assert schemas[1] == set()
+    reminder = "\n".join(
+        str(message.get("content") or "") for message in messages_by_round[1]
+    )
+    assert "Answer only with the requested email metadata" in reminder
+    assert "date" in reminder and "subject" in reminder
+    output = "".join(chunks)
+    assert "Wed, 3 May 2023 16:38:36 +0700" in output
+    assert "Re: Euro" in output
+    assert body_sentinel not in output
+
+
+def _metadata_search_output(include_date=True, include_subject=True):
+    lines = ["Found 1 email(s):", "1. **Re: Euro**", "From: nini primer (sender@example.com)"]
+    if include_date:
+        lines.append("Date: Wed, 3 May 2023 16:38:36 +0700")
+    if include_subject:
+        lines.append("Subject: Re: Euro")
+    lines.extend(["Folder: INBOX", "UID: 2365"])
+    return "\n".join(lines)
+
+
+def test_metadata_only_search_suppresses_read_and_preserves_shape(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas, executed, messages_by_round = [], [], []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        messages_by_round.append(messages)
+        if len(schemas) == 1:
+            yield "data: " + json.dumps({"type": "tool_calls", "calls": [{
+                "name": "search_emails",
+                "arguments": '{"query":"sender@example.com","max_results":1}',
+            }]}) + "\n\n"
+        else:
+            yield 'data: {"delta": "Wed, 3 May 2023 16:38:36 +0700 — Re: Euro"}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append((block.tool_type, json.loads(block.content)))
+        return block.tool_type, {"output": _metadata_search_output(), "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+    chunks = _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{"role": "user", "content": "Busca el correo más reciente de sender@example.com y dime solo la fecha y el asunto."}],
+        max_rounds=2, relevant_tools=set(_EMAIL_DOCUMENT_TOOLS), owner="admin",
+    ))
+
+    assert schemas[0] == {"search_emails"}
+    assert schemas[1] == set()
+    assert executed == [("mcp__email__search_emails", {"query": "sender@example.com", "max_results": 1})]
+    output = "".join(chunks)
+    assert "Wed, 3 May 2023 16:38:36 +0700" in output and "Re: Euro" in output
+    assert "unsolicited offer" not in output
+    reminder = "\n".join(str(m.get("content") or "") for m in messages_by_round[1])
+    assert "Answer only with the requested email metadata" in reminder
+
+
+def test_metadata_only_incomplete_result_keeps_read_email_available(monkeypatch):
+    _patch_agent(monkeypatch)
+    schemas, executed = [], []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        if len(schemas) == 1:
+            call = {"name": "search_emails", "arguments": '{"query":"sender@example.com"}'}
+        elif len(schemas) == 2:
+            call = {"name": "read_email", "arguments": '{"uid":"2365","folder":"INBOX"}'}
+        else:
+            yield 'data: {"delta": "Date unavailable."}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+        yield "data: " + json.dumps({"type": "tool_calls", "calls": [call]}) + "\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        output = _metadata_search_output(include_date=False) if "search_emails" in block.tool_type else "Body"
+        return block.tool_type, {"output": output, "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{"role": "user", "content": "Dime solo la fecha y el asunto del correo de sender@example.com."}],
+        max_rounds=3, relevant_tools=set(_EMAIL_DOCUMENT_TOOLS), owner="admin",
+    ))
+    assert executed == ["mcp__email__search_emails", "mcp__email__read_email"]
+    assert "read_email" in schemas[1]
+
+
+def test_body_request_keeps_read_email_progression(monkeypatch):
+    _patch_agent(monkeypatch)
+    executed, schemas = [], []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        schemas.append(_schema_names(kwargs.get("tools")))
+        if len(schemas) == 1:
+            call = {"name": "search_emails", "arguments": '{"query":"sender@example.com"}'}
+            yield "data: " + json.dumps({"type": "tool_calls", "calls": [call]}) + "\n\n"
+        elif len(schemas) == 2:
+            call = {"name": "read_email", "arguments": '{"uid":"2365","folder":"INBOX"}'}
+            yield "data: " + json.dumps({"type": "tool_calls", "calls": [call]}) + "\n\n"
+        else:
+            yield 'data: {"delta": "Resumen del contenido."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        output = _metadata_search_output() if "search_emails" in block.tool_type else "Full body text"
+        return block.tool_type, {"output": output, "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "stream_llm_with_fallback", fake_stream, raising=False)
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute, raising=False)
+    _collect(agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "qwen3:14b",
+        [{"role": "user", "content": "Llegeix el correu més recent de sender@example.com i resumeix-me què diu."}],
+        max_rounds=3, relevant_tools=set(_EMAIL_DOCUMENT_TOOLS), owner="admin",
+    ))
+    assert executed == ["mcp__email__search_emails", "mcp__email__read_email"]
+    assert "read_email" in schemas[1]
+
+
 @pytest.mark.parametrize("user_text", [
     "Crea'm un document Word amb tots els correus de sender@example.com, ordenats per data.",
     "Crea un documento Word con todos los correos de sender@example.com, ordenados por fecha.",
