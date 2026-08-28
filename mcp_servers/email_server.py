@@ -57,7 +57,6 @@ def _uid_fetch_rows(data) -> list:
 # inbox; None resolves to the default row. Falls back to env vars / settings.json
 # flat keys when no DB row matches (legacy single-account behaviour).
 
-_ACCOUNT_CACHE: dict = {}  # key = normalized account selector -> config dict
 _MCP_OWNER_ARG = "_odysseus_owner"
 _CURRENT_OWNER: ContextVar[str | None] = ContextVar("email_mcp_owner", default=None)
 _OWNER_ENV_KEYS = ("ODYSSEUS_MCP_EMAIL_OWNER", "ODYSSEUS_EMAIL_OWNER")
@@ -260,15 +259,15 @@ def _resolve_account(selector: str | None) -> dict | None:
 def _load_config(account: str | None = None) -> dict:
     """Return the full config dict for the requested account (or default).
 
+    Database-backed configuration is intentionally resolved on every call.
+    The email MCP server is a separate, long-lived process, so an in-memory
+    cache cannot be invalidated reliably by account mutations in the web app.
+
     Resolution order per-field:
       1. email_accounts row (selected by `account` or default)
       2. env vars + settings.json flat keys (legacy)
       3. hardcoded fallbacks (localhost:31143 etc.)
     """
-    cache_key = (_current_owner(), (account or "").strip().lower() or "__default__")
-    if cache_key in _ACCOUNT_CACHE:
-        return _ACCOUNT_CACHE[cache_key]
-
     cfg = {
         "imap_host": os.environ.get("IMAP_HOST", "localhost"),
         "imap_port": int(os.environ.get("IMAP_PORT", "31143")),
@@ -351,7 +350,6 @@ def _load_config(account: str | None = None) -> dict:
     if not cfg["from_address"]:
         cfg["from_address"] = cfg["imap_user"]
 
-    _ACCOUNT_CACHE[cache_key] = cfg
     return cfg
 
 
