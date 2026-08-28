@@ -20,9 +20,7 @@ import mcp_servers.email_server as es
 def _clear_mcp_email_owner_env(monkeypatch):
     for key in es._OWNER_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
-    es._ACCOUNT_CACHE.clear()
     yield
-    es._ACCOUNT_CACHE.clear()
 
 
 def _init_accounts_db(path, rows=None):
@@ -95,7 +93,6 @@ async def test_mcp_email_accounts_are_filtered_by_hidden_owner(tmp_path, monkeyp
     db_path = tmp_path / "app.db"
     _init_accounts_db(db_path)
     monkeypatch.setattr(es, "APP_DB", str(db_path))
-    es._ACCOUNT_CACHE.clear()
 
     out = await es.call_tool("list_email_accounts", {"_odysseus_owner": "alice"})
     text = out[0].text
@@ -109,7 +106,6 @@ async def test_mcp_email_requires_owner_when_multiple_account_owners_exist(tmp_p
     db_path = tmp_path / "app.db"
     _init_accounts_db(db_path)
     monkeypatch.setattr(es, "APP_DB", str(db_path))
-    es._ACCOUNT_CACHE.clear()
 
     out = await es.call_tool("list_email_accounts", {})
 
@@ -167,7 +163,6 @@ def test_mcp_email_scoped_owner_without_visible_account_skips_legacy_fallback(tm
     )
     monkeypatch.setattr(es, "APP_DB", str(db_path))
     monkeypatch.setattr(es, "_SETTINGS_FILE", str(settings_path))
-    es._ACCOUNT_CACHE.clear()
 
     token = es._CURRENT_OWNER.set("charlie")
     try:
@@ -175,7 +170,6 @@ def test_mcp_email_scoped_owner_without_visible_account_skips_legacy_fallback(tm
             es._load_config()
     finally:
         es._CURRENT_OWNER.reset(token)
-        es._ACCOUNT_CACHE.clear()
 
 
 @pytest.mark.asyncio
