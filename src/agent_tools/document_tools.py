@@ -429,6 +429,7 @@ class CreateDocumentTool:
             return {
                 "action": "create",
                 "doc_id": doc_id,
+                "docx_url": f"/api/document/{doc_id}/export-docx",
                 "title": title,
                 "language": language,
                 "content": content,

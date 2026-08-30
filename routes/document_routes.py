@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File, Form, Response
 
 from sqlalchemy import case, func, or_
 from core.database import SessionLocal, Document, DocumentVersion
@@ -476,6 +476,29 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 raise HTTPException(404, "Document not found")
             _verify_doc_owner(db, doc, user)
             return _doc_to_dict(doc)
+        finally:
+            db.close()
+
+    # ---- GET /api/document/{doc_id}/export-docx ----
+    @router.get("/api/document/{doc_id}/export-docx")
+    async def export_document_docx(request: Request, doc_id: str) -> Response:
+        """Render the current canonical document content as a DOCX download."""
+        from src.docx_export import render_document_docx
+
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            doc = db.query(Document).filter(Document.id == doc_id).first()
+            if not doc:
+                raise HTTPException(404, "Document not found")
+            _verify_doc_owner(db, doc, user)
+            filename = f"{_slug(doc.title or 'document')}.docx"
+            payload = render_document_docx(doc.title or "Untitled", doc.current_content or "")
+            return Response(
+                content=payload,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
         finally:
             db.close()
 
