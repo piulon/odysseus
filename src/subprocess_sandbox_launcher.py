@@ -11,6 +11,7 @@ is never executed.
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
 import sys
 
@@ -23,6 +24,36 @@ LANDLOCK_CREATE_RULESET_VERSION = 1
 LANDLOCK_RULE_PATH_BENEATH = 1
 
 PR_SET_NO_NEW_PRIVS = 38
+PR_SET_SECCOMP = 22
+SECCOMP_MODE_FILTER = 2
+
+# Landlock ABI >= 4 network rights.  With these rights handled and no
+# LANDLOCK_RULE_NET_PORT allow rules installed, TCP bind/connect fail closed.
+LANDLOCK_ACCESS_NET_BIND_TCP = 1 << 0
+LANDLOCK_ACCESS_NET_CONNECT_TCP = 1 << 1
+
+# Classic-BPF/seccomp constants.  The additional process-local filter permits
+# AF_UNIX sockets but refuses creation of IP/packet sockets.  This closes the
+# UDP/raw-socket gap left by Landlock's TCP-only network mediation.
+BPF_LD = 0x00
+BPF_W = 0x00
+BPF_ABS = 0x20
+BPF_JMP = 0x05
+BPF_JEQ = 0x10
+BPF_JGE = 0x30
+BPF_K = 0x00
+BPF_RET = 0x06
+
+SECCOMP_RET_ALLOW = 0x7FFF0000
+SECCOMP_RET_ERRNO = 0x00050000
+
+SECCOMP_DATA_NR_OFFSET = 0
+SECCOMP_DATA_ARCH_OFFSET = 4
+SECCOMP_DATA_ARG0_OFFSET = 16
+
+AUDIT_ARCH_X86_64 = 0xC000003E
+AUDIT_ARCH_AARCH64 = 0xC00000B7
+X32_SYSCALL_BIT = 0x40000000
 
 EXECUTE = 1 << 0
 WRITE_FILE = 1 << 1
@@ -46,6 +77,7 @@ TRUNCATE = 1 << 14
 class RulesetAttr(ctypes.Structure):
     _fields_ = [
         ("handled_access_fs", ctypes.c_uint64),
+        ("handled_access_net", ctypes.c_uint64),
     ]
 
 
@@ -156,12 +188,34 @@ def _install_landlock(
 
     handled = _handled_rights(abi)
 
-    attr = RulesetAttr(handled)
+    # Network mediation arrived in Landlock ABI 4.  On older kernels retain
+    # the filesystem sandbox and let the mandatory seccomp layer below provide
+    # the network fail-closed boundary.
+    handled_net = 0
+    if abi >= 4:
+        handled_net = (
+            LANDLOCK_ACCESS_NET_BIND_TCP
+            | LANDLOCK_ACCESS_NET_CONNECT_TCP
+        )
+
+    attr = RulesetAttr(
+        handled,
+        handled_net,
+    )
+
+    # Older Landlock ABIs only know the first u64 field.  Supplying the v1
+    # structure size preserves compatibility while ABI >= 4 receives both
+    # filesystem and network handled-access masks.
+    attr_size = (
+        ctypes.sizeof(attr)
+        if abi >= 4
+        else ctypes.sizeof(ctypes.c_uint64)
+    )
 
     ruleset_fd = _LIBC.syscall(
         SYS_LANDLOCK_CREATE_RULESET,
         ctypes.byref(attr),
-        ctypes.sizeof(attr),
+        attr_size,
         0,
     )
 
@@ -263,6 +317,240 @@ def _install_landlock(
         os.close(ruleset_fd)
 
 
+
+class SockFilter(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_ushort),
+        ("jt", ctypes.c_ubyte),
+        ("jf", ctypes.c_ubyte),
+        ("k", ctypes.c_uint32),
+    ]
+
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [
+        ("len", ctypes.c_ushort),
+        ("filter", ctypes.POINTER(SockFilter)),
+    ]
+
+
+def _seccomp_syscalls() -> tuple[int, int, int, int, bool]:
+    """Return audit arch + socket syscalls for supported native ABIs.
+
+    Unknown architectures fail closed instead of silently running generated
+    code without the intended network boundary.
+    """
+    machine = os.uname().machine.strip().lower()
+
+    if machine in {"x86_64", "amd64"}:
+        return (
+            AUDIT_ARCH_X86_64,
+            41,   # socket
+            53,   # socketpair
+            425,  # io_uring_setup
+            True,
+        )
+
+    if machine in {"aarch64", "arm64"}:
+        return (
+            AUDIT_ARCH_AARCH64,
+            198,  # socket
+            199,  # socketpair
+            425,  # io_uring_setup
+            False,
+        )
+
+    raise RuntimeError(
+        f"Unsupported architecture for subprocess seccomp sandbox: {machine}"
+    )
+
+
+def _install_network_seccomp() -> None:
+    """Allow AF_UNIX IPC but deny model-controlled IP/network sockets.
+
+    The filter is additive to Docker's existing seccomp policy and is inherited
+    across execve().  It denies:
+      - socket()/socketpair() for every domain except AF_UNIX;
+      - io_uring_setup(), preventing IORING_OP_SOCKET style bypasses;
+      - x32 ABI syscalls on x86_64.
+
+    Landlock independently denies TCP bind/connect on ABI >= 4.  Seccomp closes
+    the remaining UDP/raw/packet-socket gap.
+    """
+    (
+        audit_arch,
+        sys_socket,
+        sys_socketpair,
+        sys_io_uring_setup,
+        deny_x32,
+    ) = _seccomp_syscalls()
+
+    instructions: list[SockFilter] = []
+    labels: dict[str, int] = {}
+    fixups: list[tuple[int, str, str]] = []
+
+    def label(name: str) -> None:
+        if name in labels:
+            raise RuntimeError(
+                f"Duplicate seccomp BPF label: {name}"
+            )
+        labels[name] = len(instructions)
+
+    def stmt(code: int, k: int) -> None:
+        instructions.append(
+            SockFilter(code, 0, 0, k)
+        )
+
+    def jump(
+        code: int,
+        k: int,
+        true_label: str,
+        false_label: str,
+    ) -> None:
+        idx = len(instructions)
+        instructions.append(
+            SockFilter(code, 0, 0, k)
+        )
+        fixups.append(
+            (idx, "jt", true_label)
+        )
+        fixups.append(
+            (idx, "jf", false_label)
+        )
+
+    stmt(
+        BPF_LD | BPF_W | BPF_ABS,
+        SECCOMP_DATA_ARCH_OFFSET,
+    )
+    jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        audit_arch,
+        "load_nr",
+        "deny",
+    )
+
+    label("load_nr")
+    stmt(
+        BPF_LD | BPF_W | BPF_ABS,
+        SECCOMP_DATA_NR_OFFSET,
+    )
+
+    if deny_x32:
+        jump(
+            BPF_JMP | BPF_JGE | BPF_K,
+            X32_SYSCALL_BIT,
+            "deny",
+            "check_io_uring",
+        )
+    else:
+        label("check_io_uring")
+
+    if deny_x32:
+        label("check_io_uring")
+
+    jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        sys_io_uring_setup,
+        "deny",
+        "check_socket",
+    )
+
+    label("check_socket")
+    jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        sys_socket,
+        "load_domain",
+        "check_socketpair",
+    )
+
+    label("check_socketpair")
+    jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        sys_socketpair,
+        "load_domain",
+        "allow",
+    )
+
+    label("load_domain")
+    stmt(
+        BPF_LD | BPF_W | BPF_ABS,
+        SECCOMP_DATA_ARG0_OFFSET,
+    )
+    jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        1,  # AF_UNIX / AF_LOCAL
+        "allow",
+        "deny",
+    )
+
+    label("deny")
+    stmt(
+        BPF_RET | BPF_K,
+        SECCOMP_RET_ERRNO | errno.EPERM,
+    )
+
+    label("allow")
+    stmt(
+        BPF_RET | BPF_K,
+        SECCOMP_RET_ALLOW,
+    )
+
+    for idx, field_name, target in fixups:
+        if target not in labels:
+            raise RuntimeError(
+                f"Unknown seccomp BPF label: {target}"
+            )
+
+        offset = labels[target] - idx - 1
+
+        if not 0 <= offset <= 255:
+            raise RuntimeError(
+                "Invalid seccomp BPF jump offset"
+            )
+
+        setattr(
+            instructions[idx],
+            field_name,
+            offset,
+        )
+
+    array_type = SockFilter * len(instructions)
+    array = array_type(*instructions)
+
+    prog = SockFprog(
+        len(instructions),
+        ctypes.cast(
+            array,
+            ctypes.POINTER(SockFilter),
+        ),
+    )
+
+    # Landlock already sets no_new_privs; repeat defensively so this helper also
+    # fails closed if its call order is ever changed.
+    rc = _LIBC.prctl(
+        PR_SET_NO_NEW_PRIVS,
+        1,
+        0,
+        0,
+        0,
+    )
+
+    if rc != 0:
+        raise _syscall_error(
+            "PR_SET_NO_NEW_PRIVS before seccomp failed"
+        )
+
+    rc = _LIBC.prctl(
+        PR_SET_SECCOMP,
+        SECCOMP_MODE_FILTER,
+        ctypes.byref(prog),
+    )
+
+    if rc != 0:
+        raise _syscall_error(
+            "Subprocess network seccomp install failed"
+        )
+
 def _parse(argv: list[str]) -> tuple[str, str, str, str]:
     try:
         separator = argv.index("--")
@@ -329,6 +617,7 @@ def main() -> int:
             os.path.realpath(workspace),
             os.path.realpath(tmpdir),
         )
+        _install_network_seccomp()
 
         env = dict(os.environ)
 

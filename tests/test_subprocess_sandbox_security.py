@@ -446,3 +446,148 @@ def test_parent_of_persistent_data_cannot_be_explicit_workspace():
     assert "SHOULD_NOT_EXECUTE" not in output
     assert result.get("exit_code") != 0
     assert "contains Odysseus persistent data" in output
+
+
+# --- subprocess network egress hardening v2 ---
+
+
+def test_launcher_seccomp_denies_non_unix_sockets_and_preserves_unix(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import src.subprocess_sandbox_launcher as launcher
+
+    workspace = tmp_path / "workspace"
+    tmpdir = tmp_path / "tmp"
+
+    workspace.mkdir()
+    tmpdir.mkdir()
+
+    payload = r"""
+import ctypes
+import errno
+import socket
+
+def blocked(domain, kind):
+    try:
+        s = socket.socket(domain, kind)
+    except PermissionError:
+        return True
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    else:
+        s.close()
+        return False
+
+assert blocked(socket.AF_INET, socket.SOCK_STREAM)
+assert blocked(socket.AF_INET, socket.SOCK_DGRAM)
+assert blocked(socket.AF_INET6, socket.SOCK_STREAM)
+
+if hasattr(socket, "AF_PACKET"):
+    assert blocked(socket.AF_PACKET, socket.SOCK_RAW)
+
+a, b = socket.socketpair()
+a.sendall(b"x")
+assert b.recv(1) == b"x"
+a.close()
+b.close()
+
+libc = ctypes.CDLL(None, use_errno=True)
+ctypes.set_errno(0)
+
+rc = libc.syscall(
+    425,  # io_uring_setup on supported sandbox architectures
+    1,
+    ctypes.c_void_p(0),
+)
+
+err = ctypes.get_errno()
+
+assert rc == -1
+assert err == errno.EPERM
+
+print("SECCOMP_NETWORK_POLICY=PASS")
+"""
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(Path(launcher.__file__).resolve()),
+            "--tool",
+            "python",
+            "--workspace",
+            str(workspace),
+            "--tmpdir",
+            str(tmpdir),
+            "--",
+            payload,
+        ],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=20,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "SECCOMP_NETWORK_POLICY=PASS" in proc.stdout
+
+
+def test_landlock_network_denies_tcp_connect_on_precreated_socket(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import pytest
+    import src.subprocess_sandbox_launcher as launcher
+
+    if launcher._landlock_abi() < 4:
+        pytest.skip(
+            "Landlock network mediation requires ABI >= 4"
+        )
+
+    workspace = tmp_path / "workspace"
+    tmpdir = tmp_path / "tmp"
+
+    workspace.mkdir()
+    tmpdir.mkdir()
+
+    repo = Path(__file__).resolve().parents[1]
+
+    code = f"""
+import socket
+from src import subprocess_sandbox_launcher as launcher
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+launcher._install_landlock(
+    {str(workspace)!r},
+    {str(tmpdir)!r},
+)
+
+try:
+    s.connect(("127.0.0.1", 9))
+except PermissionError:
+    print("LANDLOCK_TCP_CONNECT=BLOCKED")
+else:
+    raise SystemExit("Landlock unexpectedly allowed TCP connect")
+finally:
+    s.close()
+"""
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+        ],
+        cwd=str(repo),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=20,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "LANDLOCK_TCP_CONNECT=BLOCKED" in proc.stdout
