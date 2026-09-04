@@ -1248,3 +1248,71 @@ async def test_exhaustive_document_replaces_model_summary_with_exact_unique_corp
         assert content.count(f"LOSSLESS BODY {index:02d}") == 1
     assert content.index("<message-00@example.test>") < content.index("<message-30@example.test>")
     assert any("Document created." in chunk for chunk in chunks)
+
+
+def test_required_email_document_block_preserves_explicit_nonlossless_title(monkeypatch):
+    """An explicit requested title must survive the forced email-document path."""
+    import json
+
+    calls = []
+
+    def capture_tool_block(name, arguments):
+        calls.append((name, arguments))
+        return object()
+
+    monkeypatch.setattr(
+        agent_loop,
+        "function_call_to_tool_block",
+        capture_tool_block,
+    )
+
+    items = [{
+        "subject": "Example subject",
+        "from": "sender@example.invalid",
+        "date": "2026-09-04",
+        "body": "Example retrieved body.",
+    }]
+
+    requested_title = (
+        "Gmail OAuth E2E - AutoDS - 2026-09-05"
+    )
+
+    result = agent_loop._required_email_document_block(
+        items,
+        "Create a brief document",
+        title=requested_title,
+        lossless=False,
+        discovery_complete=True,
+    )
+
+    assert result is not None
+    assert len(calls) == 1
+
+    tool_name, raw_arguments = calls[0]
+
+    assert tool_name == "create_document"
+
+    payload = json.loads(raw_arguments)
+
+    assert payload["title"] == requested_title
+
+    calls.clear()
+
+    result = agent_loop._required_email_document_block(
+        items,
+        "Create a document",
+        title=None,
+        lossless=False,
+        discovery_complete=True,
+    )
+
+    assert result is not None
+    assert len(calls) == 1
+
+    tool_name, raw_arguments = calls[0]
+
+    assert tool_name == "create_document"
+
+    payload = json.loads(raw_arguments)
+
+    assert payload["title"] == "Retrieved emails"

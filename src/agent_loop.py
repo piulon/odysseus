@@ -1991,7 +1991,7 @@ def _required_email_document_block(
         )
     content = "# Retrieved emails\n\n" + "\n\n---\n\n".join(sections)
     return function_call_to_tool_block("create_document", json.dumps({
-        "title": "Retrieved emails",
+        "title": title or "Retrieved emails",
         "language": "markdown",
         "content": content,
     }, ensure_ascii=False))
