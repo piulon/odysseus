@@ -1526,6 +1526,144 @@ def _has_exhaustive_email_intent(text: str) -> bool:
     ))
 
 
+
+def _requires_email_document_corpus(text: str) -> bool:
+    """Recognize document requests whose selected result set is a corpus.
+
+    This is deliberately separate from exhaustive mailbox intent. A bounded
+    request such as "create a document from ten emails" requires every result
+    in that selected set, but must not widen the mailbox search itself.
+    """
+    normalized = unicodedata.normalize(
+        "NFKD",
+        str(text or "").lower(),
+    )
+    normalized = "".join(
+        char
+        for char in normalized
+        if not unicodedata.combining(char)
+    )
+
+    if _has_exhaustive_email_intent(normalized):
+        return True
+
+    artifact = bool(re.search(
+        r"\b(?:document|doc|word|list|listing|archive|history|"
+        r"documento|llista|lista|arxiu|archivo|historial)\b",
+        normalized,
+    ))
+    if not artifact:
+        return False
+
+    # Explicit selection of one relevant/correct message remains targeted,
+    # even when the search itself asks for many candidate results.
+    if re.search(
+        r"\b(?:identify|select|choose|find|"
+        r"identifica|selecciona|troba|encuentra)\b"
+        r".{0,80}"
+        r"(?:\b(?:relevant|correct|right|one|"
+        r"rellevant|correcte|relevante|correcto)\b|"
+        r"\b(?:message|email|missatge|mensaje|correu|correo)\s+"
+        r"(?:correcte|correcto|relevant|relevante|rellevant)\b)",
+        normalized,
+    ):
+        return False
+
+    # "all ten emails", "every returned email", etc. are corpus semantics,
+    # but deliberately do not imply an exhaustive mailbox search.
+    if re.search(
+        r"\b(?:all|every|tots?|todos?)\b"
+        r"(?:\s+[a-z0-9_-]+){0,5}\s+"
+        r"(?:e-?mails?|messages?|correus?|correos?)\b",
+        normalized,
+    ):
+        return True
+
+    number_words = {
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+        "twenty": 20,
+        "twenty-five": 25,
+        "fifty": 50,
+        "sixty": 60,
+        "dos": 2,
+        "tres": 3,
+        "cuatro": 4,
+        "cinco": 5,
+        "diez": 10,
+        "veinte": 20,
+        "cincuenta": 50,
+        "sesenta": 60,
+        "dues": 2,
+        "quatre": 4,
+        "cinc": 5,
+        "deu": 10,
+        "vint": 20,
+        "cinquanta": 50,
+        "seixanta": 60,
+    }
+
+    number_pattern = "|".join(
+        re.escape(token)
+        for token in sorted(
+            number_words,
+            key=len,
+            reverse=True,
+        )
+    )
+
+    for match in re.finditer(
+        rf"\b(?P<count>\d+|(?:{number_pattern}))\b"
+        r"(?:\s+[a-z0-9_-]+){0,3}\s+"
+        r"(?:e-?mails?|messages?|correus?|correos?)\b",
+        normalized,
+    ):
+        token = match.group("count")
+
+        if token.isdigit():
+            count = int(token)
+        else:
+            count = number_words[token]
+
+        if count > 1:
+            return True
+
+    # "document from the synthetic emails"
+    if re.search(
+        r"\b(?:document|doc|word|documento)\b"
+        r".{0,100}"
+        r"\b(?:from|with|de|amb|con)\b"
+        r".{0,80}"
+        r"\b(?:e-?mails|messages|correus|correos)\b",
+        normalized,
+    ):
+        return True
+
+    # A document explicitly summarizing plural messages is still a corpus
+    # workflow, but its final transformation is not lossless.
+    if re.search(
+        r"\b(?:document|doc|word|documento)\b"
+        r".{0,100}"
+        r"\b(?:summar(?:y|ize|ise|izing|ising)|"
+        r"resume|resum|resumen|resumir|sintesi|sintesis)\b"
+        r".{0,100}"
+        r"\b(?:e-?mails|messages|correus|correos)\b",
+        normalized,
+    ):
+        return True
+
+    return False
+
+
 def _email_search_arguments_for_intent(
     block_content: str,
     *,
@@ -1657,6 +1795,47 @@ def _email_search_result_is_incomplete(result: Dict) -> bool:
         or ""
     )
     return "[DISCOVERY INCOMPLETE:" in raw
+
+
+
+
+def _email_document_search_targets_for_retrieval(
+    targets: Set[tuple[str, str, str, str]],
+    *,
+    corpus: bool,
+    discovery_complete: bool = True,
+) -> Set[tuple[str, str, str, str]]:
+    """Return search hits that are mandatory reads for this document request.
+
+    Corpus requests require the entire bounded result set. Targeted requests
+    keep multiple search hits as candidates, but one complete unambiguous
+    candidate can be selected deterministically without another model round.
+    """
+    if corpus:
+        return set(targets)
+
+    if discovery_complete and len(targets) == 1:
+        return set(targets)
+
+    return set()
+
+
+
+def _email_document_read_targets_for_retrieval(
+    terminal: Set[tuple[str, str, str, str]],
+    usable: Set[tuple[str, str, str, str]],
+    *,
+    corpus: bool,
+) -> Set[tuple[str, str, str, str]]:
+    """Return model-selected reads that define a targeted result set.
+
+    Corpus mode receives its required identities from search/list. Targeted
+    mode instead promotes only the identities the model actually chose to read.
+    """
+    if corpus:
+        return set()
+
+    return set(terminal) | set(usable)
 
 
 def _email_search_result_has_metadata(result: Dict, fields: Set[str]) -> bool:
@@ -1838,12 +2017,31 @@ def _email_document_items_from_result(block_content: str, result: Dict) -> list[
     }]
 
 
+
 def _requires_lossless_email_document(text: str) -> bool:
-    """Limit deterministic corpus assembly to explicit exhaustive artifacts."""
+    """Limit deterministic corpus assembly to literal exhaustive artifacts."""
     if not _has_exhaustive_email_intent(text):
         return False
-    normalized = unicodedata.normalize("NFKD", str(text or "").lower())
-    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+
+    normalized = unicodedata.normalize(
+        "NFKD",
+        str(text or "").lower(),
+    )
+    normalized = "".join(
+        char
+        for char in normalized
+        if not unicodedata.combining(char)
+    )
+
+    # An explicit transformation such as a summary must remain model-mediated,
+    # even when the source corpus itself is exhaustive.
+    if re.search(
+        r"\b(?:summar(?:y|ize|ise|izing|ising)|"
+        r"resume|resum|resumen|resumir|sintesi|sintesis)\b",
+        normalized,
+    ):
+        return False
+
     return bool(re.search(
         r"\b(?:document|doc|word|list|listing|archive|history|"
         r"documento|document|llista|lista|arxiu|archivo|historial)\b",
@@ -4105,6 +4303,7 @@ async def stream_agent_loop(
     # user turns only for explicit continuations ("yes", "do it", "1").
     _retrieval_query = str(_intent.get("retrieval_query") or _last_user)
     _exhaustive_email_intent = _has_exhaustive_email_intent(_retrieval_query)
+    _email_document_corpus_mode = _requires_email_document_corpus(_retrieval_query)
     _lossless_email_document = _requires_lossless_email_document(_retrieval_query)
     logger.info(
         "[agent-intent] latest=%r continuation=%s low_signal=%s domains=%s active_doc_relevant=%s retrieval_query=%r",
@@ -5793,17 +5992,30 @@ async def stream_agent_loop(
         active_email=active_email,
     )
     if _email_document_retrieval_state == "retrieval_pending":
-        _retrieval_gate_directive = (
-            "EMAIL DOCUMENT RETRIEVAL GATE: This document must be based on mailbox "
-            "content. `create_document` is intentionally unavailable until retrieval "
-            "is complete. First call `search_emails` or `list_emails`, then retrieve "
-            "every returned message with `read_email`. Batch known targets in ordered "
-            "`targets` arrays of at most 20, repeating bounded batches until every "
-            "returned target has a body or a terminal error/omission. Do not create a "
-            "placeholder document and do not announce `create_document` as the next "
-            "action while retrieval is incomplete. Once retrieval is ready, create the "
-            "document once with its substantive final content."
-        )
+        if _email_document_corpus_mode:
+            _retrieval_gate_directive = (
+                "EMAIL DOCUMENT RETRIEVAL GATE: This document must be based on mailbox "
+                "content. `create_document` is intentionally unavailable until retrieval "
+                "is complete. First call `search_emails` or `list_emails`, then retrieve "
+                "every returned message with `read_email`. Batch known targets in ordered "
+                "`targets` arrays of at most 20, repeating bounded batches until every "
+                "returned target has a body or a terminal error/omission. Do not create a "
+                "placeholder document and do not announce `create_document` as the next "
+                "action while retrieval is incomplete. Once retrieval is ready, create the "
+                "document once with its substantive final content."
+            )
+        else:
+            _retrieval_gate_directive = (
+                "EMAIL DOCUMENT TARGETED RETRIEVAL GATE: This document must be based on "
+                "mailbox content. `create_document` is intentionally unavailable until a "
+                "relevant message has been read successfully. Search/list results are "
+                "candidates, not a mandatory corpus. Inspect their metadata, select only "
+                "the message or messages needed for the user's request, and call "
+                "`read_email` only for those selected targets. Do not retrieve every "
+                "search result merely because it was returned. Once the selected retrieval "
+                "is usable, create exactly one document that follows the user's requested "
+                "transformation, summary, structure, and level of detail."
+            )
         if messages and messages[0].get("role") == "system":
             messages[0]["content"] = (
                 _retrieval_gate_directive + "\n\n" + (messages[0].get("content") or "")
@@ -6791,6 +7003,7 @@ async def stream_agent_loop(
         if (
             not tool_blocks
             and _email_document_creation_pending
+            and _lossless_email_document
             and not guide_only
             and not _force_answer
         ):
@@ -7547,19 +7760,54 @@ async def stream_agent_loop(
                     if _email_search_result_is_incomplete(result):
                         _email_discovery_complete = False
                     if _found_targets:
-                        _email_retrieval_expected.update(_found_targets)
-                        logger.info(
-                            "[agent] email retrieval targets discovered=%d total=%d",
-                            len(_found_targets), len(_email_retrieval_expected),
+                        _required_search_targets = (
+                            _email_document_search_targets_for_retrieval(
+                                _found_targets,
+                                corpus=_email_document_corpus_mode,
+                                discovery_complete=_email_discovery_complete,
+                            )
                         )
+                        if _required_search_targets:
+                            _email_retrieval_expected.update(
+                                _required_search_targets
+                            )
+                            if _email_document_corpus_mode:
+                                logger.info(
+                                    "[agent] email corpus retrieval targets "
+                                    "discovered=%d total=%d",
+                                    len(_required_search_targets),
+                                    len(_email_retrieval_expected),
+                                )
+                            else:
+                                logger.info(
+                                    "[agent] targeted email search "
+                                    "auto-selected single candidate"
+                                )
+                        else:
+                            logger.info(
+                                "[agent] targeted email search candidates=%d; "
+                                "awaiting model-selected read_email target",
+                                len(_found_targets),
+                            )
                 elif block.tool_type in {"mcp__email__read_email", "read_email"}:
                     _resolved_before_read = len(_email_retrieval_terminal)
                     _terminal, _usable = _email_read_progress_from_result(block.content, result)
                     _email_document_items.extend(
                         _email_document_items_from_result(block.content, result)
                     )
-                    _email_retrieval_terminal.update(_terminal & _email_retrieval_expected)
-                    _email_retrieval_usable.update(_usable & _email_retrieval_expected)
+                    _email_retrieval_expected.update(
+                        _email_document_read_targets_for_retrieval(
+                            _terminal,
+                            _usable,
+                            corpus=_email_document_corpus_mode,
+                        )
+                    )
+                    _email_retrieval_terminal.update(
+                        _terminal & _email_retrieval_expected
+                    )
+                    _email_retrieval_usable.update(
+                        _usable & _email_retrieval_expected
+                    )
                     if _deterministic_read_batch:
                         _deterministic_email_read_no_progress = (
                             len(_email_retrieval_terminal) == _resolved_before_read

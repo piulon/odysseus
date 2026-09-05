@@ -829,7 +829,7 @@ async def test_deterministic_read_no_progress_stops_without_another_model_round(
     assert len(model_schemas) == 1
     assert "create_document" not in model_schemas[0]
     assert any(
-        "email retrieval targets discovered=1 total=1" in message
+        "targeted email search auto-selected single candidate" in message
         for message in log_messages
     )
     assert "deterministic pending email retrieval made no progress" in caplog.text
@@ -950,7 +950,7 @@ async def test_sixty_pending_reads_execute_in_three_batches_without_selection_ro
     chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
         "https://api.openai.com/v1",
         "gpt-4o",
-        [{"role": "user", "content": "Create a document from twenty-five emails."}],
+        [{"role": "user", "content": "Create a document from sixty emails."}],
         max_rounds=20,
         relevant_tools={"search_emails", "read_email", "create_document", "ask_user", "send_email"},
         owner="admin",
@@ -974,6 +974,7 @@ async def test_sixty_pending_reads_execute_in_three_batches_without_selection_ro
 
 
 @pytest.mark.asyncio
+
 async def test_post_batch_pending_document_is_structurally_completed_once(monkeypatch):
     targets = [
         {"uid": str(index), "folder": "INBOX", "account": "work"}
@@ -986,38 +987,91 @@ async def test_post_batch_pending_document_is_structurally_completed_once(monkey
         model_rounds.append({
             "messages": json.loads(json.dumps(messages)),
             "schemas": _schema_names(kwargs.get("tools")),
+            "tool_choice_name": kwargs.get("tool_choice_name"),
         })
+
         round_number = len(model_rounds)
+
         if round_number == 1:
-            call = {"name": "search_emails", "arguments": json.dumps({"query": "synthetic", "account": "work"})}
+            call = {
+                "name": "search_emails",
+                "arguments": json.dumps({
+                    "query": "synthetic",
+                    "account": "work",
+                }),
+            }
             yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+
         elif round_number == 2:
-            assert "synthetic body 0" in json.dumps(messages)
+            serialized = json.dumps(messages)
+
+            assert "synthetic body 0" in serialized
+            assert model_rounds[-1]["schemas"] == {"create_document"}
+            assert model_rounds[-1]["tool_choice_name"] == "create_document"
+
+            # Provider ignores the required tool once. The supervisor must
+            # request exactly one corrective model-mediated creation round.
             yield 'data: {"delta": "The next step is to call create_document."}\n\n'
+
+        elif round_number == 3:
+            serialized = json.dumps(messages)
+
+            assert "one corrective document-creation round" in serialized
+            assert model_rounds[-1]["schemas"] == {"create_document"}
+            assert model_rounds[-1]["tool_choice_name"] == "create_document"
+
+            call = {
+                "name": "create_document",
+                "arguments": json.dumps({
+                    "title": "Synthetic pending report",
+                    "language": "markdown",
+                    "content": (
+                        "# Synthetic pending report\n\n"
+                        "Model-mediated synthesis of the retrieved synthetic emails."
+                    ),
+                }),
+            }
+
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+
         else:
             assert "SYNTHETIC_DOCUMENT_RESULT" in json.dumps(messages)
             yield 'data: {"delta": "Synthetic pending report created."}\n\n'
+
         yield "data: [DONE]\n\n"
 
     async def fake_execute(block, *args, **kwargs):
         if block.tool_type == "create_document":
             title, language, content = block.content.split("\n", 2)
-            payload = {"title": title, "language": language, "content": content}
+            payload = {
+                "title": title,
+                "language": language,
+                "content": content,
+            }
         else:
             payload = json.loads(block.content)
+
         executed.append((block.tool_type, payload))
+
         if block.tool_type == "mcp__email__search_emails":
             return block.tool_type, {
-                "output": "SYNTHETIC_SEARCH_RESULT\n" + _synthetic_search_output(targets),
+                "output": (
+                    "SYNTHETIC_SEARCH_RESULT\n"
+                    + _synthetic_search_output(targets)
+                ),
                 "exit_code": 0,
             }
+
         if block.tool_type == "mcp__email__read_email":
             assert payload == {"targets": targets}
+
             return block.tool_type, {
                 "output": _synthetic_batch_output(targets),
                 "exit_code": 0,
             }
+
         assert block.tool_type == "create_document"
+
         return block.tool_type, {
             "output": "SYNTHETIC_DOCUMENT_RESULT",
             "action": "create",
@@ -1029,36 +1083,84 @@ async def test_post_batch_pending_document_is_structurally_completed_once(monkey
             "exit_code": 0,
         }
 
-    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
-    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
-        "https://api.openai.com/v1",
-        "gpt-4o",
-        [{"role": "user", "content": "Create a document from ten synthetic emails."}],
-        max_rounds=20,
-        relevant_tools={"search_emails", "read_email", "create_document"},
-        owner="admin",
-        _is_teacher_run=True,
-    )]
+    _patch_agent_loop_dependencies(
+        monkeypatch,
+        fake_stream,
+        fake_execute,
+    )
 
-    tool_types = [tool_type for tool_type, _payload in executed]
-    assert tool_types == [
-        "mcp__email__search_emails", "mcp__email__read_email", "create_document",
+    chunks = [
+        chunk
+        async for chunk in agent_loop.stream_agent_loop(
+            "https://api.openai.com/v1",
+            "gpt-4o",
+            [{
+                "role": "user",
+                "content": "Create a document from ten synthetic emails.",
+            }],
+            max_rounds=20,
+            relevant_tools={
+                "search_emails",
+                "read_email",
+                "create_document",
+            },
+            owner="admin",
+            _is_teacher_run=True,
+        )
     ]
-    assert len(model_rounds) == 3
-    assert len(model_rounds) < 20
+
+    tool_types = [
+        tool_type
+        for tool_type, _payload in executed
+    ]
+
+    assert tool_types == [
+        "mcp__email__search_emails",
+        "mcp__email__read_email",
+        "create_document",
+    ]
+
+    assert len(model_rounds) == 4
+
     assert "create_document" not in model_rounds[0]["schemas"]
+
     assert model_rounds[1]["schemas"] == {"create_document"}
-    assert "create_document" in model_rounds[2]["schemas"]
-    assert model_rounds[2]["schemas"] != {"create_document"}
-    assert any("Synthetic pending report created." in chunk for chunk in chunks)
+    assert model_rounds[1]["tool_choice_name"] == "create_document"
+
+    assert model_rounds[2]["schemas"] == {"create_document"}
+    assert model_rounds[2]["tool_choice_name"] == "create_document"
+
+    assert model_rounds[3]["schemas"] != {"create_document"}
+
+    document = next(
+        payload
+        for tool_type, payload in executed
+        if tool_type == "create_document"
+    )
+
+    assert document["title"] == "Synthetic pending report"
+    assert "Model-mediated synthesis" in document["content"]
+    assert not document["content"].startswith("# Retrieved emails")
+
+    assert any(
+        "Synthetic pending report created." in chunk
+        for chunk in chunks
+    )
+
+    assert not any(
+        "required_artifact_creation_failed" in chunk
+        for chunk in chunks
+    )
 
 
 @pytest.mark.asyncio
+
 async def test_post_readiness_document_prose_is_structurally_completed(monkeypatch):
     targets = [
         {"uid": "2", "folder": "INBOX", "account": "work"},
         {"uid": "1", "folder": "INBOX", "account": "work"},
     ]
+
     model_rounds = []
     executed = []
 
@@ -1068,22 +1170,75 @@ async def test_post_readiness_document_prose_is_structurally_completed(monkeypat
             "schemas": _schema_names(kwargs.get("tools")),
             "tool_choice_name": kwargs.get("tool_choice_name"),
         })
-        if len(model_rounds) == 1:
+
+        round_number = len(model_rounds)
+
+        if round_number == 1:
             call = {
                 "name": "search_emails",
-                "arguments": json.dumps({"query": "synthetic", "account": "work"}),
+                "arguments": json.dumps({
+                    "query": "synthetic",
+                    "account": "work",
+                }),
             }
+
             yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
-        elif len(model_rounds) == 2:
+
+        elif round_number == 2:
+            assert model_rounds[-1]["schemas"] == {"create_document"}
+            assert model_rounds[-1]["tool_choice_name"] == "create_document"
+
+            # First synthesis attempt ignores the forced tool.
             yield 'data: {"delta": "I have summarized the emails."}\n\n'
+
+        elif round_number == 3:
+            serialized = json.dumps(messages)
+
+            assert "one corrective document-creation round" in serialized
+            assert "synthetic body 1" in serialized
+            assert "synthetic body 2" in serialized
+
+            assert model_rounds[-1]["schemas"] == {"create_document"}
+            assert model_rounds[-1]["tool_choice_name"] == "create_document"
+
+            call = {
+                "name": "create_document",
+                "arguments": json.dumps({
+                    "title": "Synthetic ordered report",
+                    "language": "markdown",
+                    "content": (
+                        "# Synthetic ordered report\n\n"
+                        "## Older message\n\n"
+                        "synthetic body 1\n\n"
+                        "## Newer message\n\n"
+                        "synthetic body 2"
+                    ),
+                }),
+            }
+
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+
         else:
+            assert "SYNTHETIC_DOCUMENT_RESULT" in json.dumps(messages)
             yield 'data: {"delta": "The document is ready."}\n\n'
+
         yield "data: [DONE]\n\n"
 
     async def fake_execute(block, *args, **kwargs):
         if block.tool_type == "create_document":
             title, language, content = block.content.split("\n", 2)
-            executed.append((block.tool_type, content))
+
+            executed.append(
+                (
+                    block.tool_type,
+                    {
+                        "title": title,
+                        "language": language,
+                        "content": content,
+                    },
+                )
+            )
+
             return block.tool_type, {
                 "output": "SYNTHETIC_DOCUMENT_RESULT",
                 "action": "create",
@@ -1094,48 +1249,109 @@ async def test_post_readiness_document_prose_is_structurally_completed(monkeypat
                 "version": 1,
                 "exit_code": 0,
             }
-        executed.append((block.tool_type, block.content))
+
+        payload = json.loads(block.content)
+        executed.append((block.tool_type, payload))
+
         if block.tool_type == "mcp__email__search_emails":
             return block.tool_type, {
                 "output": _synthetic_search_output(targets),
                 "exit_code": 0,
             }
+
         assert block.tool_type == "mcp__email__read_email"
-        payload = json.loads(_synthetic_batch_output(targets))
-        payload["items"][0]["date"] = "Tue, 25 Aug 2026 12:00:00 +0200"
-        payload["items"][1]["date"] = "Mon, 24 Aug 2026 12:00:00 +0200"
+
+        batch = json.loads(
+            _synthetic_batch_output(payload["targets"])
+        )
+
+        batch["items"][0]["date"] = (
+            "Tue, 25 Aug 2026 12:00:00 +0200"
+        )
+
+        batch["items"][1]["date"] = (
+            "Mon, 24 Aug 2026 12:00:00 +0200"
+        )
+
         return block.tool_type, {
-            "output": json.dumps(payload),
+            "output": json.dumps(batch),
             "exit_code": 0,
         }
 
-    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
-    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
-        "http://ollama:11434/v1/chat/completions",
-        "qwen3:14b",
-        [{"role": "user", "content": "Create a Word document from the synthetic emails, ordered by date."}],
-        max_rounds=20,
-        relevant_tools={"search_emails", "read_email", "create_document", "send_email"},
-        owner="admin",
-        _is_teacher_run=True,
-    )]
+    _patch_agent_loop_dependencies(
+        monkeypatch,
+        fake_stream,
+        fake_execute,
+    )
 
-    assert len(model_rounds) == 3
+    chunks = [
+        chunk
+        async for chunk in agent_loop.stream_agent_loop(
+            "http://ollama:11434/v1/chat/completions",
+            "qwen3:14b",
+            [{
+                "role": "user",
+                "content": (
+                    "Create a Word document from the synthetic emails, "
+                    "ordered by date."
+                ),
+            }],
+            max_rounds=20,
+            relevant_tools={
+                "search_emails",
+                "read_email",
+                "create_document",
+                "send_email",
+            },
+            owner="admin",
+            _is_teacher_run=True,
+        )
+    ]
+
+    assert len(model_rounds) == 4
+
     assert model_rounds[1]["schemas"] == {"create_document"}
     assert model_rounds[1]["tool_choice_name"] == "create_document"
-    assert model_rounds[2]["schemas"] != {"create_document"}
-    tool_types = [tool_type for tool_type, _content in executed]
+
+    assert model_rounds[2]["schemas"] == {"create_document"}
+    assert model_rounds[2]["tool_choice_name"] == "create_document"
+
+    assert model_rounds[3]["schemas"] != {"create_document"}
+
+    tool_types = [
+        tool_type
+        for tool_type, _payload in executed
+    ]
+
     assert tool_types == [
         "mcp__email__search_emails",
         "mcp__email__read_email",
         "create_document",
     ]
-    content = executed[-1][1]
+
+    document = next(
+        payload
+        for tool_type, payload in executed
+        if tool_type == "create_document"
+    )
+
+    content = document["content"]
+
     assert "synthetic body 1" in content
     assert "synthetic body 2" in content
-    assert content.index("synthetic body 1") < content.index("synthetic body 2")
+
+    assert (
+        content.index("synthetic body 1")
+        < content.index("synthetic body 2")
+    )
+
     assert "placeholder" not in content.lower()
-    assert not any("required_artifact_creation_failed" in chunk for chunk in chunks)
+    assert not content.startswith("# Retrieved emails")
+
+    assert not any(
+        "required_artifact_creation_failed" in chunk
+        for chunk in chunks
+    )
 
 
 @pytest.mark.asyncio
@@ -1399,4 +1615,295 @@ def test_explicit_document_title_extractor_is_conservative():
             "Create a document about AutoDS."
         )
         is None
+    )
+
+
+
+def test_targeted_email_document_search_hits_are_candidates_not_required():
+    first = ("101", "", "INBOX", "gmail")
+    second = ("102", "", "INBOX", "gmail")
+    found = {first, second}
+
+    assert agent_loop._email_document_search_targets_for_retrieval(
+        found,
+        corpus=False,
+        discovery_complete=True,
+    ) == set()
+
+    assert agent_loop._email_document_search_targets_for_retrieval(
+        found,
+        corpus=True,
+        discovery_complete=True,
+    ) == found
+
+
+
+def test_targeted_email_document_selected_read_defines_required_result_set():
+    selected = ("101", "", "INBOX", "gmail")
+
+    assert agent_loop._email_document_read_targets_for_retrieval(
+        {selected},
+        {selected},
+        corpus=False,
+    ) == {selected}
+
+    assert agent_loop._email_document_read_targets_for_retrieval(
+        {selected},
+        {selected},
+        corpus=True,
+    ) == set()
+
+
+def test_email_document_corpus_mode_is_separate_from_exhaustive_search():
+    bounded = [
+        "Create a document from ten synthetic emails.",
+        "Search fifty emails and create a document from them.",
+        "Create a Word document from the synthetic emails, ordered by date.",
+        "Create a document summarizing all ten emails.",
+    ]
+
+    for request in bounded:
+        assert agent_loop._requires_email_document_corpus(request)
+
+    assert not agent_loop._has_exhaustive_email_intent(
+        "Create a document from ten synthetic emails."
+    )
+
+    assert not agent_loop._requires_email_document_corpus(
+        "Search 10 emails to identify the relevant one and create a brief document from it."
+    )
+
+    assert not agent_loop._requires_email_document_corpus(
+        "Create a document from one email."
+    )
+
+
+def test_targeted_single_candidate_is_auto_selected_only_when_discovery_complete():
+    selected = ("101", "", "INBOX", "gmail")
+
+    assert agent_loop._email_document_search_targets_for_retrieval(
+        {selected},
+        corpus=False,
+        discovery_complete=True,
+    ) == {selected}
+
+    assert agent_loop._email_document_search_targets_for_retrieval(
+        {selected},
+        corpus=False,
+        discovery_complete=False,
+    ) == set()
+
+
+def test_lossless_email_document_excludes_explicit_summary_transformation():
+    assert agent_loop._requires_email_document_corpus(
+        "Create a document summarizing all emails involving Alex."
+    )
+
+    assert not agent_loop._requires_lossless_email_document(
+        "Create a document summarizing all emails involving Alex."
+    )
+
+    assert agent_loop._requires_lossless_email_document(
+        "Create a Word document with all emails involving Alex."
+    )
+
+
+@pytest.mark.asyncio
+async def test_targeted_multi_result_selects_one_read_before_document_creation(monkeypatch):
+    targets = [
+        {"uid": "0", "folder": "INBOX", "account": "work"},
+        {"uid": "1", "folder": "INBOX", "account": "work"},
+        {"uid": "2", "folder": "INBOX", "account": "work"},
+    ]
+
+    selected = targets[1]
+
+    model_rounds = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_rounds.append({
+            "messages": json.loads(json.dumps(messages)),
+            "schemas": _schema_names(kwargs.get("tools")),
+            "tool_choice_name": kwargs.get("tool_choice_name"),
+        })
+
+        round_number = len(model_rounds)
+
+        if round_number == 1:
+            assert "create_document" not in model_rounds[-1]["schemas"]
+
+            call = {
+                "name": "search_emails",
+                "arguments": json.dumps({
+                    "query": "synthetic",
+                    "account": "work",
+                }),
+            }
+
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+
+        elif round_number == 2:
+            serialized = json.dumps(messages)
+
+            assert "create_document" not in model_rounds[-1]["schemas"]
+            assert "read_email" in model_rounds[-1]["schemas"]
+
+            assert "synthetic body 0" not in serialized
+            assert "synthetic body 1" not in serialized
+            assert "synthetic body 2" not in serialized
+
+            call = {
+                "name": "read_email",
+                "arguments": json.dumps({
+                    "targets": [selected],
+                }),
+            }
+
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+
+        elif round_number == 3:
+            serialized = json.dumps(messages)
+
+            assert "synthetic body 1" in serialized
+            assert "synthetic body 0" not in serialized
+            assert "synthetic body 2" not in serialized
+
+            assert model_rounds[-1]["schemas"] == {"create_document"}
+            assert model_rounds[-1]["tool_choice_name"] == "create_document"
+
+            call = {
+                "name": "create_document",
+                "arguments": json.dumps({
+                    "title": "Selected synthetic email",
+                    "language": "markdown",
+                    "content": (
+                        "# Selected synthetic email\n\n"
+                        "Brief summary of synthetic body 1."
+                    ),
+                }),
+            }
+
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+
+        else:
+            assert "SYNTHETIC_DOCUMENT_RESULT" in json.dumps(messages)
+            yield 'data: {"delta": "Selected document created."}\n\n'
+
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        if block.tool_type == "create_document":
+            title, language, content = block.content.split("\n", 2)
+
+            payload = {
+                "title": title,
+                "language": language,
+                "content": content,
+            }
+        else:
+            payload = json.loads(block.content)
+
+        executed.append((block.tool_type, payload))
+
+        if block.tool_type == "mcp__email__search_emails":
+            return block.tool_type, {
+                "output": _synthetic_search_output(targets),
+                "exit_code": 0,
+            }
+
+        if block.tool_type == "mcp__email__read_email":
+            assert payload == {
+                "targets": [selected],
+            }
+
+            return block.tool_type, {
+                "output": _synthetic_batch_output([selected]),
+                "exit_code": 0,
+            }
+
+        assert block.tool_type == "create_document"
+
+        return block.tool_type, {
+            "output": "SYNTHETIC_DOCUMENT_RESULT",
+            "action": "create",
+            "doc_id": "selected-synthetic-doc",
+            "title": payload["title"],
+            "language": payload["language"],
+            "content": payload["content"],
+            "version": 1,
+            "exit_code": 0,
+        }
+
+    _patch_agent_loop_dependencies(
+        monkeypatch,
+        fake_stream,
+        fake_execute,
+    )
+
+    request = (
+        "Search synthetic email candidates to identify the relevant one. "
+        "Read only that message and create a brief document summarizing it."
+    )
+
+    assert not agent_loop._has_exhaustive_email_intent(request)
+    assert not agent_loop._requires_email_document_corpus(request)
+    assert not agent_loop._requires_lossless_email_document(request)
+
+    chunks = [
+        chunk
+        async for chunk in agent_loop.stream_agent_loop(
+            "https://api.openai.com/v1",
+            "gpt-4o",
+            [{
+                "role": "user",
+                "content": request,
+            }],
+            max_rounds=20,
+            relevant_tools={
+                "search_emails",
+                "read_email",
+                "create_document",
+            },
+            owner="admin",
+            _is_teacher_run=True,
+        )
+    ]
+
+    tool_types = [
+        tool_type
+        for tool_type, _payload in executed
+    ]
+
+    assert tool_types == [
+        "mcp__email__search_emails",
+        "mcp__email__read_email",
+        "create_document",
+    ]
+
+    read_payloads = [
+        payload
+        for tool_type, payload in executed
+        if tool_type == "mcp__email__read_email"
+    ]
+
+    assert read_payloads == [
+        {"targets": [selected]}
+    ]
+
+    document = next(
+        payload
+        for tool_type, payload in executed
+        if tool_type == "create_document"
+    )
+
+    assert "synthetic body 1" in document["content"]
+    assert "synthetic body 0" not in document["content"]
+    assert "synthetic body 2" not in document["content"]
+
+    assert len(model_rounds) == 4
+
+    assert any(
+        "Selected document created." in chunk
+        for chunk in chunks
     )
