@@ -1937,11 +1937,125 @@ def _render_lossless_email_document(
     return "# Retrieved emails\n\n" + notice + "\n\n---\n\n".join(sections)
 
 
+
+def _explicit_document_title_from_request(user_request: str) -> Optional[str]:
+    """Return a conservatively explicit exact document title from the user request."""
+    lines = str(user_request or "").splitlines()
+
+    for index, line in enumerate(lines):
+        raw = line.strip()
+        if not raw:
+            continue
+
+        lowered = raw.lower()
+
+        has_title_word = any(
+            token in lowered
+            for token in (
+                "title",
+                "títol",
+                "titol",
+                "título",
+                "titulo",
+            )
+        )
+
+        has_exact_word = any(
+            token in lowered
+            for token in (
+                "exactly",
+                "exactament",
+                "exactamente",
+            )
+        )
+
+        has_binding = any(
+            phrase in lowered
+            for phrase in (
+                "must be",
+                "has to be",
+                "ha de ser",
+                "debe ser",
+            )
+        )
+
+        if not (
+            has_title_word
+            and has_exact_word
+            and has_binding
+        ):
+            continue
+
+        candidates = []
+
+        if ":" in raw:
+            candidates.append(
+                raw.split(":", 1)[1]
+            )
+
+        candidates.extend(
+            lines[index + 1:]
+        )
+
+        for candidate in candidates:
+            value = candidate.strip()
+
+            if not value:
+                continue
+
+            if value.startswith(
+                ("-", "*", "•")
+            ):
+                value = value[1:].strip()
+
+            quote_pairs = (
+                ('"', '"'),
+                ("'", "'"),
+                ("`", "`"),
+                ("“", "”"),
+                ("«", "»"),
+            )
+
+            for opening, closing in quote_pairs:
+                if (
+                    len(value) >= 2
+                    and value.startswith(opening)
+                    and value.endswith(closing)
+                ):
+                    value = value[
+                        len(opening):
+                        len(value) - len(closing)
+                    ].strip()
+                    break
+
+            value = re.sub(
+                r"\s+",
+                " ",
+                value,
+            ).strip()
+
+            if not value:
+                continue
+
+            # Deliberately conservative: document titles should not absorb
+            # subsequent prose or arbitrary long user content.
+            if len(value) > 200:
+                return None
+
+            return value
+
+    return None
+
 def _required_email_document_block(
     items: list[Dict[str, str]], user_request: str, *, title: Optional[str] = None,
     lossless: bool = False, discovery_complete: bool = True,
 ) -> Optional[ToolBlock]:
     """Build the required artifact directly from already retrieved email bodies."""
+    resolved_title = (
+        title
+        or _explicit_document_title_from_request(user_request)
+    )
+
     if lossless:
         unique = _deduplicate_email_document_items(items)
         if not unique:
@@ -1950,7 +2064,7 @@ def _required_email_document_block(
             unique,
             discovery_complete=discovery_complete,
         )
-        document_title = title or "Retrieved emails"
+        document_title = resolved_title or "Retrieved emails"
         if not discovery_complete:
             document_title = "Retrieved email subset"
         return function_call_to_tool_block("create_document", json.dumps({
@@ -1991,7 +2105,7 @@ def _required_email_document_block(
         )
     content = "# Retrieved emails\n\n" + "\n\n---\n\n".join(sections)
     return function_call_to_tool_block("create_document", json.dumps({
-        "title": title or "Retrieved emails",
+        "title": resolved_title or "Retrieved emails",
         "language": "markdown",
         "content": content,
     }, ensure_ascii=False))

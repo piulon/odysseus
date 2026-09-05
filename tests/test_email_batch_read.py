@@ -1316,3 +1316,87 @@ def test_required_email_document_block_preserves_explicit_nonlossless_title(monk
     payload = json.loads(raw_arguments)
 
     assert payload["title"] == "Retrieved emails"
+
+
+
+def test_required_email_document_block_extracts_exact_title_from_user_request(monkeypatch):
+    """Supervisor fallback must preserve an exact title from the original request."""
+    import json
+
+    calls = []
+
+    def capture_tool_block(name, arguments):
+        calls.append((name, arguments))
+        return object()
+
+    monkeypatch.setattr(
+        agent_loop,
+        "function_call_to_tool_block",
+        capture_tool_block,
+    )
+
+    requested_title = (
+        "Gmail OAuth E2E - AutoDS - c7dfc76 - 2026-09-05"
+    )
+
+    user_request = f"""
+Busca al meu Gmail el correu relacionat amb AutoDS.
+
+El títol del document ha de ser exactament:
+
+{requested_title}
+
+No substitueixis aquest títol per "Retrieved emails".
+"""
+
+    items = [{
+        "subject": "Has compartido algunos datos de tu cuenta de Google con AutoDS",
+        "from": "Google",
+        "date": "Fri, 04 Sep 2026 07:36:27 -0700",
+        "body": "Example retrieved body.",
+    }]
+
+    result = agent_loop._required_email_document_block(
+        items,
+        user_request,
+        title=None,
+        lossless=False,
+        discovery_complete=True,
+    )
+
+    assert result is not None
+    assert len(calls) == 1
+
+    tool_name, raw_arguments = calls[0]
+
+    assert tool_name == "create_document"
+
+    payload = json.loads(raw_arguments)
+
+    assert payload["title"] == requested_title
+
+
+def test_explicit_document_title_extractor_is_conservative():
+    requested = "Exact document title"
+
+    assert (
+        agent_loop._explicit_document_title_from_request(
+            "The document title must be exactly:\n\n"
+            + requested
+        )
+        == requested
+    )
+
+    assert (
+        agent_loop._explicit_document_title_from_request(
+            'El título del documento debe ser exactamente: "Título exacto"'
+        )
+        == "Título exacto"
+    )
+
+    assert (
+        agent_loop._explicit_document_title_from_request(
+            "Create a document about AutoDS."
+        )
+        is None
+    )
