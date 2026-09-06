@@ -1577,7 +1577,7 @@ _EMAIL_ITEM_MODIFIER = (
 def _email_artifact_creation_intent(text: str) -> bool:
     """Ambiguous artifact nouns require a creation verb, not a mailbox action."""
     return bool(re.search(
-        r"\b(?:create|make|generate|write|crea|crear|genera|generar|fes|fer)\s+"
+        r"\b(?:create|make|generate|write|crea(?:['’]m)?|crear|genera|generar|fes|fer)\s+"
         r"(?:(?:a|an|the|un|una|el|la)\s+)?"
         r"(?:(?:brief|full|complete|new|requested|same)\s+)?"
         r"(?:document|doc|word|list|listing|archive|history|"

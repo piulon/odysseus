@@ -1935,6 +1935,30 @@ def test_last_findings_artifact_activation(prompt, active):
 
 
 @pytest.mark.parametrize("prompt", [
+    "Crea'm un document Word amb els correus de sender@example.com.",
+    "Crea’m un document Word amb els correus de sender@example.com.",
+    "Crea'm un document amb els correus de sender@example.com.",
+    "Crea un document amb els correus de sender@example.com.",
+    "Genera un document amb els correus de sender@example.com.",
+])
+def test_catalan_artifact_creation_variants_activate_email_document_workflow(prompt):
+    state = agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": prompt},
+    ])
+    assert state.active
+
+
+@pytest.mark.parametrize("prompt", [
+    "Busca correus sobre el document.",
+    "Cerca tots els correus que mencionen el document.",
+])
+def test_catalan_document_searches_do_not_activate_email_document_workflow(prompt):
+    assert not agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": prompt},
+    ]).active
+
+
+@pytest.mark.parametrize("prompt", [
     "Use one paragraph per email.", "Use only one heading per email.",
     "Use one sentence for each message.", "Make one section per email.",
 ])
