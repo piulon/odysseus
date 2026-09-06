@@ -563,6 +563,36 @@ async def _document_tool_dispatch(
     return None
 
 
+def _normalize_create_document_result(tool: str, result: Dict) -> Dict:
+    """Add the executor success code to a native create result when proven.
+
+    ``CreateDocumentTool`` commits the document before returning its native
+    success shape.  Keep the canonical success predicate strict, but adapt
+    that native shape at the executor boundary so downstream completion and
+    persistence see the same explicit success contract as other tools.
+    """
+    if tool != "create_document" or not isinstance(result, dict):
+        return result
+    if (
+        result.get("action") == "create"
+        and isinstance(result.get("doc_id"), str)
+        and result["doc_id"].strip()
+        and "content" in result
+        and isinstance(result.get("content"), str)
+        and "version" in result
+        and type(result.get("version")) is int
+        and result["version"] >= 1
+        and not result.get("error")
+        and not result.get("blocked")
+        and not result.get("had_error")
+        and not result.get("failure")
+        and result.get("success") is not False
+    ):
+        result = dict(result)
+        result.setdefault("exit_code", 0)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -957,6 +987,8 @@ async def _execute_tool_block_impl(
             "error": f"Unknown tool: {tool}",
             "exit_code": 1
         }
+
+    result = _normalize_create_document_result(tool, result)
 
     logger.info(f"Tool executed: {desc} -> exit_code={result.get('exit_code', 'n/a')}")
     return desc, result

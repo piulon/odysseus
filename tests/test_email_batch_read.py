@@ -9,6 +9,8 @@ pytest.importorskip("mcp")
 import src.agent_tools  # Initialize schema re-exports in application order.
 import src.agent_loop as agent_loop
 import mcp_servers.email_server as es
+import src.tool_execution as tool_execution
+from src.agent_tools import ToolBlock
 from src.tool_schemas import FUNCTION_TOOL_SCHEMAS
 from src.tool_schemas import function_call_to_tool_block
 
@@ -2348,6 +2350,167 @@ def test_email_workflow_completion_requires_successful_artifact(event, expected)
         {"role": "user", "content": "Yes. Make it a brief summary."},
     ]
     assert agent_loop._email_document_workflow_semantics(history) == expected
+
+
+@pytest.mark.parametrize("result", [
+    {
+        "action": "create",
+        "doc_id": "native-doc",
+        "docx_url": "/api/document/native-doc/export-docx",
+        "title": "Synthetic",
+        "language": "markdown",
+        "content": "",
+        "version": 1,
+    },
+    {
+        "action": "create",
+        "doc_id": "native-doc",
+        "title": "Synthetic",
+        "language": "markdown",
+        "content": "Body",
+        "version": 2,
+        "exit_code": 0,
+    },
+])
+def test_native_create_document_success_is_normalized_before_canonical_check(result):
+    normalized = tool_execution._normalize_create_document_result(
+        "create_document", result,
+    )
+    assert normalized["exit_code"] == 0
+    assert agent_loop._email_document_creation_succeeded(
+        "create_document", normalized,
+    )
+
+
+@pytest.mark.parametrize("result", [
+    {"action": "create", "doc_id": "", "content": "", "version": 1},
+    {"action": "create", "content": "", "version": 1},
+    {"action": "create", "doc_id": "native-doc", "content": "", "version": 1,
+     "error": "synthetic failure"},
+    {"action": "create", "doc_id": "native-doc", "content": "", "version": 1,
+     "blocked": True},
+    {"action": "create", "doc_id": "native-doc", "content": "", "version": 1,
+     "had_error": True},
+    {"action": "create", "doc_id": "native-doc", "content": "", "version": 0},
+    {"action": "create", "doc_id": "native-doc", "content": "", "version": True},
+    {"action": "create", "doc_id": "native-doc", "content": "", "version": False},
+    {"action": "create", "doc_id": "native-doc", "content": "", "version": "1"},
+    {"action": "create", "doc_id": "native-doc", "content": "", "version": 1,
+     "failure": "native failure"},
+    {"action": "create", "doc_id": "native-doc", "content": "", "version": 1,
+     "success": False},
+    {"action": "create", "doc_id": "native-doc", "content": "", "version": 1,
+     "exit_code": 1},
+])
+def test_native_create_document_failures_are_not_normalized(result):
+    normalized = tool_execution._normalize_create_document_result(
+        "create_document", result,
+    )
+    assert normalized.get("exit_code") != 0
+    assert not agent_loop._email_document_creation_succeeded(
+        "create_document", normalized,
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_block_normalizes_native_document_result(monkeypatch):
+    async def fake_dispatch(tool, content, session_id=None, owner=None):
+        assert tool == "create_document"
+        return {
+            "action": "create",
+            "doc_id": "native-doc",
+            "title": "Synthetic",
+            "language": "markdown",
+            "content": "",
+            "version": 1,
+        }
+
+    monkeypatch.setattr(tool_execution, "_document_tool_dispatch", fake_dispatch)
+    _description, result = await tool_execution.execute_tool_block(
+        ToolBlock("create_document", "Synthetic\nmarkdown\n"),
+        session_id="session",
+        owner="admin",
+    )
+    assert result["exit_code"] == 0
+    assert agent_loop._email_document_creation_succeeded(
+        "create_document", result,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_only_round_blocks_disallowed_read_and_normalized_create_terminates(monkeypatch):
+    assert agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": _TARGETED_WORKFLOW},
+    ]) == (True, False, False, False)
+    model_rounds = []
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        model_rounds.append(_schema_names(kwargs.get("tools")))
+        round_number = len(model_rounds)
+        if round_number == 1:
+            call = {"name": "search_emails", "arguments": json.dumps({"query": "synthetic"})}
+        elif round_number == 2:
+            call = {"name": "read_email", "arguments": json.dumps({"uid": "10595"})}
+        elif round_number == 3:
+            # This is the production failure shape: create-only schemas, but a
+            # model-emitted read call that must never reach dispatch.
+            call = {"name": "read_email", "arguments": json.dumps({"uid": "13415"})}
+        elif round_number == 4:
+            yield 'data: {"delta": "Synthetic report created."}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+        elif round_number == 5:
+            calls = [
+                {"name": "create_document", "arguments": json.dumps({
+                    "title": "Synthetic", "language": "markdown", "content": "Body",
+                })},
+                {"name": "create_document", "arguments": json.dumps({
+                    "title": "Duplicate", "language": "markdown", "content": "Should not run",
+                })},
+            ]
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": calls})}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+        else:
+            yield 'data: {"delta": "Synthetic report created."}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+        yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        if block.tool_type == "mcp__email__search_emails":
+            return block.tool_type, {"output": _synthetic_search_output([
+                {"uid": "10595", "folder": "INBOX"},
+                {"uid": "13415", "folder": "Archive"},
+            ]), "exit_code": 0}
+        if block.tool_type == "mcp__email__read_email":
+            return block.tool_type, {"output": "Subject: Synthetic\n\nUsable body", "exit_code": 0}
+        return block.tool_type, tool_execution._normalize_create_document_result(
+            "create_document", {
+            "action": "create", "doc_id": "synthetic-doc", "title": "Synthetic",
+            "language": "markdown", "content": "Body", "version": 1,
+            },
+        )
+
+    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
+    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o",
+        [{"role": "user", "content": _TARGETED_WORKFLOW}],
+        max_rounds=10,
+        relevant_tools={"search_emails", "read_email", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    )]
+
+    assert executed == [
+        "mcp__email__search_emails", "mcp__email__read_email", "create_document",
+    ]
+    assert executed.count("mcp__email__read_email") == 1
+    assert executed.count("create_document") == 1
+    assert model_rounds[2] == {"create_document"}
+    assert any("Synthetic report created." in chunk for chunk in chunks)
 
 
 @pytest.mark.parametrize("intervening", [

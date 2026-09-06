@@ -7811,6 +7811,11 @@ async def stream_agent_loop(
         tool_result_texts = []  # plain text for native tool role messages
         budget_hit = False
         _email_retrieval_became_ready = False
+        _creation_only_round = (
+            _email_document_creation_pending
+            and _email_document_retrieval_state == "retrieval_ready"
+            and _available_tool_names == {"create_document"}
+        )
         for i, block in enumerate(tool_blocks):
             # --- Tool budget check ---
             if max_tool_calls > 0 and total_tool_calls >= max_tool_calls:
@@ -7828,7 +7833,23 @@ async def stream_agent_loop(
             else:
                 cmd_display = full_command
 
-            if tool_policy and tool_policy.blocks(block.tool_type):
+            if _creation_only_round and block.tool_type != "create_document":
+                if route_state is not None:
+                    route_state.forbid_fallback()
+                desc = f"{block.tool_type}: BLOCKED"
+                result = {
+                    "error": (
+                        "Only create_document is allowed after email retrieval "
+                        "is ready."
+                    ),
+                    "exit_code": 1,
+                    "blocked": True,
+                }
+                logger.warning(
+                    "[agent] blocked disallowed tool during create-only round: %s",
+                    block.tool_type,
+                )
+            elif tool_policy and tool_policy.blocks(block.tool_type):
                 if route_state is not None:
                     route_state.forbid_fallback()
                 desc = f"{block.tool_type}: BLOCKED"
@@ -8449,6 +8470,11 @@ async def stream_agent_loop(
                     "[agent] required post-readiness artifact created round=%d",
                     round_num,
                 )
+                if _creation_only_round:
+                    # A model may emit more than one create block in one
+                    # response. Once the required artifact succeeds, do not
+                    # dispatch another same-round creation.
+                    break
 
         # Healthy diagnostic results are factual and need no probabilistic
         # second-round synthesis. This also prevents unsupported remediation
