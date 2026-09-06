@@ -975,11 +975,30 @@ _FORMATTER_HANDLED_KEYS = {
 }
 
 
-def format_tool_result(description: str, result: Dict) -> str:
+def _email_document_creation_succeeded(tool: str, result: Dict) -> bool:
+    """Canonical artifact contract for live results and persisted events."""
+    return bool(
+        tool == "create_document"
+        and result.get("exit_code") == 0
+        and isinstance(result.get("doc_id"), str)
+        and result["doc_id"].strip()
+        and not result.get("blocked")
+        and not result.get("error")
+        and not result.get("had_error")
+    )
+
+
+def format_tool_result(description: str, result: Dict, *, tool: Optional[str] = None) -> str:
     """Format a tool result into text for feeding back to the LLM."""
     parts = [f"### {description}"]
 
-    if "stdout" in result:
+    document_create = tool == "create_document" or (
+        tool is None and result.get("action") == "create"
+        and not any(key in result for key in ("stdout", "output", "content", "response", "results", "session_id", "success"))
+    )
+    if document_create and not _email_document_creation_succeeded("create_document", result):
+        parts.append(f"**Error:** Document creation failed: {result.get('error') or 'no successful artifact was returned.'}")
+    elif "stdout" in result:
         if result["stdout"]:
             parts.append(f"**stdout:**\n```\n{result['stdout']}\n```")
         if result["stderr"]:
@@ -1010,7 +1029,7 @@ def format_tool_result(description: str, result: Dict) -> str:
     elif "action" in result:
         action = result["action"]
         if action == "create":
-            parts.append(f"Document created: \"{result.get('title', '')}\" (id: {result['doc_id']}, v{result['version']})")
+            parts.append(f"Document created: \"{result.get('title', '')}\" (id: {result.get('doc_id')}, v{result.get('version', '?')})")
         elif action == "update":
             parts.append(f"Document updated: \"{result.get('title', '')}\" (v{result['version']})")
         elif action == "edit":

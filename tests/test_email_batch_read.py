@@ -1907,3 +1907,888 @@ async def test_targeted_multi_result_selects_one_read_before_document_creation(m
         "Selected document created." in chunk
         for chunk in chunks
     )
+
+
+_TARGETED_WORKFLOW = "Search email candidates, identify the relevant one, and create a brief document."
+_LITERAL_WORKFLOW = "Create a document containing all emails."
+_SUMMARY_WORKFLOW = "Summarize all emails in a document."
+
+
+@pytest.mark.parametrize("prompt,active", [
+    ("List all emails.", False), ("Archive all emails.", False),
+    ("Search all emails for purchase history.", False), ("Show email history.", False),
+    ("Create a list containing all emails.", True),
+    ("Create an archive containing all emails.", True),
+    ("Create a document with the email history.", True),
+    ("Generate a listing of the selected emails.", True),
+])
+def test_last_findings_artifact_activation(prompt, active):
+    assert agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": prompt},
+    ]).active is active
+    # Explicit new searches must also supersede an unfinished artifact.
+    if not active:
+        assert not agent_loop._email_document_workflow_semantics([
+            {"role": "user", "content": _LITERAL_WORKFLOW},
+            {"role": "user", "content": prompt},
+        ]).active
+
+
+@pytest.mark.parametrize("prompt", [
+    "Use one paragraph per email.", "Use only one heading per email.",
+    "Use one sentence for each message.", "Make one section per email.",
+])
+@pytest.mark.parametrize("origin,source", [
+    (_TARGETED_WORKFLOW, (False, False)), (_LITERAL_WORKFLOW, (True, True)),
+])
+def test_last_findings_singular_formatting(prompt, origin, source):
+    assert agent_loop._email_source_set_override(prompt) is None
+    state = agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": origin}, {"role": "user", "content": prompt},
+    ])
+    assert state.active
+    assert (state.corpus, state.exhaustive) == source
+
+
+@pytest.mark.parametrize("prompt", [
+    "use one email", "use one message", "use only one email", "use only that one",
+    "use the relevant one", "use only the relevant one", "select one message", "read only UID 10595",
+])
+def test_last_findings_singular_selection(prompt):
+    state = agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": _LITERAL_WORKFLOW}, {"role": "user", "content": prompt},
+    ])
+    assert state == (True, False, False, False)
+
+
+@pytest.mark.parametrize("items", [
+    "ten unread emails", "ten new emails", "ten recent emails", "ten selected emails",
+    "diez correos nuevos", "diez correos no leídos", "diez correos seleccionados",
+    "deu correus nous", "deu correus no llegits", "deu correus seleccionats",
+    "diez nuevos correos", "deu nous correus",
+])
+def test_last_findings_email_count_modifiers(items):
+    assert agent_loop._email_source_set_override(items) == (True, False)
+    state = agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": _TARGETED_WORKFLOW}, {"role": "user", "content": items},
+    ])
+    assert state == (True, True, False, False)
+    assert agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": "Create an archive from " + items},
+    ]).active
+
+
+@pytest.mark.parametrize("items", [
+    "ten paragraphs from emails", "ten new paragraphs about emails",
+    "five selected headings from emails",
+])
+def test_last_findings_count_modifier_negatives(items):
+    assert agent_loop._email_source_set_override(items) is None
+
+
+@pytest.mark.parametrize("raw,success", [
+    ({"exit_code": 0, "action": "create"}, False),
+    ({"exit_code": 1, "doc_id": "abc"}, False),
+    ({"exit_code": 0, "doc_id": "abc"}, True),
+    ({"exit_code": 0, "doc_id": "abc", "error": "synthetic"}, False),
+    ({"exit_code": 0, "doc_id": "abc", "blocked": True}, False),
+])
+@pytest.mark.asyncio
+async def test_last_findings_exact_create_transport_and_persistence(monkeypatch, raw, success):
+    rounds = 0
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 1:
+            name, payload = "read_email", {"uid": "10595"}
+        elif rounds == 2:
+            name, payload = "create_document", {"title": "Synthetic", "language": "markdown", "content": "Body"}
+        else:
+            assert (kwargs.get("tool_choice_name") == "create_document") is not success
+            if success and raw.get("action") == "create":
+                tool_reply = messages[-1]["content"]
+                assert "Error" not in tool_reply
+                if "content" in raw:
+                    assert raw["content"] in tool_reply
+                else:
+                    assert "Document created:" in tool_reply
+            if not success:
+                assert "Error" in json.dumps(messages)
+                assert "Document created:" not in json.dumps(messages)
+            yield 'data: {"delta": "Completion observed."}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+        call = {"name": name, "arguments": json.dumps(payload)}
+        yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        if block.tool_type == "mcp__email__read_email":
+            return block.tool_type, {"output": "Subject: Synthetic\n\nUsable body", "exit_code": 0}
+        assert block.tool_type == "create_document"
+        # Exact transport shape: no output key to bypass formatter branches.
+        return block.tool_type, dict(raw)
+
+    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
+    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", [{"role": "user", "content": _TARGETED_WORKFLOW}],
+        relevant_tools={"search_emails", "read_email", "create_document"},
+        owner="admin", _is_teacher_run=True, max_rounds=3,
+    )]
+    events = [json.loads(line[6:]) for chunk in chunks for line in chunk.splitlines()
+              if line.startswith("data: {")]
+    assert rounds == 3
+    assert executed.count("create_document") == 1
+    updates = [event for event in events if event.get("type") == "doc_update"]
+    assert bool(updates) is (success and "content" in raw and "version" in raw)
+    outputs = [event for event in events if event.get("type") == "tool_output" and event.get("tool") == "create_document"]
+    assert len(outputs) == 1
+    if success and not ("content" in raw and "version" in raw):
+        assert "doc_id" not in outputs[0]
+        assert "document_content" not in outputs[0]
+        assert "document_version" not in outputs[0]
+    if not success:
+        assert "Document created" not in outputs[0]["output"]
+        assert "document_action" not in outputs[0]
+        assert "doc_id" not in outputs[0]
+    persisted = [entry for event in events if event.get("type") == "metrics"
+                 for entry in event.get("data", {}).get("tool_events", [])
+                 if entry.get("tool") == "create_document"]
+    assert len(persisted) == 1
+    event = persisted[0]
+    assert event["blocked"] is bool(raw.get("blocked"))
+    assert event["had_error"] is not success
+    assert "error" not in event
+    state = agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": _TARGETED_WORKFLOW},
+        {"role": "assistant", "metadata": {"tool_events": persisted}},
+        {"role": "user", "content": "continue"},
+    ])
+    assert state.active is not success
+
+
+@pytest.mark.parametrize("raw", [
+    {"exit_code": 0, "action": "create"},
+    {"exit_code": 1, "action": "create", "doc_id": "abc"},
+    {"exit_code": 0, "action": "create", "doc_id": "abc", "blocked": True},
+])
+def test_last_findings_formatter_exact_invalid_create(raw):
+    from src.tool_execution import format_tool_result
+    formatted = format_tool_result("create_document", raw)
+    assert "Error" in formatted
+    assert "Document created:" not in formatted
+
+
+def test_last_findings_formatter_preserves_other_tool_output():
+    from src.tool_execution import format_tool_result
+    formatted = format_tool_result("other", {"action": "create", "output": "Other tool result", "exit_code": 0}, tool="other")
+    assert "Other tool result" in formatted
+    assert "Document creation failed" not in formatted
+
+
+@pytest.mark.parametrize("selection", [
+    "Actually use only the relevant one.", "only the relevant one",
+    "use the relevant one", "use that one", "use only that one",
+    "read only that message", "read only UID 10595",
+    "select the relevant message", "identify the relevant one",
+])
+def test_final_findings_source_narrowing(selection):
+    history = [{"role": "user", "content": _LITERAL_WORKFLOW},
+               {"role": "user", "content": selection}]
+    assert agent_loop._email_source_set_override(selection) == (False, False)
+    assert agent_loop._email_document_workflow_semantics(history) == (True, False, False, False)
+
+
+@pytest.mark.parametrize("selection", [
+    "all of them", "use all of them", "all ten", "use all ten",
+    "these ten", "those ten", "ten of them", "use these ten emails",
+    "use these ten messages", "use ten of them", "those ten emails", "the ten messages",
+])
+def test_final_findings_source_corpus(selection):
+    history = [{"role": "user", "content": _TARGETED_WORKFLOW},
+               {"role": "user", "content": selection}]
+    assert agent_loop._email_source_set_override(selection) == (True, False)
+    assert agent_loop._email_document_workflow_semantics(history) == (True, True, False, False)
+
+
+@pytest.mark.parametrize("formatting", [
+    "Write two bullet points from emails.", "Write three paragraphs about the emails.",
+    "Create five headings from these emails.", "Summarize the emails in ten sentences.",
+    "Make two sections from the messages.",
+    "Write all ten paragraphs from emails.",
+])
+@pytest.mark.parametrize("origin,source", [
+    (_TARGETED_WORKFLOW, (False, False)), (_LITERAL_WORKFLOW, (True, True)),
+])
+def test_final_findings_quantity_is_artifact_structure(formatting, origin, source):
+    assert agent_loop._email_source_set_override(formatting) is None
+    state = agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": origin}, {"role": "user", "content": formatting},
+    ])
+    assert state.active
+    assert (state.corpus, state.exhaustive) == source
+
+
+@pytest.mark.parametrize("prompt,active", [
+    ("Search all emails for invoices.", False),
+    ("Create a document from all emails.", True),
+    ("Create a document from these ten emails.", True),
+    ("Summarize all emails in a document.", True),
+    ("Search the candidates, read the relevant one, and create a brief document.", True),
+    ("Create an archive from all emails.", True),
+])
+def test_final_findings_activation_requires_artifact(prompt, active):
+    assert not agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": "all emails"},
+    ]).active
+    for prefix in ([], [{"role": "user", "content": _LITERAL_WORKFLOW}]):
+        state = agent_loop._email_document_workflow_semantics(
+            prefix + [{"role": "user", "content": prompt}],
+        )
+        assert state.active is active
+
+
+@pytest.mark.parametrize("prompt,document_active", [
+    ("Search all emails for invoices.", False),
+    ("Search all emails, read only UID 10595, and create the requested document.", True),
+])
+@pytest.mark.asyncio
+async def test_last_findings_email_only_exhaustive_search_stream(monkeypatch, caplog, prompt, document_active):
+    import logging
+
+    caplog.set_level(logging.INFO, logger=agent_loop.__name__)
+    executed = []
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        assert "EMAIL DOCUMENT RETRIEVAL GATE" not in json.dumps(messages)
+        assert ("EMAIL DOCUMENT TARGETED RETRIEVAL GATE" in json.dumps(messages)) is document_active
+        assert kwargs.get("tool_choice_name") != "create_document"
+        if not executed:
+            assert "search_emails" in _schema_names(kwargs.get("tools"))
+            call = {"name": "search_emails", "arguments": json.dumps({"query": "invoices", "max_results": 20})}
+            yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        else:
+            yield 'data: {"delta": "Found matching invoices."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        assert block.tool_type == "mcp__email__search_emails"
+        assert json.loads(block.content)["max_results"] == agent_loop._EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS
+        return block.tool_type, {"output": _synthetic_search_output([{"uid": "10595"}, {"uid": "10596"}]), "exit_code": 0}
+
+    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
+    history = [{"role": "user", "content": _LITERAL_WORKFLOW},
+               {"role": "user", "content": prompt}]
+    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", list(history), conversation_history=history,
+        relevant_tools={"search_emails", "read_email", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    )]
+    assert executed == ["mcp__email__search_emails"]
+    assert ("email document retrieval gate active" in caplog.text) is document_active
+    assert "requiring post-readiness document creation" not in caplog.text
+    assert any("Found matching invoices." in chunk for chunk in chunks)
+
+
+@pytest.mark.parametrize("result,success", [
+    ({"exit_code": 0, "doc_id": "abc"}, True),
+    ({"exit_code": 0, "action": "create"}, False),
+    ({"exit_code": 1, "doc_id": "abc"}, False),
+    ({"exit_code": 0, "doc_id": ""}, False),
+    ({"exit_code": 0, "doc_id": "abc", "blocked": True}, False),
+    ({"exit_code": 0, "doc_id": "abc", "error": "synthetic failure"}, False),
+    ({"exit_code": 0, "doc_id": "   "}, False),
+    ({"exit_code": 0, "doc_id": {}}, False),
+])
+@pytest.mark.asyncio
+async def test_final_findings_completion_live_and_history(monkeypatch, caplog, result, success):
+    import logging
+
+    caplog.set_level(logging.INFO, logger=agent_loop.__name__)
+    assert agent_loop._email_document_creation_succeeded("create_document", result) is success
+    for tool in ("update_document", "edit_document"):
+        assert not agent_loop._email_document_creation_succeeded(tool, result)
+    state = agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": _TARGETED_WORKFLOW},
+        {"role": "assistant", "metadata": {"tool_events": [{"tool": "create_document", **result}]}},
+    ])
+    assert state.active is not success
+    rounds = 0
+    created = 0
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        nonlocal rounds
+        rounds += 1
+        if rounds == 1:
+            name, payload = "read_email", {"uid": "10595"}
+        elif rounds == 2:
+            assert kwargs.get("tool_choice_name") == "create_document"
+            name, payload = "create_document", {"title": "Synthetic", "language": "markdown", "content": "Body"}
+        else:
+            assert (kwargs.get("tool_choice_name") == "create_document") is not success
+            # Stop at the first post-result round: this observes pending directly
+            # through the production tool-choice obligation, before retry logic.
+            yield 'data: {"delta": "Observed completion boundary."}\n\n'
+            return
+        call = {"name": name, "arguments": json.dumps(payload)}
+        yield f'data: {json.dumps({"type": "tool_calls", "calls": [call]})}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        nonlocal created
+        if block.tool_type == "mcp__email__read_email":
+            return block.tool_type, {"output": "Subject: Synthetic\n\nUsable body", "exit_code": 0}
+        assert block.tool_type == "create_document"
+        created += 1
+        return block.tool_type, {"output": "Synthetic result", **result}
+
+    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
+    stream = agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", [{"role": "user", "content": _TARGETED_WORKFLOW}],
+        relevant_tools={"search_emails", "read_email", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    )
+    async for chunk in stream:
+        if "Observed completion boundary." in chunk:
+            break
+    await stream.aclose()
+    assert rounds == 3
+    assert created == 1
+    assert ("required post-readiness artifact created" in caplog.text) is success
+
+
+@pytest.mark.parametrize("origin,followup,expected", [
+    (_TARGETED_WORKFLOW, "Yes. Create the document from the emails discussed.", (True, False, False, False)),
+    (_TARGETED_WORKFLOW, "yes, do that", (True, False, False, False)),
+    ("Crea un documento con todos los correos.", "Continue.", (True, True, True, True)),
+    ("Crea un documento con diez correos.", "Continue.", (True, True, False, False)),
+    (_TARGETED_WORKFLOW, "continue", (True, False, False, False)),
+    (_LITERAL_WORKFLOW, "yes", (True, True, True, True)),
+    ("Create a document from ten emails.", "Use these two instead.", (True, True, False, False)),
+    (_TARGETED_WORKFLOW, "read that one", (True, False, False, False)),
+    (_TARGETED_WORKFLOW, "now make the document", (True, False, False, False)),
+    (_TARGETED_WORKFLOW, "Create a document from these ten emails.", (True, True, False, False)),
+    (_TARGETED_WORKFLOW, "Create a document containing all emails.", (True, True, True, True)),
+    (_LITERAL_WORKFLOW, _TARGETED_WORKFLOW, (True, False, False, False)),
+    (_LITERAL_WORKFLOW, "Instead, search email candidates, identify the relevant one, and create a brief document from that message.", (True, False, False, False)),
+    (_LITERAL_WORKFLOW, "Create a document from these ten emails.", (True, True, False, False)),
+    (_TARGETED_WORKFLOW, "Actually use all of them.", (True, True, False, False)),
+    (_TARGETED_WORKFLOW, "No, use these ten instead.", (True, True, False, False)),
+    (_TARGETED_WORKFLOW, "Use these ten emails instead.", (True, True, False, False)),
+    (_TARGETED_WORKFLOW, "Use these 12 instead.", (True, True, False, False)),
+    (_TARGETED_WORKFLOW, "Use all returned emails.", (True, True, False, False)),
+    (_TARGETED_WORKFLOW, "Use every email.", (True, True, True, False)),
+    (_LITERAL_WORKFLOW, "Use only that one.", (True, False, False, False)),
+    (_LITERAL_WORKFLOW, "Read only that message.", (True, False, False, False)),
+    (_LITERAL_WORKFLOW, "Read only UID 10595.", (True, False, False, False)),
+    (_LITERAL_WORKFLOW, "Instead identify the relevant one.", (True, False, False, False)),
+    (_LITERAL_WORKFLOW, "Select the relevant message.", (True, False, False, False)),
+    (_LITERAL_WORKFLOW, "Yes. Make it a brief summary.", (True, True, True, False)),
+    (_SUMMARY_WORKFLOW, "Yes. Copy them verbatim into a full archive.", (True, True, True, True)),
+    (_LITERAL_WORKFLOW, "Make it a brief summary.", (True, True, True, False)),
+    ("Summarize all emails.", "Copy them verbatim into a full archive.", (True, True, True, True)),
+    (_LITERAL_WORKFLOW, "Forget that; search for invoices.", (False, False, False, False)),
+    (_LITERAL_WORKFLOW, "What is the capital of France?", (False, False, False, False)),
+    (_LITERAL_WORKFLOW, "Search email invoices.", (False, False, False, False)),
+    (_LITERAL_WORKFLOW, "Write a document about gardening.", (False, False, False, False)),
+    (_LITERAL_WORKFLOW, "Yes. Write a document about gardening.", (False, False, False, False)),
+    (_LITERAL_WORKFLOW, "Yes. What is the capital of France?", (False, False, False, False)),
+    (_SUMMARY_WORKFLOW, "Yes. Create a document containing all emails.", (True, True, True, True)),
+])
+def test_email_workflow_semantic_transitions(origin, followup, expected):
+    history = [
+        {"role": "user", "content": origin},
+        {"role": "assistant", "content": "Which one should I read?"},
+        {"role": "user", "content": followup},
+    ]
+    assert agent_loop._email_document_workflow_semantics(history) == expected
+
+
+@pytest.mark.parametrize("event,expected", [
+    ({"tool": "create_document", "exit_code": 0, "doc_id": "synthetic"}, (False, False, False, False)),
+    ({"tool": "create_document", "exit_code": 1}, (True, True, True, False)),
+    ({"tool": "create_document", "exit_code": 1, "doc_id": "synthetic"}, (True, True, True, False)),
+    ({"tool": "create_document", "exit_code": 0}, (True, True, True, False)),
+    ({"tool": "create_document", "doc_id": "synthetic"}, (True, True, True, False)),
+    (None, (True, True, True, False)),
+])
+def test_email_workflow_completion_requires_successful_artifact(event, expected):
+    history = [
+        {"role": "user", "content": _LITERAL_WORKFLOW},
+        {"role": "assistant", "content": "Document created.",
+         "metadata": {"tool_events": [event] if event else []}},
+        {"role": "user", "content": "Yes. Make it a brief summary."},
+    ]
+    assert agent_loop._email_document_workflow_semantics(history) == expected
+
+
+@pytest.mark.parametrize("intervening", [
+    [{"role": "assistant", "metadata": {"tool_events": [
+        {"tool": "create_document", "exit_code": 0, "doc_id": "synthetic"},
+    ]}}],
+    [{"role": "user", "content": "What is the capital of France?"}],
+    [{"role": "user", "content": "Search email invoices."}],
+    [{"role": "user", "content": "Write a document about gardening."}],
+])
+def test_email_workflow_boundaries_do_not_reuse_old_query(intervening):
+    history = [{"role": "user", "content": _LITERAL_WORKFLOW}] + intervening + [
+        {"role": "assistant", "content": "Which one should I read?"},
+        {"role": "user", "content": "Yes. Read only UID 10595 and create the requested document."},
+    ]
+    assert agent_loop._has_exhaustive_email_intent(agent_loop._recent_context_for_retrieval(history))
+    # Also prove the reset without a targeted override that could mask leakage.
+    generic_followup = history[:-1] + [{"role": "user", "content": "Yes. Make the requested document."}]
+    assert agent_loop._email_document_workflow_semantics(generic_followup) == (False, False, False, False)
+    assert agent_loop._email_document_workflow_semantics(history) == (True, False, False, False)
+    history.append({"role": "user", "content": _TARGETED_WORKFLOW})
+    assert agent_loop._email_document_workflow_semantics(history) == (True, False, False, False)
+    history.append({"role": "user", "content": _LITERAL_WORKFLOW})
+    assert agent_loop._email_document_workflow_semantics(history) == (True, True, True, True)
+
+
+@pytest.mark.parametrize("injected", [
+    {"role": "user", "content": _LITERAL_WORKFLOW, "metadata": {"trusted": False}},
+    {"role": "user", "content": [{"type": "text", "text": _LITERAL_WORKFLOW}], "metadata": {"trusted": False}},
+    {"role": "tool", "content": _LITERAL_WORKFLOW},
+    {"role": "user", "content": "[Tool execution results]\n" + _LITERAL_WORKFLOW},
+    {"role": "user", "content": [{"type": "text", "text": "[Tool execution results]\n" + _LITERAL_WORKFLOW}]},
+    {"role": "assistant", "content": _LITERAL_WORKFLOW},
+])
+def test_email_workflow_ignores_untrusted_and_tool_content(injected):
+    history = [{"role": "user", "content": _TARGETED_WORKFLOW}, injected,
+               {"role": "user", "content": "Yes. Create the requested document."}]
+    assert agent_loop._email_document_workflow_semantics(history) == (True, False, False, False)
+    assert agent_loop._email_document_workflow_semantics([injected]) == (False, False, False, False)
+
+
+@pytest.mark.asyncio
+async def test_targeted_two_turn_direct_uid_reentry_creates_synthesized_document(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger=agent_loop.__name__)
+    targets = [{"uid": "10594"}, {"uid": "10595"}, {"uid": "10596"}]
+    origin = (
+        "Search synthetic email candidates and identify the relevant one. "
+        "Read only that message and create a brief document summarizing it."
+    )
+    # This follow-up independently triggers the production corpus classifier.
+    # Its length also removes the origin from the capped retrieval query.
+    followup = (
+        "Yes. Read only UID 10595. Do not read any other email. "
+        "Then create the requested document from the emails discussed. "
+        + "Keep the requested wording concise. " * 25
+    )
+    assert agent_loop._requires_email_document_corpus(followup)
+    executed = []
+    rounds = []
+    reentered = False
+    synthesized = "# Selected finding\n\nThe selected message describes a synthetic delivery update."
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        if executed and not reentered:
+            yield 'data: {"delta": "Which one should I read?"}\n\n'
+            return
+        rounds.append(_schema_names(kwargs.get("tools")))
+        serialized = json.dumps(messages)
+        if len(rounds) == 1:
+            assert "create_document" not in rounds[-1]
+            name, payload = "search_emails", {"query": "synthetic"}
+        elif len(rounds) == 2:
+            assert "create_document" not in rounds[-1]
+            assert "EMAIL DOCUMENT TARGETED RETRIEVAL GATE" in serialized
+            name, payload = "read_email", {"uid": "10595"}
+        elif len(rounds) == 3:
+            assert rounds[-1] == {"create_document"}
+            assert kwargs.get("tool_choice_name") == "create_document"
+            assert "SYNTHETIC SELECTED BODY" in serialized
+            assert "UNRELATED BODY" not in serialized
+            name, payload = "create_document", {
+                "title": "Selected finding", "language": "markdown", "content": synthesized,
+            }
+        else:
+            yield 'data: {"delta": "Document created."}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+        yield f'data: {json.dumps({"type": "tool_calls", "calls": [{"name": name, "arguments": json.dumps(payload)}]})}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        if block.tool_type == "create_document":
+            title, language, content = block.content.split("\n", 2)
+            payload = {"title": title, "language": language, "content": content}
+        else:
+            payload = json.loads(block.content)
+        executed.append((block.tool_type, payload))
+        if block.tool_type == "mcp__email__search_emails":
+            return block.tool_type, {"output": _synthetic_search_output(targets), "exit_code": 0}
+        if block.tool_type == "mcp__email__read_email":
+            assert payload == {"uid": "10595"}
+            return block.tool_type, {
+                "output": "**Subject:** Synthetic update\n**From:** sender@example.test\n\nSYNTHETIC SELECTED BODY",
+                "exit_code": 0,
+            }
+        assert block.tool_type == "create_document"
+        assert payload["content"] == synthesized
+        assert "Retrieved emails" not in payload["content"]
+        return block.tool_type, {
+            "output": "SYNTHETIC_DOCUMENT_RESULT", "action": "create",
+            "doc_id": "synthetic-reentry", "version": 1, "exit_code": 0, **payload,
+        }
+
+    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
+    history = [{"role": "user", "content": origin}]
+    options = dict(
+        relevant_tools={"search_emails", "read_email", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    )
+    # Closing the stream after the completed search emulates an interrupted
+    # invocation; the next invocation has only route-owned conversation history.
+    first = agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", list(history), **options,
+    )
+    async for chunk in first:
+        if "Which one should I read?" in chunk:
+            break
+    await first.aclose()
+    assert [name for name, _ in executed] == ["mcp__email__search_emails"]
+    assert "targeted email search candidates=3" in caplog.text
+    reentered = True
+    history.extend([
+        {"role": "assistant", "content": (
+            _synthetic_search_output(targets) + "\nWhich one should I read?"
+        )},
+        {"role": "user", "content": followup},
+    ])
+    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", list(history),
+        conversation_history=history, max_rounds=20, **options,
+    )]
+    assert [name for name, _ in executed] == [
+        "mcp__email__search_emails", "mcp__email__read_email", "create_document",
+    ]
+    assert executed[1][1] == {"uid": "10595"}
+    assert executed[2][1]["content"] == synthesized
+    assert "email retrieval progress resolved=1/1 usable=1" in caplog.text
+    assert "state=retrieval_ready targets=1 usable=1" in caplog.text
+    assert len(rounds) == 4
+
+
+@pytest.mark.parametrize("origin,followup,lossless", [
+    (_LITERAL_WORKFLOW, "Yes. Make it a brief summary.", False),
+    (_SUMMARY_WORKFLOW, "Yes. Copy them verbatim into a full archive.", True),
+])
+@pytest.mark.asyncio
+async def test_email_workflow_transformation_reentry_controls_document_body(monkeypatch, origin, followup, lossless):
+    targets = [{"uid": "10595"}, {"uid": "10596"}]
+    executed = []
+    model_rounds = 0
+    synthesis = "A concise model-mediated synthesis."
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        nonlocal model_rounds
+        model_rounds += 1
+        if model_rounds == 1:
+            name, arguments = "search_emails", {"query": "synthetic", "max_results": 20}
+        elif model_rounds == 2:
+            assert _schema_names(kwargs.get("tools")) == {"create_document"}
+            assert kwargs.get("tool_choice_name") == "create_document"
+            assert "synthetic body 10595" in json.dumps(messages)
+            assert "synthetic body 10596" in json.dumps(messages)
+            name, arguments = "create_document", {
+                "title": "Exact synthetic title", "language": "markdown", "content": synthesis,
+            }
+        else:
+            yield 'data: {"delta": "Document created."}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+        yield f'data: {json.dumps({"type": "tool_calls", "calls": [{"name": name, "arguments": json.dumps(arguments)}]})}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        if block.tool_type == "create_document":
+            title, language, content = block.content.split("\n", 2)
+            payload = {"title": title, "language": language, "content": content}
+        else:
+            payload = json.loads(block.content)
+        executed.append((block.tool_type, payload))
+        if block.tool_type == "mcp__email__search_emails":
+            assert payload["max_results"] == agent_loop._EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS
+            return block.tool_type, {"output": _synthetic_search_output(targets), "exit_code": 0}
+        if block.tool_type == "mcp__email__read_email":
+            assert payload["targets"] == [{"uid": t["uid"], "folder": "INBOX"} for t in targets]
+            return block.tool_type, {"output": _synthetic_batch_output(targets), "exit_code": 0}
+        assert block.tool_type == "create_document"
+        return block.tool_type, {"output": "SYNTHETIC_DOCUMENT_RESULT", "exit_code": 0,
+                                 "action": "create", "doc_id": "synthetic", "version": 1, **payload}
+
+    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
+    history = [{"role": "user", "content": origin},
+               {"role": "assistant", "content": "What should the document contain?"},
+               {"role": "user", "content": followup}]
+    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", list(history), conversation_history=history,
+        max_rounds=20, relevant_tools={"search_emails", "read_email", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    )]
+    assert [tool for tool, _ in executed] == [
+        "mcp__email__search_emails", "mcp__email__read_email", "create_document",
+    ]
+    document = executed[-1][1]
+    assert document["title"] == "Exact synthetic title"
+    if lossless:
+        assert "synthetic body 10595" in document["content"]
+        assert "synthetic body 10596" in document["content"]
+        assert synthesis not in document["content"]
+    else:
+        assert document["content"] == synthesis
+        assert "Retrieved emails" not in document["content"]
+    assert any("Document created." in chunk for chunk in chunks)
+
+
+
+def test_second_review_active_state_distinguishes_targeted_from_inactive():
+    inactive = agent_loop._email_document_workflow_semantics([])
+    targeted = agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": _TARGETED_WORKFLOW},
+    ])
+    assert inactive != targeted
+    assert not inactive.active
+    assert targeted.active
+    assert not targeted.corpus and not targeted.exhaustive and not targeted.lossless
+
+
+@pytest.mark.parametrize("answer", [
+    "work", "yes", "Sí", "continue", "Només els del 2025", "only those from 2025", "search again",
+])
+@pytest.mark.parametrize("structured", [False, True])
+def test_second_review_contextual_clarification_preserves_active_state(answer, structured):
+    assistant = {"role": "assistant", "content": "Which mailbox should I use?"}
+    if structured:
+        assistant["metadata"] = {"tool_events": [{
+            "tool": "ask_user", "ask_user": {"question": "Which mailbox should I use?"},
+        }]}
+    history = [{"role": "user", "content": _LITERAL_WORKFLOW}, assistant,
+               {"role": "user", "content": answer}]
+    assert agent_loop._email_document_workflow_semantics(history) == (True, True, True, True)
+    # Another clarification uses only the latest assistant adjacency.
+    history.extend([assistant, {"role": "user", "content": "work"}])
+    assert agent_loop._email_document_workflow_semantics(history) == (True, True, True, True)
+
+
+@pytest.mark.parametrize("followup", [
+    "Now write a summary of Macbeth.", "Also summarize this report.",
+    "And then write a summary of Macbeth.", "Now make a document about gardening.",
+    "What is the capital of France?", "Search email invoices.", "start over",
+])
+def test_second_review_new_subject_overrides_clarification_context(followup):
+    history = [{"role": "user", "content": _LITERAL_WORKFLOW},
+               {"role": "assistant", "content": "What should the document contain?",
+                "metadata": {"tool_events": [{"tool": "ask_user", "ask_user": {"question": "What next?"}}]}},
+               {"role": "user", "content": followup}]
+    assert agent_loop._email_document_workflow_semantics(history) == (False, False, False, False)
+
+
+@pytest.mark.parametrize("followup", [
+    "Haz una síntesis.", "Fes-ne una síntesi.", "Haz una sintesis.",
+    "Fes-ne una sintesi.", "Make it a summary.",
+])
+def test_second_review_diacritics_share_lossless_normalization(followup):
+    history = [{"role": "user", "content": _LITERAL_WORKFLOW},
+               {"role": "user", "content": followup}]
+    assert agent_loop._email_document_workflow_semantics(history) == (True, True, True, False)
+    assert not agent_loop._requires_lossless_email_document(_LITERAL_WORKFLOW + " " + followup)
+
+
+@pytest.mark.parametrize("selection", [
+    "Actually use all ten.", "Use these ten.", "Use those ten.", "Use ten of them.",
+    "all ten", "these ten", "those ten", "ten of them", "No, use these ten instead.",
+    "Use all 10.", "Use these 10.", "Use 10 of them.",
+])
+def test_second_review_contextual_email_counts(selection):
+    assert agent_loop._email_source_set_override(selection) == (True, False)
+    history = [{"role": "user", "content": _TARGETED_WORKFLOW},
+               {"role": "user", "content": selection}]
+    assert agent_loop._email_document_workflow_semantics(history) == (True, True, False, False)
+
+
+@pytest.mark.parametrize("formatting", [
+    "Use these two bullet points.", "Write three paragraphs.", "Use five headings.",
+    "Use these ten sentences.",
+])
+@pytest.mark.parametrize("origin,expected", [
+    (_TARGETED_WORKFLOW, (True, False, False, False)),
+    (_LITERAL_WORKFLOW, (True, True, True, True)),
+])
+def test_second_review_non_email_counts_do_not_select_sources(formatting, origin, expected):
+    assert agent_loop._email_source_set_override(formatting) is None
+    history = [{"role": "user", "content": origin}, {"role": "user", "content": formatting}]
+    assert agent_loop._email_document_workflow_semantics(history) == expected
+
+
+@pytest.mark.parametrize("followup,email_workflow", [
+    ("work", True), ("search again", True),
+    ("Now write a summary of Macbeth.", False), ("Also summarize this report.", False),
+])
+@pytest.mark.asyncio
+async def test_second_review_stream_clarification_and_new_subject(monkeypatch, followup, email_workflow):
+    targets = [{"uid": "10595"}, {"uid": "10596"}]
+    executed = []
+    rounds = 0
+    model_content = "Synthetic requested document, written by the model."
+
+    async def fake_stream(_candidates, messages, **kwargs):
+        nonlocal rounds
+        rounds += 1
+        schemas = _schema_names(kwargs.get("tools"))
+        if rounds == 1 and email_workflow:
+            assert "EMAIL DOCUMENT RETRIEVAL GATE" in json.dumps(messages)
+            assert "create_document" not in schemas
+            name, payload = "search_emails", {"query": "synthetic", "max_results": 20}
+        elif not any(tool == "create_document" for tool, _ in executed):
+            assert "create_document" in schemas
+            if email_workflow:
+                assert schemas == {"create_document"}
+                assert kwargs.get("tool_choice_name") == "create_document"
+            else:
+                assert "EMAIL DOCUMENT RETRIEVAL GATE" not in json.dumps(messages)
+                assert "EMAIL DOCUMENT TARGETED RETRIEVAL GATE" not in json.dumps(messages)
+            name, payload = "create_document", {
+                "title": "Synthetic result", "language": "markdown", "content": model_content,
+            }
+        else:
+            yield 'data: {"delta": "Document created."}\n\n'
+            yield "data: [DONE]\n\n"
+            return
+        yield f'data: {json.dumps({"type": "tool_calls", "calls": [{"name": name, "arguments": json.dumps(payload)}]})}\n\n'
+        yield "data: [DONE]\n\n"
+
+    async def fake_execute(block, *args, **kwargs):
+        if block.tool_type == "create_document":
+            title, language, content = block.content.split("\n", 2)
+            payload = {"title": title, "language": language, "content": content}
+        else:
+            payload = json.loads(block.content)
+        executed.append((block.tool_type, payload))
+        if block.tool_type == "mcp__email__search_emails":
+            assert email_workflow
+            assert payload["max_results"] == agent_loop._EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS
+            return block.tool_type, {"output": _synthetic_search_output(targets), "exit_code": 0}
+        if block.tool_type == "mcp__email__read_email":
+            assert email_workflow
+            assert [target["uid"] for target in payload["targets"]] == ["10595", "10596"]
+            return block.tool_type, {"output": _synthetic_batch_output(targets), "exit_code": 0}
+        assert block.tool_type == "create_document"
+        return block.tool_type, {"output": "SYNTHETIC_DOCUMENT_RESULT", "exit_code": 0,
+                                 "action": "create", "doc_id": "synthetic", "version": 1, **payload}
+
+    _patch_agent_loop_dependencies(monkeypatch, fake_stream, fake_execute)
+    history = [{"role": "user", "content": _LITERAL_WORKFLOW},
+               {"role": "assistant", "content": "What should the document contain?",
+                "metadata": {"tool_events": [{"tool": "ask_user", "ask_user": {"question": "Which mailbox?"}}]}},
+               {"role": "user", "content": followup}]
+    chunks = [chunk async for chunk in agent_loop.stream_agent_loop(
+        "https://api.openai.com/v1", "gpt-4o", list(history), conversation_history=history,
+        max_rounds=20, relevant_tools={"search_emails", "read_email", "create_document"},
+        owner="admin", _is_teacher_run=True,
+    )]
+    assert [tool for tool, _ in executed] == (
+        ["mcp__email__search_emails", "mcp__email__read_email", "create_document"]
+        if email_workflow else ["create_document"]
+    )
+    if email_workflow:
+        assert "synthetic body 10595" in executed[-1][1]["content"]
+        assert "synthetic body 10596" in executed[-1][1]["content"]
+    else:
+        assert executed[-1][1]["content"] == model_content
+    assert any("Document created." in chunk for chunk in chunks)
+
+
+@pytest.mark.parametrize("selection", [
+    "use one selected message", "use only one selected message",
+    "use one selected email", "use only one selected email",
+    "use the selected message", "use only the selected message",
+    "use the selected email", "use only the selected email",
+    "use selected message", "use selected email",
+])
+def test_medium_closure_selected_source(selection):
+    assert agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": _LITERAL_WORKFLOW},
+        {"role": "user", "content": selection},
+    ]) == (True, False, False, False)
+
+
+@pytest.mark.parametrize("formatting", [
+    "use one selected paragraph per email", "use only one selected heading per email",
+    "use one selected sentence per message", "make one selected section per email",
+])
+def test_medium_closure_selected_formatting(formatting):
+    assert agent_loop._email_source_set_override(formatting) is None
+    assert agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": _LITERAL_WORKFLOW},
+        {"role": "user", "content": formatting},
+    ]) == (True, True, True, True)
+
+
+@pytest.mark.parametrize("cancellation", [
+    "cancel", "forget that", "discard that", "stop this", "Cancel the email document.",
+])
+def test_medium_closure_cancellation(cancellation):
+    history = [{"role": "user", "content": _LITERAL_WORKFLOW},
+               {"role": "assistant", "metadata": {"tool_events": [
+                   {"tool": "create_document", "exit_code": 0, "doc_id": "abc", "had_error": True},
+               ]}}]
+    history.append({"role": "user", "content": cancellation})
+    assert agent_loop._email_document_workflow_semantics(history) == (False, False, False, False)
+    history.append({"role": "user", "content": _TARGETED_WORKFLOW})
+    assert agent_loop._email_document_workflow_semantics(history) == (True, False, False, False)
+
+
+def test_medium_closure_negated_cancellation():
+    assert agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": _LITERAL_WORKFLOW},
+        {"role": "user", "content": "Do not cancel; continue."},
+    ]) == (True, True, True, True)
+
+
+@pytest.mark.parametrize("prompt,active", [
+    ("Search all emails for the document.", False),
+    ("Find emails mentioning the document.", False),
+    ("Search emails about the report document.", False),
+    ("Look for messages about an archived document.", False),
+    ("Create a document from all emails.", True),
+    ("Generate a document from the selected message.", True),
+    ("Create a list containing all emails.", True),
+    ("Create an archive containing all emails.", True),
+    ("Search all emails and then create a document summarizing them.", True),
+    ("Search candidates, read the relevant one, and create a brief document.", True),
+])
+def test_medium_closure_creation_intent(prompt, active):
+    for prefix in ([], [{"role": "user", "content": _LITERAL_WORKFLOW}]):
+        assert agent_loop._email_document_workflow_semantics(
+            prefix + [{"role": "user", "content": prompt}],
+        ).active is active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt,active", [
+    ("Search all emails for the document.", False),
+    ("Search all emails and use only one selected message for the document.", True),
+])
+async def test_medium_closure_search_scope_stream(monkeypatch, caplog, prompt, active):
+    state = agent_loop._email_document_workflow_semantics([
+        {"role": "user", "content": _LITERAL_WORKFLOW}, {"role": "user", "content": prompt},
+    ])
+    assert state == (active, False, False, False)
+    await test_last_findings_email_only_exhaustive_search_stream(monkeypatch, caplog, prompt, active)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("presentation", [{}, {"content": "Body"}, {"version": 7}])
+async def test_medium_closure_success_presentation_stream(monkeypatch, presentation):
+    raw = {"exit_code": 0, "doc_id": "abc", "action": "create", **presentation}
+    assert agent_loop._email_document_creation_succeeded("create_document", raw)
+    await test_last_findings_exact_create_transport_and_persistence(monkeypatch, raw, True)

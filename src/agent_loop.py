@@ -18,7 +18,7 @@ import unicodedata
 from email.utils import parsedate_to_datetime
 from difflib import SequenceMatcher
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Callable, List, Dict, Optional, Set
+from typing import Any, AsyncGenerator, Callable, List, Dict, NamedTuple, Optional, Set
 from urllib.parse import urlparse
 
 from src.llm_core import (
@@ -40,6 +40,7 @@ from src.routing_observability import (
     log_routing_fallback,
 )
 from src.tool_utils import _truncate, get_mcp_manager
+from src.tool_execution import _email_document_creation_succeeded
 from src.agent_tools import (
     parse_tool_blocks,
     strip_tool_blocks,
@@ -1511,10 +1512,14 @@ def _email_retrieval_target_key(
 _EXHAUSTIVE_EMAIL_SEARCH_MAX_RESULTS = 100
 
 
+def _normalize_email_semantics(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(text or "").lower())
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
 def _has_exhaustive_email_intent(text: str) -> bool:
     """Recognize explicit, multilingual requests for the complete email set."""
-    normalized = unicodedata.normalize("NFKD", str(text or "").lower())
-    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = _normalize_email_semantics(text)
     return bool(re.search(
         r"\b(?:"
         r"(?:all|every)\s+(?:the\s+)?(?:e-?mails?|messages?)|"
@@ -1527,22 +1532,70 @@ def _has_exhaustive_email_intent(text: str) -> bool:
 
 
 
-def _requires_email_document_corpus(text: str) -> bool:
+_EMAIL_COUNT_WORDS = {
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "twenty": 20,
+    "twenty-five": 25,
+    "fifty": 50,
+    "sixty": 60,
+    "dos": 2,
+    "tres": 3,
+    "cuatro": 4,
+    "cinco": 5,
+    "diez": 10,
+    "veinte": 20,
+    "cincuenta": 50,
+    "sesenta": 60,
+    "dues": 2,
+    "quatre": 4,
+    "cinc": 5,
+    "deu": 10,
+    "vint": 20,
+    "cinquanta": 50,
+    "seixanta": 60,
+}
+_EMAIL_COUNT_PATTERN = "|".join(
+    re.escape(token) for token in sorted(_EMAIL_COUNT_WORDS, key=len, reverse=True)
+)
+_EMAIL_ITEM_MODIFIER = (
+    r"selected|returned|relevant|synthetic|recent|latest|oldest|unread|new|"
+    r"nuevos?|nuevas?|seleccionados?|seleccionadas?|recientes?|no\s+leidos?|"
+    r"nous?|noves?|seleccionats?|seleccionades?|recents?|no\s+llegits?"
+)
+
+
+def _email_artifact_creation_intent(text: str) -> bool:
+    """Ambiguous artifact nouns require a creation verb, not a mailbox action."""
+    return bool(re.search(
+        r"\b(?:create|make|generate|write|crea|crear|genera|generar|fes|fer)\s+"
+        r"(?:(?:a|an|the|un|una|el|la)\s+)?"
+        r"(?:(?:brief|full|complete|new|requested|same)\s+)?"
+        r"(?:document|doc|word|list|listing|archive|history|"
+        r"documento|llista|lista|arxiu|archivo|historial)\b",
+        _normalize_email_semantics(text),
+    ))
+
+
+def _requires_email_document_corpus(text: str, *, explicit_set_only: bool = False) -> bool:
     """Recognize document requests whose selected result set is a corpus.
 
     This is deliberately separate from exhaustive mailbox intent. A bounded
     request such as "create a document from ten emails" requires every result
     in that selected set, but must not widen the mailbox search itself.
+    ``explicit_set_only`` excludes generic artifact references when checking
+    whether a continuation replaces the workflow's original source set.
     """
-    normalized = unicodedata.normalize(
-        "NFKD",
-        str(text or "").lower(),
-    )
-    normalized = "".join(
-        char
-        for char in normalized
-        if not unicodedata.combining(char)
-    )
+    normalized = _normalize_email_semantics(text)
 
     if _has_exhaustive_email_intent(normalized):
         return True
@@ -1552,7 +1605,7 @@ def _requires_email_document_corpus(text: str) -> bool:
         r"documento|llista|lista|arxiu|archivo|historial)\b",
         normalized,
     ))
-    if not artifact:
+    if not artifact and not explicit_set_only:
         return False
 
     # Explicit selection of one relevant/correct message remains targeted,
@@ -1573,58 +1626,17 @@ def _requires_email_document_corpus(text: str) -> bool:
     # but deliberately do not imply an exhaustive mailbox search.
     if re.search(
         r"\b(?:all|every|tots?|todos?)\b"
-        r"(?:\s+[a-z0-9_-]+){0,5}\s+"
+        rf"(?:\s+(?:the|els|los|\d+|{_EMAIL_COUNT_PATTERN}|{_EMAIL_ITEM_MODIFIER})){{0,5}}\s+"
         r"(?:e-?mails?|messages?|correus?|correos?)\b",
         normalized,
     ):
         return True
 
-    number_words = {
-        "two": 2,
-        "three": 3,
-        "four": 4,
-        "five": 5,
-        "six": 6,
-        "seven": 7,
-        "eight": 8,
-        "nine": 9,
-        "ten": 10,
-        "eleven": 11,
-        "twelve": 12,
-        "twenty": 20,
-        "twenty-five": 25,
-        "fifty": 50,
-        "sixty": 60,
-        "dos": 2,
-        "tres": 3,
-        "cuatro": 4,
-        "cinco": 5,
-        "diez": 10,
-        "veinte": 20,
-        "cincuenta": 50,
-        "sesenta": 60,
-        "dues": 2,
-        "quatre": 4,
-        "cinc": 5,
-        "deu": 10,
-        "vint": 20,
-        "cinquanta": 50,
-        "seixanta": 60,
-    }
-
-    number_pattern = "|".join(
-        re.escape(token)
-        for token in sorted(
-            number_words,
-            key=len,
-            reverse=True,
-        )
-    )
-
     for match in re.finditer(
-        rf"\b(?P<count>\d+|(?:{number_pattern}))\b"
-        r"(?:\s+[a-z0-9_-]+){0,3}\s+"
-        r"(?:e-?mails?|messages?|correus?|correos?)\b",
+        rf"\b(?P<count>\d+|(?:{_EMAIL_COUNT_PATTERN}))\b"
+        rf"(?:\s+(?:{_EMAIL_ITEM_MODIFIER})){{0,3}}\s+"
+        r"(?:e-?mails?|messages?|correus?|correos?)\b"
+        rf"(?:\s+(?:{_EMAIL_ITEM_MODIFIER})){{0,3}}",
         normalized,
     ):
         token = match.group("count")
@@ -1632,10 +1644,18 @@ def _requires_email_document_corpus(text: str) -> bool:
         if token.isdigit():
             count = int(token)
         else:
-            count = number_words[token]
+            count = _EMAIL_COUNT_WORDS[token]
 
         if count > 1:
             return True
+
+    if explicit_set_only:
+        return False
+
+    if _email_artifact_creation_intent(normalized) and re.search(
+        r"\b(?:emails|messages|correus|correos)\b", normalized,
+    ):
+        return True
 
     # "document from the synthetic emails"
     if re.search(
@@ -1662,6 +1682,196 @@ def _requires_email_document_corpus(text: str) -> bool:
         return True
 
     return False
+
+
+def _email_source_set_override(text: str) -> Optional[tuple[bool, bool]]:
+    """Explicit (corpus, exhaustive) selection; contextual sets need an active workflow."""
+    q = _normalize_email_semantics(text)
+    if re.search(
+        r"\b(?:(?:use|read|include|select|identify|choose|find)\s+"
+        r"(?:(?:only|just)\s+)?|(?:only|just)\s+)"
+        r"(?:(?:that|the|this)\s+)?"
+        r"(?:(?:relevant|correct|right|other)\s+)?"
+        r"(?:(?:one\s+)?(?:selected\s+)?(?:message|email|uid)\b|"
+        r"one(?=\s*(?:[.,;!?]|$|and\b|instead\b|please\b)))",
+        q,
+    ):
+        return False, False
+    if _has_exhaustive_email_intent(q):
+        return True, True
+    if _requires_email_document_corpus(q, explicit_set_only=True):
+        return True, False
+    if re.search(r"\b(?:(?:use|read|include|collect)\s+)?all\s+(?:of\s+)?(?:them|these|those)\b", q):
+        return True, False
+    # Match a complete nounless selection clause. An explicit unrelated noun
+    # ("two bullet points") cannot be coerced into an email count.
+    match = re.fullmatch(
+        r"(?:(?:yes|no|actually|instead)\b[\s,.;]*)*"
+        r"(?:(?:use|read|include|collect)\s+)?"
+        rf"(?:(?:all|these|those|the)\s+(?P<count>\d+|{_EMAIL_COUNT_PATTERN})|"
+        rf"(?P<part>\d+|{_EMAIL_COUNT_PATTERN})\s+of\s+(?:them|these|those))"
+        r"(?:\s+(?:instead|please))?[.!?\s]*",
+        q,
+    )
+    if match:
+        token = match.group("count") or match.group("part")
+        count = int(token) if token.isdigit() else _EMAIL_COUNT_WORDS[token]
+        if count > 1:
+            return True, False
+    return None
+
+
+def _email_document_transformation_override(text: str) -> Optional[bool]:
+    """Latest explicit transformation wins; absence does not change the mode."""
+    normalized = _normalize_email_semantics(text)
+    if re.search(
+        r"\b(?:summary|summarize|summarise|summarizing|summarising|synthesis|"
+        r"resume|resum|resumen|resumir|sintesi|sintesis)\b", normalized,
+    ):
+        return False
+    if re.search(
+        r"\b(?:verbatim|literal|lossless)\b|\b(?:full|complete)\s+archive\b",
+        normalized,
+    ):
+        return True
+    return None
+
+
+def _email_artifact_adjustment(text: str) -> bool:
+    """Recognize subjectless artifact edits, not arbitrary new summary subjects."""
+    q = _normalize_email_semantics(text)
+    return bool(re.fullmatch(
+        r"(?:(?:yes|no|actually|now|instead)\b[\s,.;]*)*"
+        r"(?:"
+        r"(?:make|create|write|haz|fes(?:-ne)?)\s+"
+        r"(?:(?:it|them|a|an|the|una|un)\s+){0,3}"
+        r"(?:(?:brief|short|full|complete)\s+)?"
+        r"(?:summary|synthesis|sintesis|sintesi|resumen|resum|archive)|"
+        r"(?:use|write|include|create|make|summarize|summarise)\s+"
+        r"(?:(?:the\s+)?(?:emails|messages)\s+in\s+)?"
+        r"(?:(?:these|those|the|all)\s+)?"
+        rf"(?:(?:only|just)\s+)?(?:one|\d+|{_EMAIL_COUNT_PATTERN})\s+"
+        r"(?:selected\s+)?(?:bullet points?|paragraphs?|headings?|sentences?|sections?)"
+        r"(?:\s+(?:from|about)\s+(?:(?:the|these|those)\s+)?(?:emails|messages))?"
+        r"(?:\s+(?:per|for each)\s+(?:email|message))?"
+        r")[.!?\s]*", q,
+    ))
+
+
+def _email_document_cancelled(text: str) -> bool:
+    """Only affirmative imperative cancellation clauses terminate this turn."""
+    return bool(re.search(
+        r"(?:^|[.;!?]\s*)(?:(?:please|actually|now)\s+)*"
+        r"(?:cancel|forget|discard|stop)"
+        r"(?:\s+(?:(?:that|this|it)|(?:the\s+)?email\s+document|"
+        r"(?:the|this|that)\s+(?:document|workflow|task)))?"
+        r"(?=\s*(?:[.;!?]|$))",
+        _normalize_email_semantics(text),
+    ))
+
+
+class _EmailDocumentWorkflowState(NamedTuple):
+    active: bool
+    corpus: bool
+    exhaustive: bool
+    lossless: bool
+
+
+def _email_document_workflow_semantics(messages: List[Dict]) -> _EmailDocumentWorkflowState:
+    """Replay independent source/artifact state in one chronological scan.
+
+    Only the preceding trusted assistant is retained for clarification. No
+    growing history prefixes or concatenated retrieval fallback establish state.
+    """
+    active = corpus = exhaustive = literal = False
+    previous_assistant = None
+    for msg in messages:
+        if (msg.get("metadata") or {}).get("trusted") is False:
+            continue
+        if msg.get("role") == "assistant":
+            previous_assistant = msg
+            if any(
+                isinstance(event, dict)
+                and _email_document_creation_succeeded(event.get("tool"), event)
+                for event in (msg.get("metadata") or {}).get("tool_events") or []
+            ):
+                active = corpus = exhaustive = literal = False
+            continue
+        if msg.get("role") != "user":
+            continue
+        text = str(_extract_last_user_message([msg]) or "").strip()
+        if not text or text.startswith("[Tool execution results]"):
+            continue
+        adjacent = [previous_assistant, msg] if previous_assistant else [msg]
+        clarification = (
+            _answered_ask_user_payload(adjacent) is not None
+            or _assistant_requested_followup(adjacent)
+        )
+        if previous_assistant and not clarification:
+            question = _extract_last_user_message([{**previous_assistant, "role": "user"}])
+            clarification = bool(re.search(
+                r"\bwhich\s+(?:mailbox|account)\b[^?]*\?", question, re.IGNORECASE,
+            ))
+        previous_assistant = None
+        domains = _classify_agent_request([msg], text).get("domains") or set()
+        q = _normalize_email_semantics(text)
+        if _email_document_cancelled(text):
+            active = corpus = exhaustive = literal = False
+            continue
+        source = _email_source_set_override(text)
+        transformation = _email_document_transformation_override(text)
+        artifact_adjustment = _email_artifact_adjustment(text)
+        approval = _is_explicit_continuation(text) or bool(re.fullmatch(
+            r"(?:do not|don't) cancel[;,]\s*continue[.!?\s]*", q,
+        ))
+        retry = bool(re.fullmatch(r"(?:(?:search|try|read|run)(?: it)? again|retry)[.!?\s]*", q))
+        reference = bool(re.search(
+            r"\b(?:it|them)\b|\b(?:that|this|the|requested|same)\s+"
+            r"(?:document|archive|message|email|one)\b|\b(?:those|these|that)(?=[.!?,;\s]*$)", q,
+        ))
+        # A question/imperative with a new subject is not a clarification answer.
+        command = bool(re.match(
+            r"(?:(?:yes|no|actually|now|also|instead|and then)\b[\s,.;]*)*"
+            r"(?:what|who|where|write|make|create|summarize|summarise|search|find|look|haz|fes)\b", q,
+        ))
+        foreign_subject = bool(re.search(
+            r"\b(?:about|summary of|synthesis of)\s+(?!the emails?\b|emails?\b|them\b)|"
+            r"\b(?:this|that|these|those|the|a|an)\s+(?:report|article|book|story)\b", q,
+        ))
+        new_task = bool(re.search(
+            r"\b(?:new task|start over)\b", q,
+        )) or (not retry and bool(re.search(r"\b(?:search|find|look for)\b", q))) or bool(re.match(
+            r"(?:list|archive|show)\s+(?:all\s+)?(?:the\s+)?(?:emails?|messages?)\b", q,
+        ))
+        continuation = (
+            active and not new_task and not foreign_subject
+            and not ({"email", "documents"}.issubset(domains) and not (reference or approval or artifact_adjustment))
+            and (not (domains - {"email", "documents"}) or retry)
+            and (source is not None or approval or retry or reference
+                 or artifact_adjustment or (clarification and not command))
+        )
+        if not continuation:
+            corpus = _requires_email_document_corpus(text)
+            artifact = (
+                _email_artifact_creation_intent(text)
+                or transformation is not None
+                or (source is not None and bool(re.search(
+                    r"\buse\b.+\bfor (?:the|a|this|that|requested) document\b", q,
+                )))
+            )
+            active = (
+                (corpus or "email" in domains or source is not None
+                 or bool(re.search(r"\b(?:messages?|correus?|correos?)\b", q))) and artifact
+            ) and not foreign_subject
+            corpus = corpus if active else False
+            exhaustive = _has_exhaustive_email_intent(text) if active else False
+            literal = _requires_lossless_email_document(text) if active else False
+        if active:
+            if source is not None:
+                corpus, exhaustive = source
+            if transformation is not None:
+                literal = transformation
+    return _EmailDocumentWorkflowState(active, corpus, exhaustive, exhaustive and literal)
 
 
 def _email_search_arguments_for_intent(
@@ -2023,15 +2233,7 @@ def _requires_lossless_email_document(text: str) -> bool:
     if not _has_exhaustive_email_intent(text):
         return False
 
-    normalized = unicodedata.normalize(
-        "NFKD",
-        str(text or "").lower(),
-    )
-    normalized = "".join(
-        char
-        for char in normalized
-        if not unicodedata.combining(char)
-    )
+    normalized = _normalize_email_semantics(text)
 
     # An explicit transformation such as a summary must remain model-mediated,
     # even when the source corpus itself is exhaustive.
@@ -4302,9 +4504,28 @@ async def stream_agent_loop(
     # Tool retrieval uses the latest message by default. It may inherit recent
     # user turns only for explicit continuations ("yes", "do it", "1").
     _retrieval_query = str(_intent.get("retrieval_query") or _last_user)
-    _exhaustive_email_intent = _has_exhaustive_email_intent(_retrieval_query)
-    _email_document_corpus_mode = _requires_email_document_corpus(_retrieval_query)
-    _lossless_email_document = _requires_lossless_email_document(_retrieval_query)
+    _email_workflow = _email_document_workflow_semantics(_conversation_messages)
+    _email_document_corpus_mode = _email_workflow.corpus
+    _exhaustive_email_search_intent = _email_workflow.exhaustive
+    # Search scope exists independently of an artifact obligation. Only the
+    # latest authoritative user request can establish fresh search scope.
+    for _scope_message in reversed(_conversation_messages):
+        if _scope_message.get("role") != "user" or (
+            _scope_message.get("metadata") or {}
+        ).get("trusted") is False:
+            continue
+        _scope_text = str(_extract_last_user_message([_scope_message]) or "").strip()
+        if not _scope_text or _scope_text.startswith("[Tool execution results]"):
+            continue
+        if not _email_workflow.active:
+            _exhaustive_email_search_intent = _has_exhaustive_email_intent(_scope_text)
+        elif _has_exhaustive_email_intent(_scope_text) and re.search(
+            r"\b(?:search|find|list|busca|buscar|cerca|cercar)\b",
+            _normalize_email_semantics(_scope_text),
+        ):
+            _exhaustive_email_search_intent = True
+        break
+    _lossless_email_document = _email_workflow.lossless
     logger.info(
         "[agent-intent] latest=%r continuation=%s low_signal=%s domains=%s active_doc_relevant=%s retrieval_query=%r",
         _last_user[:120],
@@ -5972,7 +6193,7 @@ async def stream_agent_loop(
     if (
         not guide_only
         and not _active_document_relevant
-        and {"email", "documents"}.issubset(_intent_domains)
+        and _email_workflow.active
         and _relevant_tools is not None
         and "create_document" in _relevant_tools
         and "read_email" in _relevant_tools
@@ -7444,7 +7665,7 @@ async def stream_agent_loop(
                 break
             break  # no tools — done
 
-        if _exhaustive_email_intent:
+        if _exhaustive_email_search_intent:
             for _index, _block in enumerate(tool_blocks):
                 if _block.tool_type in {"mcp__email__search_emails", "search_emails"}:
                     tool_blocks[_index] = ToolBlock(
@@ -7899,12 +8120,18 @@ async def stream_agent_loop(
 
             # Emit doc-specific event for document tools — the frontend
             # document panel handles this; no need to show content in chat.
-            if is_doc_tool and "action" in result:
+            if block.tool_type == "create_document" and not _email_document_creation_succeeded(block.tool_type, result):
+                result = dict(result)
+                result["error"] = result.get("error") or "Document creation failed: no successful artifact was returned."
+            if is_doc_tool and "action" in result and (
+                block.tool_type != "create_document"
+                or _email_document_creation_succeeded(block.tool_type, result)
+            ):
                 if result["action"] == "suggest":
                     yield (
                         f'data: {json.dumps({"type": "doc_suggestions", "doc_id": result["doc_id"], "suggestions": result["suggestions"]})}\n\n'
                     )
-                else:
+                elif block.tool_type != "create_document" or ("content" in result and "version" in result):
                     yield (
                         f'data: {json.dumps({"type": "doc_update", "doc_id": result["doc_id"], "content": result["content"], "version": result["version"], "title": result.get("title", ""), "language": result.get("language")})}\n\n'
                     )
@@ -7949,7 +8176,9 @@ async def stream_agent_loop(
             # Build output for frontend tool bubble.
             # Document tools get a short summary — content goes to the editor panel.
             output_text = ""
-            if is_doc_tool and "action" in result:
+            if block.tool_type == "create_document" and not _email_document_creation_succeeded(block.tool_type, result):
+                output_text = _truncate(str(result.get("error") or "Document creation failed."))
+            elif is_doc_tool and "action" in result:
                 action = result["action"]
                 title = result.get("title", "")
                 ver = result.get("version", "?")
@@ -7989,8 +8218,15 @@ async def stream_agent_loop(
                 output_text = _truncate(result["error"])
 
             # Emit tool_output (include ui_event data if present)
+            _create_presentation_ready = (
+                block.tool_type != "create_document"
+                or ("content" in result and "version" in result)
+            )
             tool_output_data = {"type": "tool_output", "tool": block.tool_type, "command": cmd_display, "output": output_text, "exit_code": result.get("exit_code")}
-            if is_doc_tool and "action" in result:
+            if is_doc_tool and "action" in result and _create_presentation_ready and (
+                block.tool_type != "create_document"
+                or _email_document_creation_succeeded(block.tool_type, result)
+            ):
                 tool_output_data.update({
                     "doc_id": result.get("doc_id"),
                     "document_action": result.get("action"),
@@ -8120,7 +8356,10 @@ async def stream_agent_loop(
             # Emit a doc_update so the frontend opens/activates it and sends it
             # back as active_doc_id next turn (otherwise the agent can't "see"
             # the document it just created on the follow-up message).
-            if block.tool_type in ("create_document", "update_document", "edit_document") and result.get("doc_id"):
+            if block.tool_type in ("create_document", "update_document", "edit_document") and result.get("doc_id") and _create_presentation_ready and (
+                block.tool_type != "create_document"
+                or _email_document_creation_succeeded(block.tool_type, result)
+            ):
                 yield (
                     'data: ' + json.dumps({
                         "type": "doc_update",
@@ -8170,6 +8409,9 @@ async def stream_agent_loop(
             if result.get("doc_id"):
                 tool_event["doc_id"] = result["doc_id"]
                 tool_event["doc_title"] = result.get("title", "")
+            if block.tool_type == "create_document":
+                tool_event["had_error"] = bool(result.get("error"))
+                tool_event["blocked"] = bool(result.get("blocked"))
             # Persist the file-write/edit diff so it re-renders on reload — without
             # this the diff shows live but vanishes from saved history.
             if result.get("diff"):
@@ -8183,27 +8425,24 @@ async def stream_agent_loop(
             if block.tool_type in _VERIFIER_EFFECTFUL_TOOLS:
                 _effectful_used = True
 
-            formatted = format_tool_result(desc, result)
+            formatted = format_tool_result(desc, result, tool=block.tool_type)
             tool_results.append(formatted)
             tool_result_texts.append(formatted)
             if (
                 _ody_doc_stream_create_mode
-                and block.tool_type == "create_document"
-                and result.get("action") == "create"
+                and _email_document_creation_succeeded(block.tool_type, result)
             ):
                 _doc_stream_create_completed = True
             if (
                 _ody_doc_finetune_mode
                 and block.tool_type in ("create_document", "update_document", "edit_document", "suggest_document")
                 and not result.get("error")
+                and (block.tool_type != "create_document" or _email_document_creation_succeeded(block.tool_type, result))
             ):
                 _ody_doc_tool_completed = True
             if (
                 _email_document_creation_pending
-                and block.tool_type == "create_document"
-                and not result.get("error")
-                and not result.get("blocked")
-                and (result.get("doc_id") or result.get("action") == "create")
+                and _email_document_creation_succeeded(block.tool_type, result)
             ):
                 _email_document_creation_pending = False
                 logger.info(
